@@ -1,0 +1,35 @@
+name: demo_axes
+workspace: /tmp/hyperwhip_axes_demo
+
+search:
+  mode: axes
+  defaults:
+    learning_rate: 0.001
+    optimizer: adam
+    batch_size: 64
+
+slurm:
+  partition: gpu
+  time: "02:00:00"
+  mem: "16G"
+  cpus_per_task: 4
+  gres: "gpu:1"
+
+launcher: ./launch.sh
+
+hydra:
+  command: "python train.py"
+
+parameters:
+  learning_rate:
+    type: continuous
+    low: 1e-4
+    high: 1e-2
+    scale: log
+    steps: 3
+  optimizer:
+    type: discrete
+    values: [adam, sgd, adamw]
+  batch_size:
+    type: discrete
+    values: [32, 64, 128]

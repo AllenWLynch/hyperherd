@@ -1,0 +1,40 @@
+name: demo_sweep
+workspace: /tmp/hyperwhip_demo
+
+search:
+  mode: grid
+
+slurm:
+  partition: gpu
+  time: "02:00:00"
+  mem: "16G"
+  cpus_per_task: 4
+  gres: "gpu:1"
+
+launcher: ./launch.sh
+
+hydra:
+  command: "python train.py"
+  static_overrides:
+    - "data.path=/scratch/datasets"
+
+parameters:
+  learning_rate:
+    type: continuous
+    low: 1e-4
+    high: 1e-2
+    scale: log
+    steps: 3
+  optimizer:
+    type: discrete
+    values: [adam, sgd]
+  batch_size:
+    type: discrete
+    values: [32, 64]
+
+constraints:
+  - name: sgd_low_lr
+    when:
+      optimizer: sgd
+    exclude:
+      learning_rate: [0.01]
