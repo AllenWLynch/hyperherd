@@ -1,7 +1,6 @@
 name: mock_sweep
 
-search:
-  mode: grid
+grid: all
 
 slurm:
   partition: default

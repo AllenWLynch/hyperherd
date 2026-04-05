@@ -9,7 +9,7 @@ version = "0.1.0"
 description = "Launch and monitor hyperparameter optimization job arrays on SLURM"
 readme = "README.md"
 requires-python = ">=3.8"
-dependencies = ["pyyaml"]
+dependencies = ["pyyaml", "pydantic>=2.0"]
 
 [project.scripts]
 mush = "hyperwhip.cli:main"

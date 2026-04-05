@@ -41,7 +41,7 @@ def cmd_launch(args):
     manifest.init_workspace(config.workspace)
 
     # Build abbreviation mapping for experiment names
-    abbrevs = {p.name: p.abbrev for p in config.parameters}
+    abbrevs = config.abbrevs
 
     # Create or load manifest
     if manifest.workspace_exists(config.workspace):
@@ -67,7 +67,7 @@ def cmd_launch(args):
     script = slurm.generate_sbatch_script(config, pending)
 
     if args.dry_run:
-        print_dry_run(trials, script)
+        print_dry_run(trials, script, defaults=config.defaults)
         return 0
 
     # Submit
@@ -193,7 +193,7 @@ def cmd_init(args):
         config_path, launcher_path = scaffold(
             directory=directory,
             name=args.name,
-            search_mode=args.search_mode,
+            grid=args.grid,
             partition=args.partition,
             time=args.time,
             mem=args.mem,
@@ -288,7 +288,7 @@ def main():
     p_init = subparsers.add_parser("init", help="Scaffold a new config and launcher script")
     p_init.add_argument("directory", nargs="?", default=".", help="Directory to create files in (default: current)")
     p_init.add_argument("--name", default=None, help="Experiment name (default: directory name)")
-    p_init.add_argument("--search-mode", choices=["grid", "axes"], default="grid", help="Search strategy (default: grid)")
+    p_init.add_argument("--grid", default="all", help="Grid mode: 'all' for full grid, or omit for one-at-a-time (default: all)")
     p_init.add_argument("--partition", default="default", help="SLURM partition (default: 'default')")
     p_init.add_argument("--time", default="04:00:00", help="Wall time limit (default: 04:00:00)")
     p_init.add_argument("--mem", default="8G", help="Memory per node (default: 8G)")

@@ -1,129 +1,167 @@
 """Parse and validate hyperwhip YAML configuration files."""
 
 import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import yaml
+from pydantic import BaseModel, Field, model_validator
 
 
-@dataclass
-class ParameterSpec:
-    name: str
-    abbrev: str  # short abbreviation used in experiment_name (e.g. "lr", "opt", "bs")
-    type: str  # "discrete" or "continuous"
-    values: Optional[List[Any]] = None  # for discrete
-    low: Optional[float] = None  # for continuous
-    high: Optional[float] = None
-    scale: str = "linear"  # "linear" or "log"
-    steps: int = 5  # discretization steps for continuous
+class DiscreteParameter(BaseModel):
+    type: Literal["discrete"]
+    abbrev: str
+    values: List[Any] = Field(min_length=1)
 
 
-@dataclass
-class Constraint:
-    name: str
-    when: Dict[str, Any]  # param_name -> value that triggers this constraint
-    exclude: Optional[Dict[str, List[Any]]] = None  # param_name -> values to exclude
-    force: Optional[Dict[str, Any]] = None  # param_name -> forced value
+class ContinuousParameter(BaseModel):
+    type: Literal["continuous"]
+    abbrev: str
+    low: float
+    high: float
+    scale: Literal["linear", "log"] = "linear"
+    steps: int = Field(default=5, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_range(self):
+        if self.low >= self.high:
+            raise ValueError(f"low ({self.low}) must be less than high ({self.high})")
+        if self.scale == "log" and self.low <= 0:
+            raise ValueError(f"log scale requires low > 0, got {self.low}")
+        return self
 
 
-@dataclass
-class SlurmConfig:
+ParameterSpec = Union[DiscreteParameter, ContinuousParameter]
+
+
+class Constraint(BaseModel):
+    name: str = "unnamed"
+    when: Dict[str, Any] = Field(min_length=1)
+    exclude: Optional[Dict[str, List[Any]]] = None
+    force: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def _need_exclude_or_force(self):
+        if not self.exclude and not self.force:
+            raise ValueError(f"Constraint '{self.name}': must have 'exclude' and/or 'force'")
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_exclude(cls, data):
+        if isinstance(data, dict) and "exclude" in data and data["exclude"]:
+            for k, v in data["exclude"].items():
+                if not isinstance(v, list):
+                    data["exclude"][k] = [v]
+        return data
+
+
+class SlurmConfig(BaseModel):
     partition: str = "default"
     time: str = "01:00:00"
     mem: str = "8G"
     cpus_per_task: int = 1
     gres: Optional[str] = None
-    extra_args: List[str] = field(default_factory=list)
+    extra_args: List[str] = Field(default_factory=list)
 
 
-@dataclass
-class HydraConfig:
-    static_overrides: List[str] = field(default_factory=list)
+class HydraConfig(BaseModel):
+    static_overrides: List[str] = Field(default_factory=list)
 
 
-@dataclass
-class SearchConfig:
-    mode: str = "grid"  # "grid" or "axes"
-    defaults: Optional[Dict[str, Any]] = None  # required for axes mode
-
-
-@dataclass
-class Config:
+class Config(BaseModel):
     name: str
-    workspace: str
-    search: SearchConfig
-    slurm: SlurmConfig
-    hydra: HydraConfig
-    launcher: str
-    parameters: List[ParameterSpec]
-    constraints: List[Constraint]
+    workspace: str = ""  # set by load_config from the config file's directory
+
+    # Grid field: which parameters to grid over.
+    #   - None (omitted): one-at-a-time from defaults
+    #   - "all": Cartesian product of all parameters
+    #   - list of param names: grid those, defaults for the rest
+    grid: Optional[Union[Literal["all"], List[str]]] = None
+
+    # Default values for parameters. Required when grid != "all".
+    defaults: Optional[Dict[str, Any]] = None
+
+    slurm: SlurmConfig = Field(default_factory=SlurmConfig)
+    hydra: HydraConfig = Field(default_factory=HydraConfig)
+    launcher: str = ""
+
+    # parameters stored as a dict of name -> spec during parsing,
+    # but we expose them as a list with the name embedded
+    parameters: Dict[str, ParameterSpec] = Field(min_length=1)
+    constraints: List[Constraint] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_grid_and_defaults(self):
+        param_names = set(self.parameters.keys())
+
+        if self.grid == "all":
+            # No defaults needed
+            pass
+        elif isinstance(self.grid, list):
+            # Validate grid param names exist
+            unknown = set(self.grid) - param_names
+            if unknown:
+                raise ValueError(f"grid references unknown parameters: {sorted(unknown)}")
+            # Defaults required for non-grid params
+            non_grid = param_names - set(self.grid)
+            if non_grid:
+                if not self.defaults:
+                    raise ValueError(
+                        f"defaults required for non-grid parameters: {sorted(non_grid)}"
+                    )
+                missing = non_grid - set(self.defaults.keys())
+                if missing:
+                    raise ValueError(f"defaults missing for parameters: {sorted(missing)}")
+        else:
+            # grid is None -> one-at-a-time, all params need defaults
+            if not self.defaults:
+                raise ValueError("defaults required when grid is not set (one-at-a-time mode)")
+            missing = param_names - set(self.defaults.keys())
+            if missing:
+                raise ValueError(f"defaults missing for parameters: {sorted(missing)}")
+
+        # Validate constraint references
+        for constraint in self.constraints:
+            for ref in constraint.when:
+                if ref not in param_names:
+                    raise ValueError(
+                        f"Constraint '{constraint.name}': 'when' references "
+                        f"unknown parameter '{ref}'"
+                    )
+            if constraint.exclude:
+                for ref in constraint.exclude:
+                    if ref not in param_names:
+                        raise ValueError(
+                            f"Constraint '{constraint.name}': 'exclude' references "
+                            f"unknown parameter '{ref}'"
+                        )
+            if constraint.force:
+                for ref in constraint.force:
+                    if ref not in param_names:
+                        raise ValueError(
+                            f"Constraint '{constraint.name}': 'force' references "
+                            f"unknown parameter '{ref}'"
+                        )
+
+        return self
+
+    def get_param(self, name: str) -> ParameterSpec:
+        return self.parameters[name]
+
+    @property
+    def param_names(self) -> List[str]:
+        return list(self.parameters.keys())
+
+    @property
+    def abbrevs(self) -> Dict[str, str]:
+        return {name: spec.abbrev for name, spec in self.parameters.items()}
 
 
 class ConfigError(Exception):
     pass
 
 
-def _parse_parameter(name: str, spec: dict) -> ParameterSpec:
-    ptype = spec.get("type")
-    if ptype not in ("discrete", "continuous"):
-        raise ConfigError(
-            f"Parameter '{name}': type must be 'discrete' or 'continuous', got '{ptype}'"
-        )
-    abbrev = spec.get("abbrev")
-    if not abbrev or not isinstance(abbrev, str):
-        raise ConfigError(
-            f"Parameter '{name}': 'abbrev' is required (short name for experiment naming, e.g. 'lr')"
-        )
-    if ptype == "discrete":
-        values = spec.get("values")
-        if not values or not isinstance(values, list):
-            raise ConfigError(f"Parameter '{name}': discrete type requires a 'values' list")
-        return ParameterSpec(name=name, abbrev=abbrev, type="discrete", values=values)
-    else:
-        low = spec.get("low")
-        high = spec.get("high")
-        if low is None or high is None:
-            raise ConfigError(f"Parameter '{name}': continuous type requires 'low' and 'high'")
-        return ParameterSpec(
-            name=name,
-            abbrev=abbrev,
-            type="continuous",
-            low=float(low),
-            high=float(high),
-            scale=spec.get("scale", "linear"),
-            steps=spec.get("steps", 5),
-        )
-
-
-def _parse_constraint(raw: dict) -> Constraint:
-    name = raw.get("name", "unnamed")
-    when = raw.get("when")
-    if not when or not isinstance(when, dict):
-        raise ConfigError(f"Constraint '{name}': 'when' must be a non-empty dict")
-    exclude = raw.get("exclude")
-    force = raw.get("force")
-    if not exclude and not force:
-        raise ConfigError(f"Constraint '{name}': must have 'exclude' and/or 'force'")
-    if exclude:
-        for k, v in exclude.items():
-            if not isinstance(v, list):
-                exclude[k] = [v]
-    return Constraint(name=name, when=when, exclude=exclude, force=force)
-
-
 CONFIG_FILENAME = "hyperwhip.yaml"
-
-
-def resolve_config_path(path: str) -> str:
-    """Resolve a CLI argument to the config file path.
-
-    Accepts either a directory (workspace) or a direct path to a YAML file.
-    """
-    path = os.path.abspath(path)
-    if os.path.isdir(path):
-        return os.path.join(path, CONFIG_FILENAME)
-    return path
 
 
 def load_config(path: str) -> Config:
@@ -139,71 +177,16 @@ def load_config(path: str) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError("Config file must be a YAML mapping")
 
-    name = raw.get("name")
-    if not name:
-        raise ConfigError("Config must have a 'name' field")
-
     # Workspace is the directory containing the config file
     config_dir = os.path.dirname(path)
-    workspace = config_dir
+    raw["workspace"] = config_dir
 
-    # Search config
-    search_raw = raw.get("search", {})
-    search = SearchConfig(
-        mode=search_raw.get("mode", "grid"),
-        defaults=search_raw.get("defaults"),
-    )
-    if search.mode not in ("grid", "axes"):
-        raise ConfigError(f"search.mode must be 'grid' or 'axes', got '{search.mode}'")
-
-    # SLURM config
-    slurm_raw = raw.get("slurm", {})
-    slurm = SlurmConfig(
-        partition=slurm_raw.get("partition", "default"),
-        time=slurm_raw.get("time", "01:00:00"),
-        mem=slurm_raw.get("mem", "8G"),
-        cpus_per_task=slurm_raw.get("cpus_per_task", 1),
-        gres=slurm_raw.get("gres"),
-        extra_args=slurm_raw.get("extra_args", []),
-    )
-
-    # Hydra config
-    hydra_raw = raw.get("hydra", {})
-    hydra = HydraConfig(
-        static_overrides=hydra_raw.get("static_overrides", []),
-    )
-
-    # Launcher
+    # Resolve launcher path relative to config dir
     launcher = raw.get("launcher", "")
     if launcher and not os.path.isabs(launcher):
-        launcher = os.path.normpath(os.path.join(config_dir, launcher))
+        raw["launcher"] = os.path.normpath(os.path.join(config_dir, launcher))
 
-    # Parameters
-    params_raw = raw.get("parameters", {})
-    if not params_raw:
-        raise ConfigError("Config must define at least one parameter")
-    parameters = [_parse_parameter(name, spec) for name, spec in params_raw.items()]
-
-    # Validate axes mode has defaults
-    if search.mode == "axes":
-        if not search.defaults:
-            raise ConfigError("axes mode requires 'search.defaults' for all parameters")
-        param_names = {p.name for p in parameters}
-        missing = param_names - set(search.defaults.keys())
-        if missing:
-            raise ConfigError(f"axes mode missing defaults for: {missing}")
-
-    # Constraints
-    constraints_raw = raw.get("constraints", [])
-    constraints = [_parse_constraint(c) for c in constraints_raw]
-
-    return Config(
-        name=name,
-        workspace=workspace,
-        search=search,
-        slurm=slurm,
-        hydra=hydra,
-        launcher=launcher,
-        parameters=parameters,
-        constraints=constraints,
-    )
+    try:
+        return Config.model_validate(raw)
+    except Exception as e:
+        raise ConfigError(str(e)) from e

@@ -4,7 +4,7 @@ import os
 import subprocess
 from typing import List
 
-from hyperwhip.config import Config
+from hyperwhip.config import Config, ContinuousParameter, DiscreteParameter
 
 
 class PreflightError(Exception):
@@ -30,11 +30,7 @@ def run_preflight(config: Config, strict: bool = False) -> List[PreflightWarning
 
     _check_launcher(config)
     _check_workspace_writable(config)
-    _check_parameters_nonempty(config)
-    _check_constraint_refs(config)
-
-    if config.search.mode == "axes":
-        _check_axes_defaults(config)
+    _check_defaults(config)
 
     warnings.extend(_check_partition(config))
 
@@ -62,7 +58,6 @@ def _check_launcher(config: Config) -> None:
 def _check_workspace_writable(config: Config) -> None:
     """Verify we can write to the workspace parent directory."""
     ws = config.workspace
-    # If workspace already exists, check it's writable
     if os.path.isdir(ws):
         if not os.access(ws, os.W_OK):
             raise PreflightError(
@@ -70,7 +65,6 @@ def _check_workspace_writable(config: Config) -> None:
             )
         return
 
-    # Otherwise check the parent is writable (we'll create workspace on launch)
     parent = os.path.dirname(ws)
     if not parent:
         parent = "."
@@ -85,87 +79,32 @@ def _check_workspace_writable(config: Config) -> None:
         )
 
 
-def _check_parameters_nonempty(config: Config) -> None:
-    """Verify at least one parameter is defined and all have valid values."""
-    if not config.parameters:
-        raise PreflightError("No parameters defined. Add at least one parameter to sweep over.")
+def _check_defaults(config: Config) -> None:
+    """Verify default values are valid for their parameters (when defaults are used)."""
+    if not config.defaults:
+        return
 
-    for param in config.parameters:
-        if param.type == "discrete":
-            if not param.values:
-                raise PreflightError(
-                    f"Parameter '{param.name}': discrete type has empty values list."
-                )
-        elif param.type == "continuous":
-            if param.low >= param.high:
-                raise PreflightError(
-                    f"Parameter '{param.name}': low ({param.low}) must be less than high ({param.high})."
-                )
-            if param.steps < 1:
-                raise PreflightError(
-                    f"Parameter '{param.name}': steps must be >= 1, got {param.steps}."
-                )
-            if param.scale == "log" and param.low <= 0:
-                raise PreflightError(
-                    f"Parameter '{param.name}': log scale requires low > 0, got {param.low}."
-                )
-
-
-def _check_constraint_refs(config: Config) -> None:
-    """Verify constraint 'when', 'exclude', and 'force' reference defined parameters."""
-    param_names = {p.name for p in config.parameters}
-
-    for constraint in config.constraints:
-        for ref in constraint.when:
-            if ref not in param_names:
-                raise PreflightError(
-                    f"Constraint '{constraint.name}': 'when' references unknown parameter '{ref}'.\n"
-                    f"  Defined parameters: {sorted(param_names)}"
-                )
-        if constraint.exclude:
-            for ref in constraint.exclude:
-                if ref not in param_names:
-                    raise PreflightError(
-                        f"Constraint '{constraint.name}': 'exclude' references unknown parameter '{ref}'.\n"
-                        f"  Defined parameters: {sorted(param_names)}"
-                    )
-        if constraint.force:
-            for ref in constraint.force:
-                if ref not in param_names:
-                    raise PreflightError(
-                        f"Constraint '{constraint.name}': 'force' references unknown parameter '{ref}'.\n"
-                        f"  Defined parameters: {sorted(param_names)}"
-                    )
-
-
-def _check_axes_defaults(config: Config) -> None:
-    """Verify axes-mode defaults reference valid parameter values."""
-    if not config.search.defaults:
-        raise PreflightError("axes mode requires 'search.defaults' for all parameters.")
-
-    for param in config.parameters:
-        default = config.search.defaults.get(param.name)
+    for name, spec in config.parameters.items():
+        default = config.defaults.get(name)
         if default is None:
+            continue
+        if isinstance(spec, DiscreteParameter) and default not in spec.values:
             raise PreflightError(
-                f"axes mode: no default value for parameter '{param.name}'."
+                f"Default value '{default}' for parameter '{name}' "
+                f"is not in its values list: {spec.values}"
             )
-        if param.type == "discrete" and default not in param.values:
-            raise PreflightError(
-                f"axes mode: default value '{default}' for parameter '{param.name}' "
-                f"is not in its values list: {param.values}"
-            )
-        if param.type == "continuous":
+        if isinstance(spec, ContinuousParameter):
             try:
                 val = float(default)
             except (TypeError, ValueError):
                 raise PreflightError(
-                    f"axes mode: default value '{default}' for continuous parameter "
-                    f"'{param.name}' is not a number."
+                    f"Default value '{default}' for continuous parameter "
+                    f"'{name}' is not a number."
                 )
-            if val < param.low or val > param.high:
+            if val < spec.low or val > spec.high:
                 raise PreflightError(
-                    f"axes mode: default value {val} for parameter '{param.name}' "
-                    f"is outside range [{param.low}, {param.high}]."
+                    f"Default value {val} for parameter '{name}' "
+                    f"is outside range [{spec.low}, {spec.high}]."
                 )
 
 

@@ -29,12 +29,11 @@ class TestScaffold(unittest.TestCase):
             content = f.read()
         self.assertIn("name: my_sweep", content)
 
-    def test_config_contains_search_mode(self):
-        scaffold(self.tmpdir, name="test", search_mode="axes")
+    def test_config_contains_grid(self):
+        scaffold(self.tmpdir, name="test", grid="all")
         with open(os.path.join(self.tmpdir, "hyperwhip.yaml")) as f:
             content = f.read()
-        self.assertIn("mode: axes", content)
-        self.assertIn("defaults:", content)
+        self.assertIn("grid: all", content)
 
     def test_config_contains_gres(self):
         scaffold(self.tmpdir, name="test", gres="gpu:1")
@@ -60,7 +59,6 @@ class TestScaffold(unittest.TestCase):
 
     def test_force_overwrites(self):
         scaffold(self.tmpdir, name="test")
-        # Should not raise
         scaffold(self.tmpdir, name="test_v2", overwrite=True)
         with open(os.path.join(self.tmpdir, "hyperwhip.yaml")) as f:
             content = f.read()

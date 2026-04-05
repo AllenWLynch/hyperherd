@@ -6,8 +6,13 @@ import stat
 CONFIG_TEMPLATE = """\
 name: {name}
 
-search:
-  mode: {search_mode}
+# Grid controls which parameters are swept via Cartesian product.
+#   grid: all          — grid over everything
+#   grid: [lr, wd]     — grid over lr and wd, hold others at defaults
+#   (omit grid)        — one-at-a-time from defaults
+{grid_line}
+
+# Default values for each parameter (required unless grid: all)
 {defaults_block}
 slurm:
   partition: {partition}
@@ -50,7 +55,7 @@ python train.py $OVERRIDES
 def scaffold(
     directory,
     name=None,
-    search_mode="grid",
+    grid="all",
     partition="default",
     time="04:00:00",
     mem="8G",
@@ -83,13 +88,20 @@ def scaffold(
     # Build config content
     gres_line = f'  gres: "{gres}"' if gres else "  # gres: \"gpu:1\"  # uncomment for GPU jobs"
 
-    defaults_block = ""
-    if search_mode == "axes":
+    if grid == "all":
+        grid_line = "grid: all"
         defaults_block = (
-            "  defaults:\n"
-            "    # Set default value for each parameter:\n"
-            "    # param_name: default_value\n"
-            "\n"
+            "# defaults:\n"
+            "#   learning_rate: 0.001\n"
+            "#   optimizer: adam\n"
+        )
+    else:
+        grid_line = "# grid: all"
+        defaults_block = (
+            "defaults:\n"
+            "  # Set default value for each parameter:\n"
+            "  # learning_rate: 0.001\n"
+            "  # optimizer: adam\n"
         )
 
     static_overrides_block = (
@@ -101,7 +113,7 @@ def scaffold(
 
     config_content = CONFIG_TEMPLATE.format(
         name=name,
-        search_mode=search_mode,
+        grid_line=grid_line,
         defaults_block=defaults_block,
         partition=partition,
         time=time,

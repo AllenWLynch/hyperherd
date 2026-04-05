@@ -1,11 +1,11 @@
 name: demo_axes
 
-search:
-  mode: axes
-  defaults:
-    learning_rate: 0.001
-    optimizer: adam
-    batch_size: 64
+# No grid field = one-at-a-time from defaults
+
+defaults:
+  learning_rate: 0.001
+  optimizer: adam
+  batch_size: 64
 
 slurm:
   partition: gpu
@@ -15,8 +15,6 @@ slurm:
   gres: "gpu:1"
 
 launcher: ./launch.sh
-
-hydra: {}
 
 parameters:
   learning_rate:

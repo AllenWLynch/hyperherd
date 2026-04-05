@@ -1,7 +1,6 @@
 name: demo_sweep
 
-search:
-  mode: grid
+grid: all
 
 slurm:
   partition: gpu

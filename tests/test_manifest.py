@@ -60,7 +60,6 @@ class TestManifest(unittest.TestCase):
         manifest.create_manifest(self.tmpdir, [{"a": i} for i in range(5)])
         manifest.bulk_update_status(self.tmpdir, {0: "completed", 2: "running", 4: "failed"})
         pending = manifest.get_pending_indices(self.tmpdir)
-        # pending + failed = 1, 3, 4
         self.assertEqual(sorted(pending), [1, 3, 4])
 
     def test_resolve_overrides(self):
@@ -127,8 +126,6 @@ class TestExperimentName(unittest.TestCase):
 
         overrides = manifest.resolve_overrides(self.tmpdir, 0)
         self.assertIn("experiment_name=lr=0.001_opt=adam", overrides)
-        self.assertIn("lr=", overrides)
-        self.assertIn("opt=adam", overrides)
 
 
 class TestWorkspaceExists(unittest.TestCase):
