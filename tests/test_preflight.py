@@ -10,8 +10,7 @@ from hyperwhip.config import Config
 from hyperwhip.preflight import PreflightError, run_preflight
 
 
-def _make_config(parameters=None, constraints=None, launcher=None, workspace=None,
-                 grid="all", defaults=None):
+def _make_config(parameters=None, constraints=None, launcher=None, workspace=None, grid="all"):
     if parameters is None:
         parameters = {"lr": {"abbrev": "lr", "type": "discrete", "values": [0.1, 0.01]}}
     if constraints is None:
@@ -26,8 +25,6 @@ def _make_config(parameters=None, constraints=None, launcher=None, workspace=Non
     }
     if grid is not None:
         raw["grid"] = grid
-    if defaults is not None:
-        raw["defaults"] = defaults
     return Config.model_validate(raw)
 
 
@@ -109,41 +106,39 @@ class TestDefaultsCheck(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
 
-    def test_default_not_in_values(self):
-        config = _make_config(
-            launcher=self.launcher, workspace=self.tmpdir,
-            parameters={"opt": {"abbrev": "opt", "type": "discrete", "values": ["adam", "sgd"]}},
-            grid=None, defaults={"opt": "rmsprop"},
-        )
-        with self.assertRaises(PreflightError) as ctx:
-            run_preflight(config)
-        self.assertIn("not in its values list", str(ctx.exception))
+    def test_default_not_in_values_fails_at_parse(self):
+        """Pydantic validates default is in values at parse time."""
+        from pydantic import ValidationError
+        with self.assertRaises((ValidationError, Exception)):
+            _make_config(
+                launcher=self.launcher, workspace=self.tmpdir,
+                parameters={"opt": {"abbrev": "opt", "type": "discrete", "values": ["adam", "sgd"], "default": "rmsprop"}},
+                grid=None,
+            )
 
-    def test_continuous_default_out_of_range(self):
-        config = _make_config(
-            launcher=self.launcher, workspace=self.tmpdir,
-            parameters={"lr": {"abbrev": "lr", "type": "continuous", "low": 0.001, "high": 0.1, "steps": 3}},
-            grid=None, defaults={"lr": 999.0},
-        )
-        with self.assertRaises(PreflightError) as ctx:
-            run_preflight(config)
-        self.assertIn("outside range", str(ctx.exception))
+    def test_continuous_default_out_of_range_fails_at_parse(self):
+        from pydantic import ValidationError
+        with self.assertRaises((ValidationError, Exception)):
+            _make_config(
+                launcher=self.launcher, workspace=self.tmpdir,
+                parameters={"lr": {"abbrev": "lr", "type": "continuous", "low": 0.001, "high": 0.1, "steps": 3, "default": 999.0}},
+                grid=None,
+            )
 
     def test_valid_defaults(self):
         config = _make_config(
             launcher=self.launcher, workspace=self.tmpdir,
             parameters={
-                "lr": {"abbrev": "lr", "type": "continuous", "low": 0.001, "high": 0.1, "steps": 3},
-                "opt": {"abbrev": "opt", "type": "discrete", "values": ["adam", "sgd"]},
+                "lr": {"abbrev": "lr", "type": "continuous", "low": 0.001, "high": 0.1, "steps": 3, "default": 0.01},
+                "opt": {"abbrev": "opt", "type": "discrete", "values": ["adam", "sgd"], "default": "adam"},
             },
-            grid=None, defaults={"lr": 0.01, "opt": "adam"},
+            grid=None,
         )
         run_preflight(config)
 
 
 class TestConstraintValidation(unittest.TestCase):
     def test_unknown_when_param(self):
-        """Constraint referencing unknown param should fail at config parse time."""
         from pydantic import ValidationError
         with self.assertRaises((ValidationError, Exception)):
             _make_config(

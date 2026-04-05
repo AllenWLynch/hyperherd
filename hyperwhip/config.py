@@ -11,6 +11,15 @@ class DiscreteParameter(BaseModel):
     type: Literal["discrete"]
     abbrev: str
     values: List[Any] = Field(min_length=1)
+    default: Optional[Any] = None
+
+    @model_validator(mode="after")
+    def _validate_default(self):
+        if self.default is not None and self.default not in self.values:
+            raise ValueError(
+                f"default '{self.default}' is not in values: {self.values}"
+            )
+        return self
 
 
 class ContinuousParameter(BaseModel):
@@ -20,6 +29,7 @@ class ContinuousParameter(BaseModel):
     high: float
     scale: Literal["linear", "log"] = "linear"
     steps: int = Field(default=5, ge=1)
+    default: Optional[float] = None
 
     @model_validator(mode="after")
     def _validate_range(self):
@@ -27,6 +37,11 @@ class ContinuousParameter(BaseModel):
             raise ValueError(f"low ({self.low}) must be less than high ({self.high})")
         if self.scale == "log" and self.low <= 0:
             raise ValueError(f"log scale requires low > 0, got {self.low}")
+        if self.default is not None:
+            if self.default < self.low or self.default > self.high:
+                raise ValueError(
+                    f"default {self.default} is outside range [{self.low}, {self.high}]"
+                )
         return self
 
 
@@ -78,15 +93,10 @@ class Config(BaseModel):
     #   - list of param names: grid those, defaults for the rest
     grid: Optional[Union[Literal["all"], List[str]]] = None
 
-    # Default values for parameters. Required when grid != "all".
-    defaults: Optional[Dict[str, Any]] = None
-
     slurm: SlurmConfig = Field(default_factory=SlurmConfig)
     hydra: HydraConfig = Field(default_factory=HydraConfig)
     launcher: str = ""
 
-    # parameters stored as a dict of name -> spec during parsing,
-    # but we expose them as a list with the name embedded
     parameters: Dict[str, ParameterSpec] = Field(min_length=1)
     constraints: List[Constraint] = Field(default_factory=list)
 
@@ -104,21 +114,20 @@ class Config(BaseModel):
                 raise ValueError(f"grid references unknown parameters: {sorted(unknown)}")
             # Defaults required for non-grid params
             non_grid = param_names - set(self.grid)
-            if non_grid:
-                if not self.defaults:
+            for name in non_grid:
+                if self.parameters[name].default is None:
                     raise ValueError(
-                        f"defaults required for non-grid parameters: {sorted(non_grid)}"
+                        f"parameter '{name}' needs a default value "
+                        f"(it is not in the grid)"
                     )
-                missing = non_grid - set(self.defaults.keys())
-                if missing:
-                    raise ValueError(f"defaults missing for parameters: {sorted(missing)}")
         else:
             # grid is None -> one-at-a-time, all params need defaults
-            if not self.defaults:
-                raise ValueError("defaults required when grid is not set (one-at-a-time mode)")
-            missing = param_names - set(self.defaults.keys())
-            if missing:
-                raise ValueError(f"defaults missing for parameters: {sorted(missing)}")
+            for name, spec in self.parameters.items():
+                if spec.default is None:
+                    raise ValueError(
+                        f"parameter '{name}' needs a default value "
+                        f"(grid is not set, so all parameters need defaults)"
+                    )
 
         # Validate constraint references
         for constraint in self.constraints:
@@ -155,6 +164,18 @@ class Config(BaseModel):
     @property
     def abbrevs(self) -> Dict[str, str]:
         return {name: spec.abbrev for name, spec in self.parameters.items()}
+
+    @property
+    def defaults(self) -> Optional[Dict[str, Any]]:
+        """Build defaults dict from per-parameter default fields.
+
+        Returns None if no parameters have defaults set.
+        """
+        d = {}
+        for name, spec in self.parameters.items():
+            if spec.default is not None:
+                d[name] = spec.default
+        return d if d else None
 
 
 class ConfigError(Exception):

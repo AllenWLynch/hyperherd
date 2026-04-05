@@ -4,7 +4,7 @@ import os
 import subprocess
 from typing import List
 
-from hyperwhip.config import Config, ContinuousParameter, DiscreteParameter
+from hyperwhip.config import Config
 
 
 class PreflightError(Exception):
@@ -30,7 +30,6 @@ def run_preflight(config: Config, strict: bool = False) -> List[PreflightWarning
 
     _check_launcher(config)
     _check_workspace_writable(config)
-    _check_defaults(config)
 
     warnings.extend(_check_partition(config))
 
@@ -78,34 +77,6 @@ def _check_workspace_writable(config: Config) -> None:
             f"Workspace parent directory is not writable: {parent}"
         )
 
-
-def _check_defaults(config: Config) -> None:
-    """Verify default values are valid for their parameters (when defaults are used)."""
-    if not config.defaults:
-        return
-
-    for name, spec in config.parameters.items():
-        default = config.defaults.get(name)
-        if default is None:
-            continue
-        if isinstance(spec, DiscreteParameter) and default not in spec.values:
-            raise PreflightError(
-                f"Default value '{default}' for parameter '{name}' "
-                f"is not in its values list: {spec.values}"
-            )
-        if isinstance(spec, ContinuousParameter):
-            try:
-                val = float(default)
-            except (TypeError, ValueError):
-                raise PreflightError(
-                    f"Default value '{default}' for continuous parameter "
-                    f"'{name}' is not a number."
-                )
-            if val < spec.low or val > spec.high:
-                raise PreflightError(
-                    f"Default value {val} for parameter '{name}' "
-                    f"is outside range [{spec.low}, {spec.high}]."
-                )
 
 
 def _check_partition(config: Config) -> List[PreflightWarning]:

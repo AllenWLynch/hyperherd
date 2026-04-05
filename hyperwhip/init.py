@@ -12,8 +12,6 @@ name: {name}
 #   (omit grid)        — one-at-a-time from defaults
 {grid_line}
 
-# Default values for each parameter (required unless grid: all)
-{defaults_block}
 slurm:
   partition: {partition}
   time: "{time}"
@@ -90,19 +88,8 @@ def scaffold(
 
     if grid == "all":
         grid_line = "grid: all"
-        defaults_block = (
-            "# defaults:\n"
-            "#   learning_rate: 0.001\n"
-            "#   optimizer: adam\n"
-        )
     else:
         grid_line = "# grid: all"
-        defaults_block = (
-            "defaults:\n"
-            "  # Set default value for each parameter:\n"
-            "  # learning_rate: 0.001\n"
-            "  # optimizer: adam\n"
-        )
 
     static_overrides_block = (
         "  # static_overrides:\n"
@@ -114,7 +101,6 @@ def scaffold(
     config_content = CONFIG_TEMPLATE.format(
         name=name,
         grid_line=grid_line,
-        defaults_block=defaults_block,
         partition=partition,
         time=time,
         mem=mem,
@@ -147,12 +133,14 @@ def _build_example_parameters():
     high: 1e-2
     scale: log
     steps: 5
+    # default: 0.001  # required unless grid: all
 
   # Example discrete parameter:
   # optimizer:
   #   abbrev: opt
   #   type: discrete
   #   values: [adam, sgd, adamw]
+  #   default: adam    # required unless grid: all
 
 # constraints:
 #   - name: example_constraint

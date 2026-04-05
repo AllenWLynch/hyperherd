@@ -2,11 +2,6 @@ name: demo_axes
 
 # No grid field = one-at-a-time from defaults
 
-defaults:
-  learning_rate: 0.001
-  optimizer: adam
-  batch_size: 64
-
 slurm:
   partition: gpu
   time: "02:00:00"
@@ -24,11 +19,14 @@ parameters:
     high: 1e-2
     scale: log
     steps: 3
+    default: 0.001
   optimizer:
     abbrev: opt
     type: discrete
     values: [adam, sgd, adamw]
+    default: adam
   batch_size:
     abbrev: bs
     type: discrete
     values: [32, 64, 128]
+    default: 64
