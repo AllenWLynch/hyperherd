@@ -51,17 +51,20 @@ def build_experiment_name(
 ) -> str:
     """Construct a deterministic experiment name from parameter abbreviations and values.
 
+    Uses '-' as key-value separator (not '=') to avoid conflicts with Hydra's
+    override syntax when experiment_name is passed as an override.
+
     Example: with abbrevs={"learning_rate": "lr", "optimizer": "opt"} and
     params={"learning_rate": 0.001, "optimizer": "adam"},
-    returns "lr=0.001_opt=adam".
+    returns "lr-0.001_opt-adam".
     """
     parts = []
     for param_name, value in params.items():
         abbr = abbrevs.get(param_name, param_name)
         if isinstance(value, float):
-            parts.append(f"{abbr}={value:.4g}")
+            parts.append(f"{abbr}-{value:.4g}")
         else:
-            parts.append(f"{abbr}={value}")
+            parts.append(f"{abbr}-{value}")
     return "_".join(parts)
 
 

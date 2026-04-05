@@ -154,6 +154,79 @@ def cmd_tail(args):
     return 0
 
 
+def cmd_test(args):
+    """Run a single trial locally via the launcher script (no SLURM)."""
+    import subprocess
+
+    config = load_config(args.workspace)
+
+    # Preflight checks
+    try:
+        run_preflight(config)
+    except PreflightError as e:
+        print(f"Preflight check failed: {e}", file=sys.stderr)
+        return 1
+
+    # Generate combinations and ensure manifest exists
+    combinations = generate_combinations(config)
+    combinations = apply_constraints(combinations, config.constraints)
+
+    if not combinations:
+        print("No valid parameter combinations after applying constraints.", file=sys.stderr)
+        return 1
+
+    manifest.init_workspace(config.workspace)
+
+    if not manifest.workspace_exists(config.workspace):
+        abbrevs = config.abbrevs
+        manifest.create_manifest(config.workspace, combinations, abbrevs)
+
+    trials = manifest.load_manifest(config.workspace)
+
+    index = args.index
+    if index < 0 or index >= len(trials):
+        print(f"Trial index {index} out of range (0-{len(trials) - 1}).", file=sys.stderr)
+        return 1
+
+    trial = trials[index]
+    exp_name = trial.get("experiment_name", "")
+    overrides = manifest.resolve_overrides(
+        config.workspace, index, config.hydra.static_overrides or None
+    )
+
+    # Append --cfg job to validate Hydra config without running training
+    overrides_with_cfg = f"{overrides} --cfg job"
+
+    print(f"Validating Hydra config for trial {index}")
+    if exp_name:
+        print(f"  experiment_name: {exp_name}")
+    print(f"  overrides: {overrides}")
+    print(f"  launcher: {config.launcher}")
+    print(f"  (appending --cfg job for Hydra config validation)")
+    print("-" * 60)
+    print()
+
+    # Set env vars to match what the sbatch script would export
+    env = os.environ.copy()
+    env["HYPERWHIP_TRIAL_ID"] = str(index)
+    env["HYPERWHIP_EXPERIMENT_NAME"] = exp_name
+
+    result = subprocess.run(
+        ["bash", config.launcher, overrides_with_cfg],
+        cwd=config.workspace,
+        env=env,
+    )
+
+    print()
+    print("-" * 60)
+    if result.returncode == 0:
+        print(f"Trial {index}: Hydra config is valid.")
+    else:
+        print(f"Trial {index}: Hydra config validation failed (exit code {result.returncode}).")
+
+    return result.returncode
+
+
 def cmd_clean(args):
     """Cancel running jobs and clean up workspace."""
     config = load_config(args.workspace)
@@ -312,6 +385,11 @@ def main():
     p_monitor = subparsers.add_parser("monitor", help="Show status of all trials")
     p_monitor.add_argument("workspace", help="Workspace directory (contains hyperwhip.yaml)")
 
+    # test
+    p_test = subparsers.add_parser("test", help="Validate Hydra config by running a trial with --cfg job")
+    p_test.add_argument("workspace", help="Workspace directory (contains hyperwhip.yaml)")
+    p_test.add_argument("index", nargs="?", type=int, default=0, help="Trial index to test (default: 0)")
+
     # tail
     p_tail = subparsers.add_parser("tail", help="Print last N lines of a trial's log")
     p_tail.add_argument("workspace", help="Workspace directory (contains hyperwhip.yaml)")
@@ -341,6 +419,7 @@ def main():
     handlers = {
         "init": cmd_init,
         "launch": cmd_launch,
+        "test": cmd_test,
         "monitor": cmd_monitor,
         "tail": cmd_tail,
         "clean": cmd_clean,

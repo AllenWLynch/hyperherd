@@ -100,23 +100,23 @@ class TestExperimentName(unittest.TestCase):
         params = {"learning_rate": 0.001, "optimizer": "adam", "batch_size": 64}
         abbrevs = {"learning_rate": "lr", "optimizer": "opt", "batch_size": "bs"}
         name = manifest.build_experiment_name(params, abbrevs)
-        self.assertEqual(name, "lr=0.001_opt=adam_bs=64")
+        self.assertEqual(name, "lr-0.001_opt-adam_bs-64")
 
     def test_build_experiment_name_float_formatting(self):
         params = {"lr": 0.00012345}
         abbrevs = {"lr": "lr"}
         name = manifest.build_experiment_name(params, abbrevs)
-        self.assertEqual(name, "lr=0.0001234")
+        self.assertEqual(name, "lr-0.0001234")
 
     def test_manifest_stores_experiment_name(self):
         manifest.init_workspace(self.tmpdir)
         combos = [{"lr": 0.001, "opt": "adam"}]
         abbrevs = {"lr": "lr", "opt": "opt"}
         trials = manifest.create_manifest(self.tmpdir, combos, abbrevs)
-        self.assertEqual(trials[0]["experiment_name"], "lr=0.001_opt=adam")
+        self.assertEqual(trials[0]["experiment_name"], "lr-0.001_opt-adam")
 
         loaded = manifest.load_manifest(self.tmpdir)
-        self.assertEqual(loaded[0]["experiment_name"], "lr=0.001_opt=adam")
+        self.assertEqual(loaded[0]["experiment_name"], "lr-0.001_opt-adam")
 
     def test_resolve_overrides_includes_experiment_name(self):
         manifest.init_workspace(self.tmpdir)
@@ -125,7 +125,7 @@ class TestExperimentName(unittest.TestCase):
         manifest.create_manifest(self.tmpdir, combos, abbrevs)
 
         overrides = manifest.resolve_overrides(self.tmpdir, 0)
-        self.assertIn("experiment_name=lr=0.001_opt=adam", overrides)
+        self.assertIn("experiment_name=lr-0.001_opt-adam", overrides)
 
 
 class TestWorkspaceExists(unittest.TestCase):
