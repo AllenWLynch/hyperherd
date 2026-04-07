@@ -394,7 +394,7 @@ def _sync_slurm_status(workspace: str):
     state_map = {
         "COMPLETED": "completed",
         "RUNNING": "running",
-        "PENDING": "pending",
+        "PENDING": "queued",     # SLURM queued != never submitted
         "FAILED": "failed",
         "CANCELLED": "cancelled",
         "TIMEOUT": "failed",

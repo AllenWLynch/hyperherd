@@ -1,0 +1,55 @@
+name: mnist_sweep
+
+grid: [learning_rate, optimizer]
+
+slurm:
+  partition: gpu
+  time: "01:00:00"
+  mem: "16G"
+  cpus_per_task: 4
+  gres: "gpu:1"
+
+launcher: ./launch.sh
+
+hydra:
+  static_overrides:
+    - "max_epochs=10"
+    - "data_dir=/scratch/$USER/mnist"
+    - "accelerator=auto"
+
+parameters:
+  learning_rate:
+    abbrev: lr
+    type: continuous
+    low: 1e-4
+    high: 1e-1
+    scale: log
+    steps: 4
+    default: 0.001
+  optimizer:
+    abbrev: opt
+    type: discrete
+    values: [adam, sgd, adamw]
+    default: adam
+  batch_size:
+    abbrev: bs
+    type: discrete
+    values: [32, 64, 128]
+    default: 64
+  hidden_dim:
+    abbrev: hd
+    type: discrete
+    values: [64, 128, 256]
+    default: 128
+  dropout:
+    abbrev: do
+    type: discrete
+    values: [0.0, 0.2, 0.5]
+    default: 0.0
+
+constraints:
+  - name: sgd_needs_lower_lr
+    when:
+      optimizer: sgd
+    exclude:
+      learning_rate: [0.1]
