@@ -163,16 +163,35 @@ def query_job_status(job_ids: List[str]) -> Dict[Tuple[str, int], str]:
             continue
         job_id_str = parts[0]
         state = parts[1].split()[0] if parts[1] else "UNKNOWN"  # strip trailing text
-        elapsed = parts[2] if len(parts) > 2 else ""
 
-        # Parse "12345_0" format (job array tasks)
-        match = re.match(r"(\d+)_(\d+)", job_id_str)
+        # Parse "12345_0" format (individual job array tasks)
+        match = re.match(r"(\d+)_(\d+)$", job_id_str)
         if match:
             jid = match.group(1)
             array_idx = int(match.group(2))
             statuses[(jid, array_idx)] = state
+            continue
+
+        # Parse "12345_[0-10]" compact range format (e.g. cancelled before running)
+        match = re.match(r"(\d+)_\[(.+)\]$", job_id_str)
+        if match:
+            jid = match.group(1)
+            for idx in _parse_array_range(match.group(2)):
+                statuses[(jid, idx)] = state
 
     return statuses
+
+
+def _parse_array_range(spec: str) -> List[int]:
+    """Parse a SLURM array range spec like '0-10' or '0-3,5,7-9' into indices."""
+    indices = []
+    for part in spec.split(","):
+        if "-" in part:
+            start, end = part.split("-", 1)
+            indices.extend(range(int(start), int(end) + 1))
+        else:
+            indices.append(int(part))
+    return indices
 
 
 def _query_squeue(job_ids: List[str]) -> Dict[Tuple[str, int], str]:

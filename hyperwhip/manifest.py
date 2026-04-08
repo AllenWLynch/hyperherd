@@ -133,9 +133,9 @@ def get_trials_by_status(base: str, status: str) -> List[dict]:
 
 
 def get_pending_indices(base: str) -> List[int]:
-    """Get indices that need (re)submission: pending or failed."""
+    """Get indices that need (re)submission: pending, failed, or cancelled."""
     trials = load_manifest(base)
-    return [t["index"] for t in trials if t["status"] in ("pending", "failed")]
+    return [t["index"] for t in trials if t["status"] in ("pending", "failed", "cancelled")]
 
 
 # --- Job ID tracking ---
