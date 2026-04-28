@@ -101,6 +101,7 @@ SLURM resource requests. These map directly to `#SBATCH` directives in the gener
 | `mem`           | string       | no       | `"8G"`       | Memory per node (e.g. `"16G"`, `"512M"`). |
 | `cpus_per_task` | integer      | no       | `1`          | Number of CPU cores per task. |
 | `gres`          | string       | no       | *omitted*    | Generic resources (e.g. `"gpu:1"`, `"gpu:a100:2"`). If omitted, the `--gres` line is not included. |
+| `max_concurrent`| integer      | no       | *omitted*    | Cap on simultaneously running array tasks. Appended as `%N` to the SLURM array spec (e.g. `--array=0-49%5`). Override per-run with `whip run --max-concurrent N`. |
 | `extra_args`    | list[string] | no       | `[]`         | Additional raw `#SBATCH` flags. Each string is placed after `#SBATCH ` verbatim. |
 
 ```yaml

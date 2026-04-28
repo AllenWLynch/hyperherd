@@ -64,7 +64,7 @@ def cmd_launch(args):
         pending = [t["index"] for t in trials]
 
     # Generate sbatch script
-    script = slurm.generate_sbatch_script(config, pending)
+    script = slurm.generate_sbatch_script(config, pending, args.max_concurrent)
 
     if args.dry_run:
         print_dry_run(trials, script, defaults=config.defaults)
@@ -234,6 +234,88 @@ def cmd_test(args):
         print(f"Trial {index}: Hydra config is valid.")
     else:
         print(f"Trial {index}: Hydra config validation failed (exit code {result.returncode}).")
+
+    return result.returncode
+
+
+def cmd_local(args):
+    """Run a single trial end-to-end locally via the launcher (no SLURM, no --cfg job).
+
+    Useful as a final pre-flight before `whip run`. Refuses any index that has
+    ever been submitted to SLURM, to avoid interfering with a real run's outputs.
+    """
+    import subprocess
+
+    config = load_config(args.workspace)
+
+    try:
+        run_preflight(config)
+    except PreflightError as e:
+        print(f"Preflight check failed: {e}", file=sys.stderr)
+        return 1
+
+    combinations = generate_combinations(config)
+    combinations = apply_constraints(combinations, config.conditions)
+
+    if not combinations:
+        print("No valid parameter combinations after applying conditions.", file=sys.stderr)
+        return 1
+
+    manifest.init_workspace(config.workspace)
+
+    if not manifest.workspace_exists(config.workspace):
+        manifest.create_manifest(config.workspace, combinations, config.abbrevs, config.labels)
+
+    trials = manifest.load_manifest(config.workspace)
+
+    index = args.index
+    if index < 0 or index >= len(trials):
+        print(f"Trial index {index} out of range (0-{len(trials) - 1}).", file=sys.stderr)
+        return 1
+
+    # Refuse if this index has ever been submitted to SLURM.
+    for record in manifest.get_job_ids(config.workspace):
+        if index in record.get("indices", []):
+            print(
+                f"Trial {index} was previously submitted to SLURM "
+                f"(job {record['slurm_job_id']}). Refusing to run locally — "
+                f"running would clobber its outputs/logs. Pick a different index "
+                f"or `whip clean --all` first.",
+                file=sys.stderr,
+            )
+            return 1
+
+    trial = trials[index]
+    exp_name = trial.get("experiment_name", "")
+    overrides = manifest.resolve_overrides(
+        config.workspace, index, config.hydra.static_overrides or None
+    )
+
+    print(f"Running trial {index} locally")
+    if exp_name:
+        print(f"  experiment_name: {exp_name}")
+    print(f"  overrides: {overrides}")
+    print(f"  launcher: {config.launcher}")
+    print("-" * 60)
+    print()
+
+    env = os.environ.copy()
+    env["HYPERWHIP_WORKSPACE"] = config.workspace
+    env["HYPERWHIP_TRIAL_ID"] = str(index)
+    env["HYPERWHIP_EXPERIMENT_NAME"] = exp_name
+
+    result = subprocess.run(
+        ["bash", config.launcher, overrides],
+        cwd=config.workspace,
+        env=env,
+    )
+
+    print()
+    print("-" * 60)
+    if result.returncode == 0:
+        print(f"Trial {index}: local run completed successfully.")
+    else:
+        print(f"Trial {index}: local run failed (exit code {result.returncode}).")
 
     return result.returncode
 
@@ -429,23 +511,27 @@ def main():
     # init
     p_init = subparsers.add_parser("init", help="Scaffold a new config and launcher script")
     p_init.add_argument("directory", nargs="?", default=".", help="Directory to create files in (default: current)")
-    p_init.add_argument("--name", default=None, help="Experiment name (default: directory name)")
-    p_init.add_argument("--grid", default="all", help="Grid mode: 'all' for full grid, or omit for one-at-a-time (default: all)")
-    p_init.add_argument("--partition", default="default", help="SLURM partition (default: 'default')")
-    p_init.add_argument("--time", default="04:00:00", help="Wall time limit (default: 04:00:00)")
-    p_init.add_argument("--mem", default="8G", help="Memory per node (default: 8G)")
-    p_init.add_argument("--cpus", type=int, default=1, help="CPUs per task (default: 1)")
+    p_init.add_argument("-N", "--name", default=None, help="Experiment name (default: directory name)")
+    p_init.add_argument("-g", "--grid", default="all", help="Grid mode: 'all' for full grid, or omit for one-at-a-time (default: all)")
+    p_init.add_argument("-p", "--partition", default="default", help="SLURM partition (default: 'default')")
+    p_init.add_argument("-t", "--time", default="04:00:00", help="Wall time limit (default: 04:00:00)")
+    p_init.add_argument("-m", "--mem", default="8G", help="Memory per node (default: 8G)")
+    p_init.add_argument("-c", "--cpus", type=int, default=1, help="CPUs per task (default: 1)")
     p_init.add_argument("--gres", default=None, help="Generic resources (e.g. gpu:1)")
     p_init.add_argument("--config", default=None, help="Copy this file as hyperwhip.yaml instead of generating a template")
     p_init.add_argument("--launcher", default=None, help="Copy this file as launch.sh instead of generating a template")
-    p_init.add_argument("--force", action="store_true", help="Overwrite existing files")
+    p_init.add_argument("-f", "--force", action="store_true", help="Overwrite existing files")
 
     # launch
     p_launch = subparsers.add_parser("run", help="Submit a hyperparameter sweep")
     p_launch.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
     p_launch.add_argument(
-        "--dry-run", action="store_true",
+        "-n", "--dry-run", action="store_true",
         help="Print the sbatch script and trial list without submitting"
+    )
+    p_launch.add_argument(
+        "-j", "--max-concurrent", type=int, default=None,
+        help="Cap concurrent running array tasks (overrides slurm.max_concurrent)"
     )
 
     # monitor
@@ -456,6 +542,11 @@ def main():
     p_test = subparsers.add_parser("test", help="Validate Hydra config by running a trial with --cfg job")
     p_test.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
     p_test.add_argument("index", nargs="?", type=int, default=0, help="Trial index to test (default: 0)")
+
+    # local
+    p_local = subparsers.add_parser("local", help="Run a single trial end-to-end locally (no SLURM)")
+    p_local.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
+    p_local.add_argument("index", nargs="?", type=int, default=0, help="Trial index to run (default: 0)")
 
     # tail
     p_tail = subparsers.add_parser("tail", help="Print last N lines of a trial's log")
@@ -470,8 +561,8 @@ def main():
     # clean
     p_clean = subparsers.add_parser("clean", help="Cancel jobs and clean up workspace")
     p_clean.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
-    p_clean.add_argument("--logs", action="store_true", help="Remove log files")
-    p_clean.add_argument("--all", action="store_true", help="Remove entire .hyperwhip state")
+    p_clean.add_argument("-l", "--logs", action="store_true", help="Remove log files")
+    p_clean.add_argument("-a", "--all", action="store_true", help="Remove entire .hyperwhip state")
 
     # Internal: resolve-overrides (called from within sbatch script)
     p_resolve = subparsers.add_parser("resolve-overrides", help=argparse.SUPPRESS)
@@ -490,6 +581,7 @@ def main():
         "init": cmd_init,
         "run": cmd_launch,
         "test": cmd_test,
+        "local": cmd_local,
         "status": cmd_monitor,
         "tail": cmd_tail,
         "res": cmd_results,

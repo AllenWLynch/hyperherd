@@ -9,13 +9,21 @@ from hyperwhip.config import Config
 from hyperwhip import manifest
 
 
-def generate_sbatch_script(config: Config, indices: List[int]) -> str:
-    """Generate a SLURM batch script for the job array."""
+def generate_sbatch_script(
+    config: Config, indices: List[int], max_concurrent: Optional[int] = None
+) -> str:
+    """Generate a SLURM batch script for the job array.
+
+    If `max_concurrent` is given it overrides `config.slurm.max_concurrent`.
+    """
     ws = manifest.workspace_path(config.workspace)
     log_dir = manifest.logs_path(config.workspace)
 
     # Build array spec (e.g. "0-49" or "0,2,5,7-10")
     array_spec = _indices_to_array_spec(indices)
+    throttle = max_concurrent if max_concurrent is not None else config.slurm.max_concurrent
+    if throttle is not None:
+        array_spec = f"{array_spec}%{throttle}"
 
     lines = [
         "#!/bin/bash",

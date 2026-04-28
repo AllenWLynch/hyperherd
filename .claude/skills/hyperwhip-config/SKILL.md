@@ -239,15 +239,28 @@ python train.py $OVERRIDES
 - **Idempotent training is required** for `whip run` resubmission to work. Use `$HYPERWHIP_EXPERIMENT_NAME` for a stable output dir and resume from checkpoint on startup.
 - **Launcher path** in `hyperwhip.yaml` is resolved relative to the config file's directory, not the cwd.
 
+## Throttling concurrent jobs
+
+Set `slurm.max_concurrent: N` to cap simultaneously running array tasks. HyperWhip appends `%N` to the SLURM array spec (e.g. `--array=0-49%5`). Use this when:
+
+- The cluster has a per-user concurrent-job limit
+- You want to avoid hammering a shared filesystem
+- You're sanity-checking a sweep — start with `max_concurrent: 1` to serialize
+
+Override per invocation with `whip run --max-concurrent N` (CLI wins over the config value).
+
 ## Workflow
 
 After writing or editing the config, suggest the user run:
 
 ```bash
 whip run <workspace> --dry-run    # validate config, preview trials & sbatch script
-whip test <workspace>             # run trial 0 with --cfg job (Hydra config validation)
+whip test <workspace>             # run trial 0 with --cfg job (Hydra config validation only)
+whip local <workspace>            # run trial 0 end-to-end locally — full pre-flight, no SLURM
 whip run <workspace>              # actually submit
 ```
+
+`whip local` runs the launcher exactly like SLURM would, with `HYPERWHIP_*` env vars set. It refuses any index that has ever been submitted to SLURM (would clobber outputs).
 
 ## Authoring discipline
 

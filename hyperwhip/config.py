@@ -153,6 +153,7 @@ class SlurmConfig(BaseModel):
     mem: str = "8G"
     cpus_per_task: int = 1
     gres: Optional[str] = None
+    max_concurrent: Optional[int] = Field(default=None, ge=1)
     extra_args: List[str] = Field(default_factory=list)
 
 
