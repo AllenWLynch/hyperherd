@@ -46,7 +46,7 @@ parameters:
     values: [0.0, 0.2, 0.5]
     default: 0.0
 
-constraints:
+conditions:
   - name: sgd_needs_lower_lr
     when:
       optimizer: sgd

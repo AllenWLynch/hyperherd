@@ -2,7 +2,9 @@
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+
+from hyperwhip.constraints import Trial
 
 
 WORKSPACE_DIR = ".hyperwhip"
@@ -70,22 +72,33 @@ def build_experiment_name(
 
 def create_manifest(
     base: str,
-    combinations: List[Dict[str, Any]],
+    trials: List[Union[Trial, Dict[str, Any]]],
     abbrevs: Optional[Dict[str, str]] = None,
 ) -> List[dict]:
-    """Create a new manifest from parameter combinations."""
+    """Create a new manifest from a list of Trials (or bare param dicts).
+
+    Bare dicts are accepted for back-compat and treated as trials with no
+    extras.
+    """
     if abbrevs is None:
         abbrevs = {}
-    trials = []
-    for i, combo in enumerate(combinations):
-        trials.append({
+    records = []
+    for i, item in enumerate(trials):
+        if isinstance(item, Trial):
+            params = item.params
+            extras = item.extras
+        else:
+            params = item
+            extras = {}
+        records.append({
             "index": i,
-            "params": combo,
-            "experiment_name": build_experiment_name(combo, abbrevs),
+            "params": params,
+            "extras": extras,
+            "experiment_name": build_experiment_name(params, abbrevs),
             "status": "pending",
         })
-    _write_manifest(base, trials)
-    return trials
+    _write_manifest(base, records)
+    return records
 
 
 def load_manifest(base: str) -> List[dict]:
@@ -169,13 +182,24 @@ def _write_job_ids(base: str, records: List[dict]) -> None:
 
 # --- Hydra override resolution ---
 
+def _format_override_value(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:.10g}"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 def resolve_overrides(
     base: str, task_id: int, static_overrides: Optional[List[str]] = None
 ) -> str:
     """Build the Hydra override string for a given array task ID.
 
-    Includes experiment_name=<name> as the first override so it can be used
-    for output directories, wandb run names, etc.
+    Order (Hydra applies left-to-right, last wins):
+      1. experiment_name=<name>
+      2. swept parameter overrides
+      3. hydra.static_overrides
+      4. constraint `set` extras (last → wins over statics)
     """
     trials = load_manifest(base)
     trial = None
@@ -189,18 +213,19 @@ def resolve_overrides(
 
     parts = []
 
-    # Include experiment_name as a hydra override
     exp_name = trial.get("experiment_name", "")
     if exp_name:
         parts.append(f"experiment_name={exp_name}")
 
     for param, value in trial["params"].items():
-        if isinstance(value, float):
-            parts.append(f"{param}={value:.10g}")
-        else:
-            parts.append(f"{param}={value}")
+        parts.append(f"{param}={_format_override_value(value)}")
 
     if static_overrides:
         parts.extend(static_overrides)
+
+    # Extras are emitted last so constraint `set` values override statics.
+    extras = trial.get("extras") or {}
+    for k, v in extras.items():
+        parts.append(f"{k}={_format_override_value(v)}")
 
     return " ".join(parts)

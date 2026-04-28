@@ -162,7 +162,7 @@ class TestConstraintValidation(unittest.TestCase):
             },
             constraints=[{"name": "c1", "when": {"opt": "sgd"}, "exclude": {"lr": [0.1]}}],
         )
-        self.assertEqual(len(config.constraints), 1)
+        self.assertEqual(len(config.conditions), 1)
 
 
 if __name__ == "__main__":

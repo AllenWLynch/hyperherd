@@ -6,7 +6,7 @@ This document describes how to write a HyperWhip configuration file (`hyperwhip.
 
 A HyperWhip experiment requires exactly two user-authored files:
 
-1. **`hyperwhip.yaml`** — declares the hyperparameter search space, SLURM resources, constraints, and static Hydra overrides.
+1. **`hyperwhip.yaml`** — declares the hyperparameter search space, SLURM resources, conditions, and static Hydra overrides.
 2. **`launch.sh`** — a bash script that receives a Hydra override string as its first argument (`$1`) and runs the training command inside whatever environment you need (container, conda, modules, etc.).
 
 Both files live in a **workspace directory**. All HyperWhip commands take the workspace directory as their argument:
@@ -53,7 +53,7 @@ The configuration file is YAML. Every field is documented below with its type, w
 | `slurm`       | object | no       | see below | SLURM resource requests. See [slurm](#slurm). |
 | `hydra`       | object | no       | see below | Static Hydra overrides. See [hydra](#hydra). |
 | `parameters`  | object | **yes**  | —       | Hyperparameter definitions. At least one parameter is required. See [parameters](#parameters). |
-| `constraints` | list   | no       | `[]`    | Constraints that filter or modify parameter combinations. See [constraints](#constraints). |
+| `conditions`  | list   | no       | `[]`    | Conditional rules that filter or modify parameter combinations. Also accepts the legacy key `constraints`. See [conditions](#conditions). |
 
 The **workspace** is the directory containing `hyperwhip.yaml`. HyperWhip stores its state in a `.hyperwhip/` subdirectory within the workspace.
 
@@ -214,39 +214,79 @@ parameters:
 
 ---
 
-### `constraints`
+### `conditions`
 
-An ordered list of constraint objects. Constraints are applied as post-filters after all parameter combinations are generated. They are evaluated in order.
+An ordered list of conditional rules. Conditions are applied as post-filters after all parameter combinations are generated. They are evaluated in order.
 
-Each constraint has:
+The legacy key `constraints` is still accepted as a synonym for `conditions`.
+
+Each condition has:
 
 | Field     | Type   | Required | Description |
 |-----------|--------|----------|-------------|
 | `name`    | string | no       | Human-readable label (used in error messages). |
-| `when`    | object | **yes**  | Condition: a mapping of `parameter_name: value`. Activates only when **all** listed parameters match. |
+| `when`    | object | **yes**  | Condition: a mapping of `parameter_name: matcher`. All listed parameters must match (AND). See [matchers](#when-matchers). |
 | `exclude` | object | no*      | Exclusion: `parameter_name: [values]`. Removes matching combinations. |
 | `force`   | object | no*      | Override: `parameter_name: value`. Forces the value; duplicates are removed. |
+| `set`     | object | no*      | Inject extra Hydra overrides: `hydra.path: value`. Keys are arbitrary Hydra paths (not parameters), and these overrides win over `hydra.static_overrides`. |
 
-*At least one of `exclude` or `force` is required per constraint.
+*At least one of `exclude`, `force`, or `set` is required per condition.
+
+#### `when` matchers
+
+Each value in the `when` mapping can be one of three forms:
+
+| Form | Example | Meaning |
+|------|---------|---------|
+| scalar | `optimizer: sgd` | exact equality |
+| list   | `optimizer: [sgd, momentum_sgd]` | OR — matches any element |
+| operator map | `learning_rate: {gt: 0.01}` | comparison: `eq`, `ne`, `gt`, `ge`, `lt`, `le`, `in`, `not_in` |
+
+Operator maps must contain exactly one operator key. `in` and `not_in` take a list; the others take a scalar. Numeric comparisons (`gt`/`ge`/`lt`/`le`) only match if both sides are numbers.
+
+If a discrete parameter's `values` are themselves lists, use `eq:` to disambiguate from the OR-list form (e.g. `layers: {eq: [3, 5, 7]}`).
+
+#### Examples
 
 ```yaml
-constraints:
-  # When optimizer is sgd, remove trials with high learning rates
-  - name: sgd_no_high_lr
+conditions:
+  # Multi-value when: applies to both sgd and momentum_sgd in one rule.
+  - name: sgd_family_no_high_lr
     when:
-      optimizer: sgd
+      optimizer: [sgd, momentum_sgd]
+      learning_rate: {gt: 0.01}
     exclude:
-      learning_rate: [0.01, 0.1]
+      learning_rate: [0.05, 0.1]
 
-  # When optimizer is adamw, force weight_decay to 0.01
+  # Force a parameter value.
   - name: adamw_fixed_wd
     when:
       optimizer: adamw
     force:
       weight_decay: 0.01
+
+  # Inject non-parameter Hydra overrides conditionally.
+  # `set` keys are arbitrary Hydra paths; they're not validated as parameters.
+  - name: adamw_warmup
+    when:
+      optimizer: adamw
+    set:
+      scheduler.type: cosine
+      scheduler.warmup_steps: 1000
 ```
 
-Constraint references are validated at parse time — referencing an undefined parameter name is an error.
+Constraint references in `when`, `exclude`, and `force` are validated at parse time. `set` keys are intentionally **not** validated against `parameters` — they're meant for non-parameter Hydra paths.
+
+#### Override ordering
+
+The Hydra override string for each trial is built in this order (Hydra applies left-to-right, last wins):
+
+1. `experiment_name=<name>`
+2. swept parameter `name=value` pairs
+3. `hydra.static_overrides`
+4. condition `set` extras (last → these win over `static_overrides`)
+
+This means `set` is the right place for **conditional adjustments** that should override the global baseline, while `static_overrides` is the baseline that always applies.
 
 ---
 
@@ -453,7 +493,7 @@ parameters:
     values: [64, 128, 256]
     default: 128
 
-constraints:
+conditions:
   - name: sgd_no_high_lr
     when:
       optimizer: sgd

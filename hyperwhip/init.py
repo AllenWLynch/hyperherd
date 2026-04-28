@@ -156,7 +156,7 @@ def _build_example_parameters():
   #   values: [adam, sgd, adamw]
   #   default: adam    # required unless grid: all
 
-# constraints:
+# conditions:
 #   - name: example_constraint
 #     when:
 #       optimizer: sgd

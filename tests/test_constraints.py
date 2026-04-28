@@ -23,9 +23,8 @@ class TestExcludeConstraint(unittest.TestCase):
         ]
         result = apply_constraints(combos, constraints)
         self.assertEqual(len(result), 3)
-        # sgd+0.1 should be gone
-        for c in result:
-            self.assertFalse(c["opt"] == "sgd" and c["lr"] == 0.1)
+        for t in result:
+            self.assertFalse(t.params["opt"] == "sgd" and t.params["lr"] == 0.1)
 
     def test_exclude_no_match(self):
         combos = [
@@ -54,13 +53,12 @@ class TestForceConstraint(unittest.TestCase):
             )
         ]
         result = apply_constraints(combos, constraints)
-        for c in result:
-            if c["opt"] == "adamw":
-                self.assertEqual(c["wd"], 0.01)
-        # sgd combo should be unchanged
-        sgd = [c for c in result if c["opt"] == "sgd"]
+        for t in result:
+            if t.params["opt"] == "adamw":
+                self.assertEqual(t.params["wd"], 0.01)
+        sgd = [t for t in result if t.params["opt"] == "sgd"]
         self.assertEqual(len(sgd), 1)
-        self.assertEqual(sgd[0]["wd"], 0.0)
+        self.assertEqual(sgd[0].params["wd"], 0.0)
 
     def test_force_deduplication(self):
         combos = [
@@ -71,7 +69,6 @@ class TestForceConstraint(unittest.TestCase):
             Constraint(name="force", when={"opt": "adamw"}, force={"wd": 0.01})
         ]
         result = apply_constraints(combos, constraints)
-        # Both collapse to {opt=adamw, lr=0.1, wd=0.01}, deduplicated to 1
         self.assertEqual(len(result), 1)
 
 
@@ -88,8 +85,123 @@ class TestMultipleConstraints(unittest.TestCase):
             Constraint(name="c2", when={"opt": "adamw"}, force={"wd": 0.01}),
         ]
         result = apply_constraints(combos, constraints)
-        # sgd+0.1 excluded, adamw gets wd=0.01
         self.assertEqual(len(result), 3)
+
+
+class TestWhenListMatcher(unittest.TestCase):
+    """A list value in `when` is OR-match across the listed values."""
+
+    def test_or_match_excludes_multiple_optimizers(self):
+        combos = [
+            {"opt": "sgd", "lr": 0.1},
+            {"opt": "momentum_sgd", "lr": 0.1},
+            {"opt": "adam", "lr": 0.1},
+        ]
+        constraints = [
+            Constraint(
+                name="no_high_lr_for_sgd_family",
+                when={"opt": ["sgd", "momentum_sgd"]},
+                exclude={"lr": [0.1]},
+            )
+        ]
+        result = apply_constraints(combos, constraints)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].params["opt"], "adam")
+
+
+class TestWhenOperatorMatcher(unittest.TestCase):
+    def test_gt_filter(self):
+        combos = [
+            {"opt": "sgd", "lr": 0.001},
+            {"opt": "sgd", "lr": 0.05},
+            {"opt": "sgd", "lr": 0.1},
+        ]
+        constraints = [
+            Constraint(
+                name="sgd_no_high_lr",
+                when={"opt": "sgd", "lr": {"gt": 0.01}},
+                exclude={"lr": [0.05, 0.1]},
+            )
+        ]
+        result = apply_constraints(combos, constraints)
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result[0].params["lr"], 0.001)
+
+    def test_in_operator(self):
+        combos = [
+            {"bs": 32}, {"bs": 64}, {"bs": 128},
+        ]
+        constraints = [
+            Constraint(
+                name="big_batch_only",
+                when={"bs": {"in": [64, 128]}},
+                force={"bs": 256},
+            )
+        ]
+        result = apply_constraints(combos, constraints)
+        # bs=32 untouched, bs=64 and bs=128 both forced to 256, dedup to one
+        bs_values = sorted(t.params["bs"] for t in result)
+        self.assertEqual(bs_values, [32, 256])
+
+    def test_invalid_operator_rejected(self):
+        with self.assertRaises(Exception):
+            Constraint(
+                name="bad",
+                when={"lr": {"approx": 0.01}},
+                exclude={"lr": [0.1]},
+            )
+
+    def test_two_operator_keys_rejected(self):
+        with self.assertRaises(Exception):
+            Constraint(
+                name="bad",
+                when={"lr": {"gt": 0.01, "lt": 0.1}},
+                exclude={"lr": [0.5]},
+            )
+
+
+class TestSetField(unittest.TestCase):
+    def test_set_injects_extras(self):
+        combos = [
+            {"opt": "adamw", "lr": 0.001},
+            {"opt": "sgd", "lr": 0.001},
+        ]
+        constraints = [
+            Constraint(
+                name="adamw_warmup",
+                when={"opt": "adamw"},
+                set={"scheduler.type": "cosine", "scheduler.warmup_steps": 1000},
+            )
+        ]
+        result = apply_constraints(combos, constraints)
+        self.assertEqual(len(result), 2)
+        adamw = next(t for t in result if t.params["opt"] == "adamw")
+        sgd = next(t for t in result if t.params["opt"] == "sgd")
+        self.assertEqual(adamw.extras["scheduler.type"], "cosine")
+        self.assertEqual(adamw.extras["scheduler.warmup_steps"], 1000)
+        self.assertEqual(sgd.extras, {})
+
+    def test_set_only_constraint_allowed(self):
+        # `set` alone (no exclude/force) should be valid
+        c = Constraint(
+            name="just_set",
+            when={"opt": "adamw"},
+            set={"foo.bar": 1},
+        )
+        self.assertEqual(c.set, {"foo.bar": 1})
+
+    def test_no_action_rejected(self):
+        with self.assertRaises(Exception):
+            Constraint(name="empty", when={"opt": "adamw"})
+
+    def test_multiple_constraints_accumulate_extras(self):
+        combos = [{"opt": "adamw", "stage": "pretrain"}]
+        constraints = [
+            Constraint(name="c1", when={"opt": "adamw"}, set={"a": 1}),
+            Constraint(name="c2", when={"stage": "pretrain"}, set={"b": 2}),
+        ]
+        result = apply_constraints(combos, constraints)
+        self.assertEqual(result[0].extras, {"a": 1, "b": 2})
 
 
 if __name__ == "__main__":

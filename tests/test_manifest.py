@@ -127,6 +127,36 @@ class TestExperimentName(unittest.TestCase):
         overrides = manifest.resolve_overrides(self.tmpdir, 0)
         self.assertIn("experiment_name=lr-0.001_opt-adam", overrides)
 
+    def test_resolve_overrides_extras_win_over_statics(self):
+        from hyperwhip.constraints import Trial
+        manifest.init_workspace(self.tmpdir)
+        trials = [Trial(params={"lr": 0.001}, extras={"scheduler.type": "cosine"})]
+        manifest.create_manifest(self.tmpdir, trials, {"lr": "lr"})
+
+        overrides = manifest.resolve_overrides(
+            self.tmpdir, 0, static_overrides=["scheduler.type=linear", "data.root=/x"]
+        )
+        # Extras must appear AFTER statics so Hydra (last-wins) lets `set`
+        # override `static_overrides`.
+        self.assertLess(
+            overrides.index("scheduler.type=linear"),
+            overrides.index("scheduler.type=cosine"),
+        )
+        # Params come before statics
+        self.assertLess(
+            overrides.index("lr=0.001"),
+            overrides.index("data.root=/x"),
+        )
+
+    def test_manifest_persists_extras(self):
+        from hyperwhip.constraints import Trial
+        manifest.init_workspace(self.tmpdir)
+        trials = [Trial(params={"opt": "adamw"}, extras={"scheduler.warmup": 1000})]
+        manifest.create_manifest(self.tmpdir, trials, {"opt": "opt"})
+
+        loaded = manifest.load_manifest(self.tmpdir)
+        self.assertEqual(loaded[0]["extras"], {"scheduler.warmup": 1000})
+
 
 class TestWorkspaceExists(unittest.TestCase):
     def setUp(self):

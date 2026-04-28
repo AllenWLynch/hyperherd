@@ -31,10 +31,10 @@ def cmd_launch(args):
 
     # Generate parameter combinations
     combinations = generate_combinations(config)
-    combinations = apply_constraints(combinations, config.constraints)
+    combinations = apply_constraints(combinations, config.conditions)
 
     if not combinations:
-        print("No valid parameter combinations after applying constraints.", file=sys.stderr)
+        print("No valid parameter combinations after applying conditions.", file=sys.stderr)
         return 1
 
     # Initialize workspace
@@ -179,10 +179,10 @@ def cmd_test(args):
 
     # Generate combinations and ensure manifest exists
     combinations = generate_combinations(config)
-    combinations = apply_constraints(combinations, config.constraints)
+    combinations = apply_constraints(combinations, config.conditions)
 
     if not combinations:
-        print("No valid parameter combinations after applying constraints.", file=sys.stderr)
+        print("No valid parameter combinations after applying conditions.", file=sys.stderr)
         return 1
 
     manifest.init_workspace(config.workspace)

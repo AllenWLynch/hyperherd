@@ -1,0 +1,217 @@
+---
+description: Author or edit a HyperWhip sweep configuration (hyperwhip.yaml) and its companion launch.sh. Use when the user is creating, editing, or debugging a hyperwhip.yaml file, scaffolding a sweep workspace, designing parameter conditions, or asking how to express a particular sweep shape (full grid, partial grid, one-at-a-time, conditional overrides).
+---
+
+# HyperWhip Configuration
+
+HyperWhip runs SLURM hyperparameter sweeps from two files in a workspace directory:
+
+- `hyperwhip.yaml` — declarative sweep config (parameters, grid mode, SLURM resources, conditions, static Hydra overrides)
+- `launch.sh` — bash script that receives a Hydra override string as `$1` and runs the training command
+
+The full reference lives at `docs/configuration.md` in this repo. **Read it before writing a non-trivial config** — this skill is a checklist and a set of patterns, not a substitute for the doc.
+
+## When to use this skill
+
+- Creating a new `hyperwhip.yaml` from scratch
+- Editing an existing one (adding parameters, changing grid mode, adding/refactoring conditions)
+- Debugging Pydantic validation errors from `whip run` / `whip test`
+- Designing the launcher script
+
+## Checklist before writing
+
+1. **What's the sweep shape?**
+   - Full Cartesian product → `grid: all`, no defaults required
+   - Sweep a subset, hold others fixed → `grid: [param1, param2]`, defaults required for non-grid params
+   - One-at-a-time around a baseline → omit `grid`, defaults required for **all** params
+2. **For each parameter:**
+   - Pick `discrete` (explicit `values:`) or `continuous` (`low`/`high`/`scale`/`steps`)
+   - Provide an `abbrev` (short, distinct — used in experiment names like `lr-0.001_opt-adam`)
+   - For log-scale continuous, **`low` must be > 0**
+   - If not in the grid (per rule 1), include a `default`
+3. **Conditions** (formerly `constraints`, both keys still parse):
+   - Need to filter out illegal combinations? Use `exclude`
+   - Need to pin a parameter when another is set? Use `force`
+   - Need to inject **non-parameter** Hydra overrides (e.g. `scheduler.warmup_steps`)? Use `set`
+4. **Launcher:** does it need a container, conda env, or modules? Most launchers are 5–10 lines.
+
+## `when` matchers (the flexible part)
+
+Each value in a condition's `when:` block can be:
+
+| Form | Example | Meaning |
+|------|---------|---------|
+| scalar | `optimizer: sgd` | exact match |
+| list | `optimizer: [sgd, momentum_sgd]` | OR — any element |
+| operator map | `learning_rate: {gt: 0.01}` | `eq`, `ne`, `gt`, `ge`, `lt`, `le`, `in`, `not_in` |
+
+Multiple keys in one `when` are AND'd. Use a list to avoid duplicating a condition for several values of the same parameter.
+
+## Override ordering (memorize this)
+
+The Hydra override string is built left-to-right, last wins:
+
+1. `experiment_name=<auto>`
+2. swept parameter `name=value` pairs
+3. `hydra.static_overrides`
+4. condition `set` extras
+
+So `set` **overrides** `static_overrides`. Use `static_overrides` for the always-on baseline; use `set` for conditional adjustments.
+
+## Common patterns
+
+### Full grid, simple
+
+```yaml
+name: my_sweep
+launcher: ./launch.sh
+
+slurm:
+  partition: gpu
+  time: "04:00:00"
+  mem: "16G"
+  cpus_per_task: 4
+  gres: "gpu:1"
+
+grid: all
+
+parameters:
+  learning_rate:
+    abbrev: lr
+    type: continuous
+    low: 1e-4
+    high: 1e-1
+    scale: log
+    steps: 4
+  optimizer:
+    abbrev: opt
+    type: discrete
+    values: [adam, sgd, adamw]
+```
+
+### Partial grid (sweep two, hold others)
+
+```yaml
+grid: [learning_rate, weight_decay]
+
+parameters:
+  learning_rate:
+    abbrev: lr
+    type: continuous
+    low: 1e-4
+    high: 1e-1
+    scale: log
+    steps: 4
+    default: 0.001
+  weight_decay:
+    abbrev: wd
+    type: continuous
+    low: 0.0
+    high: 0.01
+    steps: 3
+    default: 0.001
+  optimizer:           # not in grid → needs default
+    abbrev: opt
+    type: discrete
+    values: [adam, adamw]
+    default: adamw
+  batch_size:          # not in grid → needs default
+    abbrev: bs
+    type: discrete
+    values: [64, 128, 256]
+    default: 128
+```
+
+### One-at-a-time (omit grid; all params need defaults)
+
+```yaml
+# (no `grid:` field)
+
+parameters:
+  learning_rate: { abbrev: lr, type: continuous, low: 1e-4, high: 1e-1, scale: log, steps: 4, default: 0.001 }
+  optimizer:     { abbrev: opt, type: discrete, values: [adam, sgd, adamw], default: adamw }
+  batch_size:    { abbrev: bs, type: discrete, values: [64, 128, 256], default: 128 }
+```
+
+### Conditions
+
+```yaml
+conditions:
+  # OR-match across multiple optimizer values in one rule.
+  - name: sgd_family_no_high_lr
+    when:
+      optimizer: [sgd, momentum_sgd]
+      learning_rate: {gt: 0.01}
+    exclude:
+      learning_rate: [0.05, 0.1]
+
+  # Pin a parameter conditionally.
+  - name: adamw_fixed_wd
+    when:
+      optimizer: adamw
+    force:
+      weight_decay: 0.01
+
+  # Inject non-parameter Hydra overrides (the `set` field).
+  # Keys are arbitrary Hydra paths; not validated as parameters.
+  - name: adamw_warmup
+    when:
+      optimizer: adamw
+    set:
+      scheduler.type: cosine
+      scheduler.warmup_steps: 1000
+```
+
+### Launcher (Apptainer)
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+OVERRIDES="$1"
+CONTAINER="/path/to/container.sif"
+
+apptainer exec --nv --bind "/scratch:/scratch" "$CONTAINER" \
+    python train.py $OVERRIDES
+```
+
+### Launcher (conda)
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+OVERRIDES="$1"
+source /opt/conda/etc/profile.d/conda.sh
+conda activate myenv
+
+python train.py $OVERRIDES
+```
+
+## Pitfalls
+
+- **`abbrev` collisions** silently produce ambiguous experiment names. Keep them distinct.
+- **Log scale with `low: 0`** is rejected — log requires `low > 0`.
+- **Continuous `default` outside `[low, high]`** is rejected at parse time.
+- **Discrete `default` not in `values`** is rejected at parse time.
+- **`exclude` / `force` referencing an unknown parameter** is rejected at parse time. (`set` keys are *not* validated — they're free-form Hydra paths.)
+- **Trial dedup on params only** — if a `force` collapses two combos to the same params, they merge. Extras (`set`) are deterministic from params, so they don't break this.
+- **Idempotent training is required** for `whip run` resubmission to work. Use `$HYPERWHIP_EXPERIMENT_NAME` for a stable output dir and resume from checkpoint on startup.
+- **Launcher path** in `hyperwhip.yaml` is resolved relative to the config file's directory, not the cwd.
+
+## Workflow
+
+After writing or editing the config, suggest the user run:
+
+```bash
+whip run <workspace> --dry-run    # validate config, preview trials & sbatch script
+whip test <workspace>             # run trial 0 with --cfg job (Hydra config validation)
+whip run <workspace>              # actually submit
+```
+
+## Authoring discipline
+
+- Don't invent fields. The full set is in `docs/configuration.md`. If the user asks for something the schema doesn't support (e.g. computed expressions in `set`), say so and suggest the closest supported alternative.
+- Don't recommend `constraints:` for new configs — `conditions:` is the canonical key (the legacy alias is for backward compat only).
+- Pick `abbrev` values that read well in filenames: `lr`, `opt`, `wd`, `bs`, `nl`, `do` (dropout), `sd` (seed), etc.
+- When the user asks for a sweep, default to **partial grid** if they name 2–3 swept params and the rest are fixed; default to **full grid** only if they explicitly want a Cartesian product.

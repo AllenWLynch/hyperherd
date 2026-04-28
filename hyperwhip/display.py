@@ -180,4 +180,11 @@ def print_dry_run(
         for name, value in params.items():
             highlight = _is_non_default(name, value, defaults)
             print(f"    {_format_param_kv(name, value, is_non_default=highlight)}")
+
+        # Constraint-injected extras, if any
+        extras = trial.get("extras") or {}
+        if extras:
+            print(f"    {_DIM}# constraint set:{_RESET}")
+            for name, value in extras.items():
+                print(f"    {_format_param_kv(name, value, is_non_default=True)}")
         print()

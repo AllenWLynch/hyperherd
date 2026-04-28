@@ -44,7 +44,7 @@ whip init my_experiment --partition gpu --gres gpu:1
 
 This creates `my_experiment/hyperwhip.yaml` and `my_experiment/launch.sh` with sensible defaults. Edit both files to match your setup:
 
-- **hyperwhip.yaml** — define your parameters, grid mode, SLURM resources, and constraints
+- **hyperwhip.yaml** — define your parameters, grid mode, SLURM resources, and conditions
 - **launch.sh** — set up your container, conda environment, or module loads
 
 ### 2. Validate and preview

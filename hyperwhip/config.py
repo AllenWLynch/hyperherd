@@ -4,7 +4,7 @@ import os
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 
 class DiscreteParameter(BaseModel):
@@ -48,16 +48,56 @@ class ContinuousParameter(BaseModel):
 ParameterSpec = Union[DiscreteParameter, ContinuousParameter]
 
 
+# Valid operator keys for `when` operator-maps.
+WHEN_OPERATORS = {"eq", "ne", "gt", "ge", "lt", "le", "in", "not_in"}
+
+
 class Constraint(BaseModel):
     name: str = "unnamed"
     when: Dict[str, Any] = Field(min_length=1)
     exclude: Optional[Dict[str, List[Any]]] = None
     force: Optional[Dict[str, Any]] = None
+    set: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
-    def _need_exclude_or_force(self):
-        if not self.exclude and not self.force:
-            raise ValueError(f"Constraint '{self.name}': must have 'exclude' and/or 'force'")
+    def _need_action(self):
+        if not self.exclude and not self.force and not self.set:
+            raise ValueError(
+                f"Constraint '{self.name}': must have at least one of "
+                f"'exclude', 'force', or 'set'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_when_matchers(self):
+        for param, matcher in self.when.items():
+            if isinstance(matcher, dict):
+                if len(matcher) != 1:
+                    raise ValueError(
+                        f"Constraint '{self.name}': operator-map for '{param}' "
+                        f"must have exactly one operator key, got {list(matcher.keys())}"
+                    )
+                op = next(iter(matcher.keys()))
+                if op not in WHEN_OPERATORS:
+                    raise ValueError(
+                        f"Constraint '{self.name}': unknown operator '{op}' for "
+                        f"'{param}'. Valid operators: {sorted(WHEN_OPERATORS)}"
+                    )
+                if op in ("in", "not_in") and not isinstance(matcher[op], list):
+                    raise ValueError(
+                        f"Constraint '{self.name}': operator '{op}' on '{param}' "
+                        f"requires a list value"
+                    )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_set_keys(self):
+        if self.set:
+            for k in self.set:
+                if not isinstance(k, str) or not k:
+                    raise ValueError(
+                        f"Constraint '{self.name}': 'set' keys must be non-empty strings"
+                    )
         return self
 
     @model_validator(mode="before")
@@ -98,7 +138,10 @@ class Config(BaseModel):
     launcher: str = ""
 
     parameters: Dict[str, ParameterSpec] = Field(min_length=1)
-    constraints: List[Constraint] = Field(default_factory=list)
+    conditions: List[Constraint] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("conditions", "constraints"),
+    )
 
     @model_validator(mode="after")
     def _validate_grid_and_defaults(self):
@@ -129,8 +172,8 @@ class Config(BaseModel):
                         f"(grid is not set, so all parameters need defaults)"
                     )
 
-        # Validate constraint references
-        for constraint in self.constraints:
+        # Validate condition references
+        for constraint in self.conditions:
             for ref in constraint.when:
                 if ref not in param_names:
                     raise ValueError(
@@ -151,6 +194,8 @@ class Config(BaseModel):
                             f"Constraint '{constraint.name}': 'force' references "
                             f"unknown parameter '{ref}'"
                         )
+            # Note: `set` keys are arbitrary Hydra paths and intentionally not
+            # validated against `parameters` — that's the whole point.
 
         return self
 
