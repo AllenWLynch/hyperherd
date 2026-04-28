@@ -200,6 +200,10 @@ def _write_job_ids(base: str, records: List[dict]) -> None:
 # --- Hydra override resolution ---
 
 def _format_override_value(value: Any) -> str:
+    if value is None:
+        # Hydra reads bare `None` as the string "None"; `null` is the YAML
+        # null literal that resolves to Python None.
+        return "null"
     if isinstance(value, float):
         return f"{value:.10g}"
     if isinstance(value, bool):

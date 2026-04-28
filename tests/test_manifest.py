@@ -78,6 +78,14 @@ class TestManifest(unittest.TestCase):
         overrides = manifest.resolve_overrides(self.tmpdir, 0, ["data.path=/tmp"])
         self.assertIn("data.path=/tmp", overrides)
 
+    def test_resolve_overrides_none_becomes_null(self):
+        manifest.init_workspace(self.tmpdir)
+        manifest.create_manifest(self.tmpdir, [{"ckpt": None, "lr": 0.001}])
+        overrides = manifest.resolve_overrides(self.tmpdir, 0)
+        # Hydra reads bare `None` as the string "None"; `null` resolves to Python None.
+        self.assertIn("ckpt=null", overrides)
+        self.assertNotIn("ckpt=None", overrides)
+
     def test_job_id_tracking(self):
         manifest.init_workspace(self.tmpdir)
         manifest.record_job_submission(self.tmpdir, "12345", [0, 1, 2])
