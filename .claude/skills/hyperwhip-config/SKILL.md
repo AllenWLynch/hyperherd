@@ -58,6 +58,44 @@ The Hydra override string is built left-to-right, last wins:
 
 So `set` **overrides** `static_overrides`. Use `static_overrides` for the always-on baseline; use `set` for conditional adjustments.
 
+## Passing extra Hydra config to every trial
+
+Use the top-level `hydra` block. Each entry is a literal Hydra override string appended to every trial.
+
+```yaml
+hydra:
+  static_overrides:
+    - "data.root=/scratch/imagenet"
+    - "trainer.max_epochs=90"
+    - "trainer.seed=42"
+```
+
+These are **not** swept and **not** validated against the parameter list — they're free-form Hydra paths, same as `set` keys. Use this for fixed paths, seeds, dataset roots, logger config, etc. that differ from your Hydra defaults but don't change across the sweep.
+
+If the value should depend on a swept parameter, use a condition with `set:` instead.
+
+## Environment variables in the launcher
+
+HyperWhip exports three environment variables before invoking `launch.sh`. Use them inside the launcher (or pass them through to the training script) to give every trial a stable identity.
+
+| Variable | Value | Typical use |
+|----------|-------|-------------|
+| `HYPERWHIP_WORKSPACE` | absolute path to the workspace directory | resolving paths under `.hyperwhip/`, locating the manifest |
+| `HYPERWHIP_TRIAL_ID` | the SLURM array task index (same as `$SLURM_ARRAY_TASK_ID`) | per-trial output subdir, `log_result()` keying |
+| `HYPERWHIP_EXPERIMENT_NAME` | the auto-generated name (e.g. `lr-0.001_opt-adam_bs-64`) | wandb run name, output directory, checkpoint path |
+
+The training code can read these directly:
+
+```python
+import os
+exp_name = os.environ["HYPERWHIP_EXPERIMENT_NAME"]
+output_dir = f"./outputs/{exp_name}"          # idempotent, stable across resubmissions
+```
+
+Or pass them through Hydra by referencing them in `static_overrides` (Hydra resolves `${env:VAR}` if you have OmegaConf env-var resolution enabled), but reading them directly in Python is usually simpler.
+
+**Idempotency reminder:** because `whip run` resubmits failed/cancelled trials with the same array indices and parameters, your training script must use a *deterministic* output path (driven by `HYPERWHIP_EXPERIMENT_NAME` or `HYPERWHIP_TRIAL_ID`) and resume from checkpoint on startup.
+
 ## Common patterns
 
 ### Full grid, simple
