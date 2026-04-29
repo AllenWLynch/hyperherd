@@ -409,6 +409,50 @@ def cmd_results(args):
     return 0
 
 
+def cmd_stop(args):
+    """Cancel a single running/queued trial via scancel <jobid>_<index>."""
+    config = load_config(args.workspace)
+
+    if not manifest.workspace_exists(config.workspace):
+        print("No workspace found.", file=sys.stderr)
+        return 1
+
+    _sync_slurm_status(config.workspace)
+
+    index = args.index
+    trials = manifest.load_manifest(config.workspace)
+    trial = next((t for t in trials if t["index"] == index), None)
+    if trial is None:
+        print(f"No trial found with index {index}.", file=sys.stderr)
+        return 1
+
+    status = trial.get("status", "unknown")
+    if status not in ("running", "queued", "submitted"):
+        print(
+            f"Trial {index} is {status!r}, not running/queued — nothing to cancel.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Find the most recent submission that included this index.
+    job_id = None
+    for record in reversed(manifest.get_job_ids(config.workspace)):
+        if index in record.get("indices", []):
+            job_id = record["slurm_job_id"]
+            break
+
+    if job_id is None:
+        print(
+            f"No SLURM job ID recorded for trial {index}.", file=sys.stderr
+        )
+        return 1
+
+    print(f"Cancelling trial {index} (job {job_id}_{index})...")
+    slurm.cancel_array_task(job_id, index)
+    manifest.update_trial_status(config.workspace, index, "cancelled")
+    return 0
+
+
 def cmd_clean(args):
     """Cancel running jobs and clean up workspace."""
     config = load_config(args.workspace)
@@ -599,6 +643,11 @@ def main():
     p_results = subparsers.add_parser("res", help="Print TSV of trial parameters and logged metrics")
     p_results.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
 
+    # stop
+    p_stop = subparsers.add_parser("stop", help="Cancel a single running/queued trial")
+    p_stop.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
+    p_stop.add_argument("index", type=int, help="Trial index to cancel")
+
     # clean
     p_clean = subparsers.add_parser("clean", help="Cancel jobs and clean up workspace")
     p_clean.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
@@ -626,6 +675,7 @@ def main():
         "status": cmd_monitor,
         "tail": cmd_tail,
         "res": cmd_results,
+        "stop": cmd_stop,
         "clean": cmd_clean,
         "resolve-overrides": cmd_resolve_overrides,
         "resolve-name": cmd_resolve_name,

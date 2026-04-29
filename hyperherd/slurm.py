@@ -256,6 +256,13 @@ def cancel_jobs(job_ids: List[str]) -> None:
         subprocess.run(["scancel", jid], capture_output=True, text=True)
 
 
+def cancel_array_task(job_id: str, array_index: int) -> None:
+    """Cancel a single task within a SLURM job array via scancel <jid>_<idx>."""
+    subprocess.run(
+        ["scancel", f"{job_id}_{array_index}"], capture_output=True, text=True
+    )
+
+
 def get_log_tail(base: str, index: int, lines: int = 1) -> str:
     """Read the last N lines from a task's stdout log."""
     log_file = os.path.join(manifest.logs_path(base), f"{index}.out")
