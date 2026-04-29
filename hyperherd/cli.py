@@ -7,13 +7,62 @@ import sys
 
 from hyperherd.config import ConfigError, load_config
 from hyperherd.constraints import apply_constraints
-from hyperherd.display import print_dry_run, print_status_table, print_summary
+from hyperherd.display import print_dry_run, print_launch_success, print_status_table, print_summary
 from hyperherd.init import scaffold
 from hyperherd.preflight import PreflightError, run_preflight
 from hyperherd.search import generate_combinations
 from hyperherd import manifest
 from hyperherd import slurm
 from hyperherd.logging import load_all_results
+
+
+_ACTIVE_STATUSES = ("running", "queued", "submitted", "completed")
+
+
+def _apply_reconciliation(config, diff, force: bool) -> bool:
+    """Apply a manifest/config diff: drop config-removed trials, append new ones.
+
+    Returns False if the user must intervene (active trials removed without --force).
+    """
+    active_removed = [t for t in diff.removed if t.get("status") in _ACTIVE_STATUSES]
+    droppable = [t for t in diff.removed if t.get("status") not in _ACTIVE_STATUSES]
+
+    if active_removed and not force:
+        print(
+            f"Config edit removes {len(active_removed)} trial(s) that are "
+            f"running, queued, or completed:",
+            file=sys.stderr,
+        )
+        for t in active_removed[:5]:
+            print(
+                f"  idx {t['index']} [{t.get('status')}] {t.get('experiment_name','')}",
+                file=sys.stderr,
+            )
+        if len(active_removed) > 5:
+            print(f"  ... and {len(active_removed) - 5} more", file=sys.stderr)
+        print(
+            "Refusing to drop them. Pass --force to keep them in the manifest "
+            "as orphans, or revert your config edit.",
+            file=sys.stderr,
+        )
+        return False
+
+    if droppable:
+        manifest.drop_trials(config.workspace, [t["index"] for t in droppable])
+        print(f"  Dropped {len(droppable)} trial(s) no longer in config.")
+
+    if active_removed and force:
+        print(
+            f"  Keeping {len(active_removed)} active trial(s) as orphans (--force)."
+        )
+
+    if diff.added:
+        manifest.append_trials(
+            config.workspace, diff.added, config.abbrevs, config.labels
+        )
+        print(f"  Added {len(diff.added)} new trial(s) from config edits.")
+
+    return True
 
 
 def cmd_launch(args):
@@ -44,22 +93,24 @@ def cmd_launch(args):
     abbrevs = config.abbrevs
 
     # Create or load manifest
-    if manifest.workspace_exists(config.workspace):
+    existing = manifest.load_manifest(config.workspace) if manifest.workspace_exists(config.workspace) else []
+    if existing:
+        print(f"Existing workspace found with {len(existing)} trials.")
+        # Refresh status from SLURM before deciding what to resubmit
+        _sync_slurm_status(config.workspace)
         existing = manifest.load_manifest(config.workspace)
-        if existing:
-            print(f"Existing workspace found with {len(existing)} trials.")
-            # Refresh status from SLURM before deciding what to resubmit
-            _sync_slurm_status(config.workspace)
-            pending = manifest.get_pending_indices(config.workspace)
-            if not pending and not args.indices:
-                print("All trials are completed or currently running. Nothing to submit.")
-                return 0
-            if not args.indices:
-                print(f"  {len(pending)} trials need (re)submission.")
-            trials = existing
-        else:
-            trials = manifest.create_manifest(config.workspace, combinations, abbrevs, config.labels)
-            pending = [t["index"] for t in trials]
+
+        diff = manifest.reconcile_manifest(existing, combinations)
+        if not _apply_reconciliation(config, diff, args.force):
+            return 1
+
+        trials = manifest.load_manifest(config.workspace)
+        pending = manifest.get_pending_indices(config.workspace)
+        if not pending and not args.indices:
+            print("All trials are completed or currently running. Nothing to submit.")
+            return 0
+        if not args.indices:
+            print(f"  {len(pending)} trials need (re)submission.")
     else:
         trials = manifest.create_manifest(config.workspace, combinations, abbrevs, config.labels)
         pending = [t["index"] for t in trials]
@@ -107,14 +158,17 @@ def cmd_launch(args):
     print(f"Submitting {len(pending)} trials as SLURM job array...")
     job_id = slurm.submit_job(config, script, dry_run=False)
     assert job_id is not None
-    print(f"Submitted job array: {job_id}")
 
     # Record submission and update statuses
     manifest.record_job_submission(config.workspace, job_id, pending)
     manifest.bulk_update_status(config.workspace, {i: "submitted" for i in pending})
 
-    print(f"Workspace: {manifest.workspace_path(config.workspace)}")
-    print(f"Logs: {manifest.logs_path(config.workspace)}")
+    print_launch_success(
+        job_id=job_id,
+        n_trials=len(pending),
+        workspace=manifest.workspace_path(config.workspace),
+        logs=manifest.logs_path(config.workspace),
+    )
     return 0
 
 
@@ -616,7 +670,11 @@ def main():
     )
     p_launch.add_argument(
         "-f", "--force", action="store_true",
-        help="With --indices: resubmit even if a requested trial is already running or completed"
+        help=(
+            "Override safety checks: with --indices, resubmit trials that are "
+            "already running or completed; without --indices, allow config "
+            "edits that drop running/completed trials (kept as orphans)"
+        ),
     )
 
     # monitor

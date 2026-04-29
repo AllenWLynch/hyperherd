@@ -26,6 +26,9 @@ _PARAM_VALUE = "\033[33m"  # yellow for values
 _TRIAL_HEADER = "\033[1;37m"  # bold white for trial headers
 _EXP_NAME = "\033[35m"    # magenta for experiment name
 _BG_HIGHLIGHT = "\033[47m"  # light grey background for non-default values
+_GREEN = "\033[32m"
+_BOLD_GREEN = "\033[1;32m"
+_CYAN = "\033[36m"
 
 
 def _colorize_status(text: str, status: str) -> str:
@@ -188,3 +191,25 @@ def print_dry_run(
             for name, value in extras.items():
                 print(f"    {_format_param_kv(name, value, is_non_default=True)}")
         print()
+
+
+def print_launch_success(
+    job_id: str,
+    n_trials: int,
+    workspace: str,
+    logs: str,
+) -> None:
+    """Celebratory banner shown after a successful sbatch submission."""
+    bar = f"{_BOLD_GREEN}{'━' * 60}{_RESET}"
+    print()
+    print(bar)
+    print(
+        f"{_BOLD_GREEN}  ✓ Launched {n_trials} trial"
+        f"{'s' if n_trials != 1 else ''} as SLURM job array "
+        f"{_CYAN}{job_id}{_RESET}"
+    )
+    print(bar)
+    print(f"  {_DIM}workspace:{_RESET} {workspace}")
+    print(f"  {_DIM}logs:     {_RESET} {logs}")
+    print(f"  {_DIM}monitor:  {_RESET} {_GREEN}herd status{_RESET}")
+    print()

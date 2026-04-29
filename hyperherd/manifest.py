@@ -1,7 +1,9 @@
 """Manage the .hyperherd/ workspace: trial manifest, status, and job tracking."""
 
+import hashlib
 import json
 import os
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 from hyperherd.constraints import Trial
@@ -86,6 +88,38 @@ def build_experiment_name(
     return "_".join(parts)
 
 
+def trial_hash(params: Dict[str, Any], extras: Optional[Dict[str, Any]] = None) -> str:
+    """Stable identity hash for a trial, derived from its swept params + constraint extras.
+
+    Two trials with the same hash are considered the same trial across
+    config edits — this is how reconciliation distinguishes
+    "kept" trials from "added"/"removed" ones.
+    """
+    blob = json.dumps(
+        {"params": params, "extras": extras or {}},
+        sort_keys=True,
+        default=_json_default,
+    )
+    return hashlib.sha1(blob.encode()).hexdigest()[:12]
+
+
+def _trial_record(
+    index: int,
+    params: Dict[str, Any],
+    extras: Dict[str, Any],
+    abbrevs: Dict[str, str],
+    labels: Optional[Dict[str, Dict[Any, str]]],
+) -> dict:
+    return {
+        "index": index,
+        "hash": trial_hash(params, extras),
+        "params": params,
+        "extras": extras,
+        "experiment_name": build_experiment_name(params, abbrevs, labels),
+        "status": "ready",
+    }
+
+
 def create_manifest(
     base: str,
     trials: List[Union[Trial, Dict[str, Any]]],
@@ -107,13 +141,7 @@ def create_manifest(
         else:
             params = item
             extras = {}
-        records.append({
-            "index": i,
-            "params": params,
-            "extras": extras,
-            "experiment_name": build_experiment_name(params, abbrevs, labels),
-            "status": "ready",
-        })
+        records.append(_trial_record(i, params, extras, abbrevs, labels))
     _write_manifest(base, records)
     return records
 
@@ -123,7 +151,96 @@ def load_manifest(base: str) -> List[dict]:
     if not os.path.isfile(path):
         return []
     with open(path, "r") as f:
-        return json.load(f)
+        trials = json.load(f)
+    # Backfill `hash` on legacy manifests written before reconciliation existed.
+    # Avoids a forced migration; the hash is fully derivable from params+extras.
+    for t in trials:
+        if "hash" not in t:
+            t["hash"] = trial_hash(t.get("params", {}), t.get("extras") or {})
+    return trials
+
+
+@dataclass
+class Reconciled:
+    """Diff between the on-disk manifest and a freshly-generated combo list."""
+    kept: List[dict] = field(default_factory=list)        # trials present in both
+    added: List[Trial] = field(default_factory=list)      # in combos, not in manifest
+    removed: List[dict] = field(default_factory=list)     # in manifest, not in combos
+
+    @property
+    def is_clean(self) -> bool:
+        return not self.added and not self.removed
+
+
+def reconcile_manifest(
+    existing: List[dict],
+    combos: List[Trial],
+) -> Reconciled:
+    """Diff an on-disk manifest against a freshly-generated combo list by trial hash.
+
+    Identity is `trial_hash(params, extras)` — independent of index, abbrevs,
+    or experiment_name. Kept trials retain their existing record (frozen
+    experiment_name, status, etc.); added trials are returned as Trial objects
+    awaiting index assignment.
+    """
+    by_hash = {t["hash"]: t for t in existing}
+    new_hashes = {trial_hash(c.params, c.extras): c for c in combos}
+
+    kept = [t for t in existing if t["hash"] in new_hashes]
+    removed = [t for t in existing if t["hash"] not in new_hashes]
+    added = [c for h, c in new_hashes.items() if h not in by_hash]
+    return Reconciled(kept=kept, added=added, removed=removed)
+
+
+def _next_index(base: str, existing: List[dict]) -> int:
+    """High-water mark across the live manifest AND historical job_ids.
+
+    Even after a trial is dropped from the manifest, its index may still
+    appear in job_ids.json — recycling it would let _sync_slurm_status
+    apply a stale SLURM state to a new trial.
+    """
+    max_live = max((t["index"] for t in existing), default=-1)
+    max_hist = -1
+    for record in _load_job_ids(base):
+        for idx in record.get("indices", []):
+            if idx > max_hist:
+                max_hist = idx
+    return max(max_live, max_hist) + 1
+
+
+def append_trials(
+    base: str,
+    new_combos: List[Trial],
+    abbrevs: Dict[str, str],
+    labels: Optional[Dict[str, Dict[Any, str]]],
+) -> List[dict]:
+    """Append new trials to an existing manifest, assigning fresh indices.
+
+    Indices are never reused — they extend past the high-water mark across
+    both the live manifest and `job_ids.json`, so SLURM job_ids referencing
+    old indices can never collide with new trials.
+    """
+    if not new_combos:
+        return load_manifest(base)
+    existing = load_manifest(base)
+    next_idx = _next_index(base, existing)
+    for combo in new_combos:
+        existing.append(_trial_record(next_idx, combo.params, combo.extras, abbrevs, labels))
+        next_idx += 1
+    _write_manifest(base, existing)
+    return existing
+
+
+def drop_trials(base: str, indices: List[int]) -> List[dict]:
+    """Remove trials by index. Caller is responsible for ensuring it's safe
+    (e.g., no live SLURM jobs reference these indices)."""
+    if not indices:
+        return load_manifest(base)
+    drop = set(indices)
+    existing = load_manifest(base)
+    kept = [t for t in existing if t["index"] not in drop]
+    _write_manifest(base, kept)
+    return kept
 
 
 def _write_manifest(base: str, trials: List[dict]) -> None:
