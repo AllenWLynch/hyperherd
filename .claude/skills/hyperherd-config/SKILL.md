@@ -66,9 +66,9 @@ conditions:
       scheduler.warmup: 100    # literals still work
 ```
 
-Allowed: arithmetic (`+ - * / // % **`), comparisons (chained too: `0 < x < 10`), `and`/`or`/`not`, `in` / `not in` against tuple/list literals, `x if cond else y`, numbers/strings/booleans/`None`, names of swept parameters.
+Allowed: arithmetic (`+ - * / // % **`), comparisons (chained too: `0 < x < 10`), `and`/`or`/`not`, `in` / `not in` against tuple/list literals, `x if cond else y`, numbers/strings/booleans/`None`, names of swept parameters, and the bounding helpers `min(...)` / `max(...)` (e.g. `min(max(y, 0), 10)` to clamp).
 
-Rejected at config-load time: function calls, attribute access, subscripting, lambdas, comprehensions, f-strings, any unknown name.
+Rejected at config-load time: any other function call, attribute access, subscripting, lambdas, comprehensions, f-strings, keyword arguments, any unknown name.
 
 `+`/`~`/`++` prefixes are stripped in the expression namespace, so `+experiment` is referenced as `experiment` inside an expr. If two parameters would collide after stripping (e.g. both `foo` and `+foo`), config validation fails.
 

@@ -143,7 +143,7 @@ class TestConfigValidation(unittest.TestCase):
             )
         self.assertIn("Unknown name", str(ctx.exception))
 
-    def test_call_in_set_expr_rejected(self):
+    def test_disallowed_call_in_set_expr_rejected(self):
         with self.assertRaises(Exception) as ctx:
             Config.model_validate(
                 self._cfg(
@@ -152,7 +152,16 @@ class TestConfigValidation(unittest.TestCase):
                     set={"x": {"expr": "abs(y)"}},
                 )
             )
-        self.assertIn("Disallowed syntax", str(ctx.exception))
+        self.assertIn("Disallowed function", str(ctx.exception))
+
+    def test_min_max_in_set_expr_accepted(self):
+        Config.model_validate(
+            self._cfg(
+                name="ok",
+                when={"y": {"ge": 0}},
+                set={"x": {"expr": "min(max(y, 0), 10)"}},
+            )
+        )
 
     def test_collision_rejected_at_load(self):
         cfg = {

@@ -35,6 +35,10 @@ _ALLOWED_OPS = (
     ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn,
 )
 
+# Whitelisted callables — bounding/clamping is the natural use case.
+# Kept tiny on purpose; expand only when a clear pattern emerges.
+_ALLOWED_CALLS = {"min": min, "max": max}
+
 
 class ExprError(ValueError):
     """Raised when an expression fails validation or evaluation."""
@@ -91,14 +95,34 @@ def validate_expr(expr_str: str, allowed_names: Set[str]) -> None:
             continue
         if isinstance(node, _ALLOWED_OPS):
             continue
+        if isinstance(node, ast.Call):
+            # Only bare-name calls to whitelisted functions; no kwargs/starargs.
+            if not isinstance(node.func, ast.Name):
+                raise ExprError(
+                    f"Only direct calls to {sorted(_ALLOWED_CALLS)} are allowed "
+                    f"in expression {expr_str!r}"
+                )
+            if node.func.id not in _ALLOWED_CALLS:
+                raise ExprError(
+                    f"Disallowed function {node.func.id!r} in expression "
+                    f"{expr_str!r} (allowed: {sorted(_ALLOWED_CALLS)})"
+                )
+            if node.keywords:
+                raise ExprError(
+                    f"Keyword arguments are not allowed in expression {expr_str!r}"
+                )
+            continue
         raise ExprError(
             f"Disallowed syntax in expression {expr_str!r}: "
             f"{type(node).__name__} is not permitted "
-            f"(allowed: arithmetic, comparison, boolean, membership)"
+            f"(allowed: arithmetic, comparison, boolean, membership, "
+            f"{sorted(_ALLOWED_CALLS)})"
         )
 
+    callable_names = set(_ALLOWED_CALLS)
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id not in allowed_names:
+        if isinstance(node, ast.Name) and node.id not in allowed_names \
+                and node.id not in callable_names:
             raise ExprError(
                 f"Unknown name {node.id!r} in expression {expr_str!r}. "
                 f"Available names: {sorted(allowed_names)}"
@@ -113,4 +137,7 @@ def eval_expr(expr_str: str, namespace: Dict[str, Any]) -> Any:
     block any sneaky access via shadowed names.
     """
     code = compile(expr_str, "<hyperherd-expr>", "eval")
-    return eval(code, {"__builtins__": {}}, namespace)
+    # Whitelisted callables ride alongside params; param names take precedence
+    # if a sweep ever has a param literally called "min" or "max".
+    scope = {**_ALLOWED_CALLS, **namespace}
+    return eval(code, {"__builtins__": {}}, scope)

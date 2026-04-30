@@ -31,9 +31,17 @@ class TestValidate(unittest.TestCase):
             validate_expr("z + 1", self.NAMES)
         self.assertIn("Unknown name", str(ctx.exception))
 
-    def test_call_rejected(self):
+    def test_min_max_allowed(self):
+        validate_expr("max(0, x)", self.NAMES)
+        validate_expr("min(x, max(y, 1))", self.NAMES)
+
+    def test_other_call_rejected(self):
         with self.assertRaises(ExprError):
             validate_expr("abs(x)", self.NAMES)
+
+    def test_kwarg_call_rejected(self):
+        with self.assertRaises(ExprError):
+            validate_expr("min(x, default=0)", self.NAMES)
 
     def test_attribute_rejected(self):
         with self.assertRaises(ExprError):
@@ -69,6 +77,10 @@ class TestEval(unittest.TestCase):
 
     def test_conditional(self):
         self.assertEqual(eval_expr("x if x > 0 else -x", {"x": -5}), 5)
+
+    def test_min_max_eval(self):
+        self.assertEqual(eval_expr("max(0, x)", {"x": -3}), 0)
+        self.assertEqual(eval_expr("min(x, 10)", {"x": 42}), 10)
 
     def test_no_builtins(self):
         # Even if user smuggled `abs` past validate_expr (they can't, but verify
