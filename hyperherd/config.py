@@ -89,6 +89,38 @@ ParameterSpec = Union[DiscreteParameter, ContinuousParameter]
 WHEN_OPERATORS = {"eq", "ne", "gt", "ge", "lt", "le", "in", "not_in"}
 
 
+def _coerce_numeric(value):
+    """Recursively coerce strings that parse cleanly as int/float to numbers.
+
+    Strings like "1e-3", "0.001", "42" become numbers; anything else
+    (including bare True/False, real text, leading-zero IDs) is left alone.
+    Applied to nested dicts and lists so it reaches operator-map values
+    (`{le: "1e-3"}`) and exclude lists (`[1e-3]`).
+    """
+    if isinstance(value, str):
+        s = value.strip()
+        # Leave decorative/leading-zero strings (like '007', '0x10') as strings.
+        if not s or s.lower() in {"true", "false", "null", "none"}:
+            return value
+        try:
+            f = float(s)
+        except (TypeError, ValueError):
+            return value
+        # Prefer int when the parsed float is integer and the source had no
+        # decimal/exponent (so "1.0" stays float, "1" becomes int).
+        if "." not in s and "e" not in s.lower() and float(s).is_integer():
+            try:
+                return int(s)
+            except ValueError:
+                return f
+        return f
+    if isinstance(value, list):
+        return [_coerce_numeric(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _coerce_numeric(v) for k, v in value.items()}
+    return value
+
+
 class Constraint(BaseModel):
     name: str = "unnamed"
     when: Dict[str, Any] = Field(min_length=1)
@@ -157,6 +189,25 @@ class Constraint(BaseModel):
             for k, v in data["exclude"].items():
                 if not isinstance(v, list):
                     data["exclude"][k] = [v]
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_numeric_strings(cls, data):
+        """Coerce strings that parse as numbers (e.g. YAML 1.1 reads `1e-3`
+        as a string because there's no decimal/sign).
+
+        Without this, a `when: {lr: {le: 1e-3}}` clause silently fails to
+        match because `_match_one`'s comparison branch requires int/float on
+        both sides. Same trap in `exclude` list values and any `force`/`set`
+        literal that's intended to be numeric.
+        """
+        if not isinstance(data, dict):
+            return data
+        for field in ("when", "exclude", "force", "set"):
+            section = data.get(field)
+            if isinstance(section, dict):
+                data[field] = {k: _coerce_numeric(v) for k, v in section.items()}
         return data
 
 

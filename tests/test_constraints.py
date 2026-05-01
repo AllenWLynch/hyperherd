@@ -6,6 +6,43 @@ from hyperherd.config import Constraint
 from hyperherd.constraints import apply_constraints
 
 
+class TestNumericStringCoercion(unittest.TestCase):
+    """YAML 1.1 reads `1e-3` (no decimal/sign) as a string. Without coercion
+    at config-load time, comparison matchers silently fail to match."""
+
+    def test_le_with_yaml_style_scientific_notation(self):
+        # Same shape as a YAML loader would produce for `{le: 1e-3}`.
+        c = Constraint(
+            name="t",
+            when={"lr": {"le": "1e-3"}},
+            force={"clamped": 1},
+        )
+        out = apply_constraints([{"lr": 0.0001}, {"lr": 0.01}], [c])
+        self.assertEqual(out[0].params.get("clamped"), 1)
+        self.assertNotIn("clamped", out[1].params)
+
+    def test_exclude_list_with_string_scientific(self):
+        c = Constraint(
+            name="t",
+            when={"lr": "0.1"},
+            exclude={"lr": ["1e-1"]},
+        )
+        out = apply_constraints([{"lr": 0.1}, {"lr": 0.01}], [c])
+        # 0.1 should be excluded by the string-scientific entry.
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].params["lr"], 0.01)
+
+    def test_genuinely_string_value_left_alone(self):
+        c = Constraint(
+            name="t",
+            when={"opt": "adam"},
+            exclude={"opt": ["sgd"]},
+        )
+        # "adam" / "sgd" are not float-parseable; they must remain strings.
+        self.assertEqual(c.when["opt"], "adam")
+        self.assertEqual(c.exclude["opt"], ["sgd"])
+
+
 class TestExcludeConstraint(unittest.TestCase):
     def test_basic_exclude(self):
         combos = [
