@@ -30,9 +30,18 @@ The sweep is configured as a partial grid over `learning_rate` and `optimizer`, 
 | `optimizer`     | adam, sgd, adamw          | adam    |
 | `batch_size`    | 32, 64, 128               | 64      |
 | `hidden_dim`    | 64, 128, 256              | 128     |
-| `dropout`       | 0.0, 0.2, 0.5            | 0.0     |
+| `dropout`       | 0.0, 0.2, 0.5            | 0.2     |
 
 With `grid: [learning_rate, optimizer]`, this produces 4 x 3 = 12 trials (minus 1 from the SGD high-LR constraint = 11 trials).
+
+The `conditions:` block in `hyperherd.yaml` shows off four constraint forms in one place:
+
+1. **`when.expr`** — programmatic predicate (`optimizer == 'sgd' and learning_rate > 0.05`).
+2. **`set` (literals)** — inject Hydra overrides not declared as parameters (`weight_decay`, `gradient_clip_val`).
+3. **`set.expr`** — compute an extra from swept params (`weight_decay = 0.1 * learning_rate`).
+4. **`force`** — pin a swept parameter under a condition (`dropout = 0` for tiny LRs).
+
+The trainer reads `weight_decay` and `gradient_clip_val` so the per-trial effects are visible in `herd run -n` and in the actual training logs.
 
 ## Running locally (single trial)
 

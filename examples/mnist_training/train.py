@@ -21,7 +21,14 @@ from torchvision.datasets import MNIST
 
 
 class MNISTClassifier(pl.LightningModule):
-    def __init__(self, hidden_dim: int, dropout: float, learning_rate: float, optimizer: str):
+    def __init__(
+        self,
+        hidden_dim: int,
+        dropout: float,
+        learning_rate: float,
+        optimizer: str,
+        weight_decay: float = 0.0,
+    ):
         super().__init__()
         self.save_hyperparameters()
 
@@ -65,12 +72,13 @@ class MNISTClassifier(pl.LightningModule):
     def configure_optimizers(self):
         name = self.hparams.optimizer
         lr = self.hparams.learning_rate
+        wd = self.hparams.weight_decay
         if name == "adam":
-            return torch.optim.Adam(self.parameters(), lr=lr)
+            return torch.optim.Adam(self.parameters(), lr=lr, weight_decay=wd)
         elif name == "adamw":
-            return torch.optim.AdamW(self.parameters(), lr=lr)
+            return torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=wd)
         elif name == "sgd":
-            return torch.optim.SGD(self.parameters(), lr=lr, momentum=0.9)
+            return torch.optim.SGD(self.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
         else:
             raise ValueError(f"Unknown optimizer: {name}")
 
@@ -124,6 +132,7 @@ def main(cfg: DictConfig) -> None:
     print(f"Output dir: {output_dir}")
     print(f"  lr={cfg.learning_rate}, opt={cfg.optimizer}, bs={cfg.batch_size}")
     print(f"  hidden_dim={cfg.hidden_dim}, dropout={cfg.dropout}")
+    print(f"  weight_decay={cfg.weight_decay}, gradient_clip_val={cfg.gradient_clip_val}")
     print(f"  max_epochs={cfg.max_epochs}, accelerator={cfg.accelerator}")
 
     # Seed for reproducibility
@@ -135,6 +144,7 @@ def main(cfg: DictConfig) -> None:
         dropout=cfg.dropout,
         learning_rate=cfg.learning_rate,
         optimizer=cfg.optimizer,
+        weight_decay=cfg.weight_decay,
     )
 
     # Data
@@ -167,6 +177,7 @@ def main(cfg: DictConfig) -> None:
         callbacks=[checkpoint_cb],
         default_root_dir=output_dir,
         enable_progress_bar=True,
+        gradient_clip_val=cfg.gradient_clip_val,
     )
 
     # Train

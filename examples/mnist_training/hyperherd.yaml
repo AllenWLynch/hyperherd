@@ -7,6 +7,8 @@ slurm:
   time: "01:00:00"
   mem: "4G"
   cpus_per_task: 1
+  # Cap simultaneously running array tasks. Useful for shared FS / quota.
+  max_concurrent: 4
 
 launcher: ./launch.sh
 
@@ -44,11 +46,45 @@ parameters:
     abbrev: do
     type: discrete
     values: [0.0, 0.2, 0.5]
-    default: 0.0
+    default: 0.2
 
+# Conditions are evaluated in order; each can filter (`exclude`), pin
+# (`force`), or inject Hydra overrides (`set`). The four below showcase:
+# a programmatic predicate, a literal-extra injection, a computed-extra
+# expression, and a structured force.
 conditions:
-  - name: sgd_needs_lower_lr
+  # 1) Programmatic predicate via `when.expr`. Plain SGD is unstable at
+  #    high learning rates — drop those combos entirely.
+  - name: sgd_unstable_at_high_lr
+    when:
+      expr: "optimizer == 'sgd' and learning_rate > 0.05"
+    exclude:
+      learning_rate: [0.1, 1.0]
+
+  # 2) AdamW gets a fixed weight decay AND turns on gradient clipping.
+  #    `set` keys are arbitrary Hydra paths, not declared parameters.
+  - name: adamw_regularized
+    when:
+      optimizer: adamw
+    set:
+      weight_decay: 0.01
+      gradient_clip_val: 1.0
+
+  # 3) For SGD, scale weight decay with the learning rate via `set.expr`.
+  #    The expression sees the trial's swept params (after any `force`).
+  - name: sgd_scaled_weight_decay
     when:
       optimizer: sgd
-    exclude:
-      learning_rate: [0.1]
+    set:
+      weight_decay: {expr: "0.1 * learning_rate"}
+      gradient_clip_val: 1.0
+
+  # 4) `force` pins a swept parameter under a condition. When LR is very
+  #    small we clamp dropout to 0 so we're testing the optimizer in
+  #    isolation (the value is no longer free even though dropout is in
+  #    the parameter list).
+  - name: tiny_lr_no_dropout
+    when:
+      learning_rate: {le: 1e-3}
+    force:
+      dropout: 0.0
