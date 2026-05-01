@@ -3,14 +3,14 @@
 ## Installation
 
 ```bash
-pip install git+https://github.com/AllenWLynch/hyperwhip.git
+pip install git+https://github.com/AllenWLynch/hyperherd.git
 ```
 
 For local development:
 
 ```bash
-git clone https://github.com/AllenWLynch/hyperwhip.git
-cd hyperwhip
+git clone https://github.com/AllenWLynch/hyperherd.git
+cd hyperherd
 pip install -e .
 ```
 

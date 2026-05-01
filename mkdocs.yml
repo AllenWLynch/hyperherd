@@ -1,8 +1,8 @@
 site_name: HyperHerd
 site_description: Launch and monitor hyperparameter optimization job arrays on SLURM.
-site_url: https://allenwlynch.github.io/hyperwhip/
-repo_url: https://github.com/AllenWLynch/hyperwhip
-repo_name: AllenWLynch/hyperwhip
+site_url: https://allenwlynch.github.io/hyperherd/
+repo_url: https://github.com/AllenWLynch/hyperherd
+repo_name: AllenWLynch/hyperherd
 edit_uri: edit/main/docs/
 
 theme:
@@ -57,7 +57,9 @@ markdown_extensions:
       line_spans: __span
       pygments_lang_class: true
   - pymdownx.inlinehilite
-  - pymdownx.snippets
+  - pymdownx.snippets:
+      base_path: ["docs"]
+      check_paths: true
   - pymdownx.superfences
   - pymdownx.tabbed:
       alternate_style: true

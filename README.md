@@ -6,13 +6,13 @@ You write a YAML sweep config and a bash launcher script. HyperHerd generates a 
 
 [Hydra](https://hydra.cc/) is the recommended trainer harness (its CLI consumes the override format directly), but the launcher is free-form bash — parse the arguments however you want.
 
-📖 **Full documentation: [allenwlynch.github.io/hyperwhip](https://allenwlynch.github.io/hyperwhip/)**
+📖 **Full documentation: [allenwlynch.github.io/hyperherd](https://allenwlynch.github.io/hyperherd/)**
 
 ## Quick start
 
 ```bash
 # Install
-pip install git+https://github.com/AllenWLynch/hyperwhip.git
+pip install git+https://github.com/AllenWLynch/hyperherd.git
 
 # Install the Claude Code skill for authoring sweep configs
 herd install-skill
@@ -28,12 +28,12 @@ herd status my_experiment           # monitor
 
 ## Documentation
 
-- [Getting started](https://allenwlynch.github.io/hyperwhip/getting-started/) — install, scaffold, run your first sweep
-- [Sweep config reference](https://allenwlynch.github.io/hyperwhip/configuration/) — every field in `hyperherd.yaml`
-- [Conditions](https://allenwlynch.github.io/hyperwhip/conditions/) — filter or modify parameter combinations
-- [Launcher script](https://allenwlynch.github.io/hyperwhip/launcher/) — contract + examples (Apptainer, conda, non-Hydra)
-- [Command reference](https://allenwlynch.github.io/hyperwhip/commands/) — every `herd` subcommand
-- [Claude Code skill](https://allenwlynch.github.io/hyperwhip/claude-skill/) — authoring configs by asking Claude
+- [Getting started](https://allenwlynch.github.io/hyperherd/getting-started/) — install, scaffold, run your first sweep
+- [Sweep config reference](https://allenwlynch.github.io/hyperherd/configuration/) — every field in `hyperherd.yaml`
+- [Conditions](https://allenwlynch.github.io/hyperherd/conditions/) — filter or modify parameter combinations
+- [Launcher script](https://allenwlynch.github.io/hyperherd/launcher/) — contract + examples (Apptainer, conda, non-Hydra)
+- [Command reference](https://allenwlynch.github.io/hyperherd/commands/) — every `herd` subcommand
+- [Claude Code skill](https://allenwlynch.github.io/hyperherd/claude-skill/) — authoring configs by asking Claude
 
 ## Requirements
 
