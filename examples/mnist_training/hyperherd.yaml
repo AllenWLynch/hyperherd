@@ -3,19 +3,26 @@ name: mnist_sweep
 grid: [learning_rate, optimizer]
 
 slurm:
-  partition: park,short
+  partition: short
   time: "01:00:00"
-  mem: "4G"
+  mem: "1500MB"
   cpus_per_task: 1
   # Cap simultaneously running array tasks. Useful for shared FS / quota.
-  max_concurrent: 4
+  max_concurrent: 2
 
 launcher: ./launch.sh
 
 static_overrides:
-  - "max_epochs=10"
+  - "max_epochs=50"
   - "data_dir=./data/mnist"
   - "accelerator=auto"
+
+watch:
+    format: ntfy
+    interval_seconds: 30
+    events: [failed, done, heartbeat]
+    heartbeat_minutes: 1
+    summarize: true
 
 parameters:
   learning_rate:

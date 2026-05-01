@@ -1,0 +1,44 @@
+/* Terminal-output blocks rendered from captured ANSI by docs/_scripts/render_ansi.py.
+   Embedded inline in the markdown via the `md_in_html` extension.        */
+
+pre.terminal {
+  background: #1e1e2e;
+  color: #cdd6f4;
+  border-radius: 6px;
+  padding: 1em 1.2em;
+  margin: 1em 0;
+  overflow-x: auto;
+  font-size: 0.85em;
+  line-height: 1.45;
+  font-family:
+    "JetBrains Mono", "SFMono-Regular", "Roboto Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+pre.terminal code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  font-family: inherit;
+  font-size: inherit;
+  white-space: pre;
+}
+
+/* SGR mapping. Keep in sync with _CODE_TO_CLASS in render_ansi.py.
+   Colors picked to read on the dark background above and roughly mirror
+   the terminal palette display.py was authored for. */
+.ansi-bold      { font-weight: 700; }
+.ansi-dim       { opacity: 0.65; }
+.ansi-fg-red    { color: #f38ba8; }
+.ansi-fg-green  { color: #a6e3a1; }
+.ansi-fg-yellow { color: #f9e2af; }
+.ansi-fg-blue   { color: #89b4fa; }
+.ansi-fg-magenta{ color: #f5c2e7; }
+.ansi-fg-cyan   { color: #94e2d5; }
+.ansi-fg-white  { color: #ffffff; }
+.ansi-fg-gray   { color: #7f849c; }
+.ansi-bg-highlight {
+  background: rgba(180, 190, 254, 0.18);
+  border-radius: 2px;
+  padding: 0 2px;
+}

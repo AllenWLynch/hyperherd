@@ -22,6 +22,7 @@ Two files in a workspace directory:
 - Tracks state across runs: re-running the same workspace resubmits only failed/pending trials.
 - Lets you **edit `hyperherd.yaml` mid-sweep** — new trials are appended on the next `herd run`; completed trials keep their results.
 - Reads back per-trial metrics logged via `from hyperherd import log_result`.
+- Optional [`herd watch`](commands.md#herd-watch) daemon posts trial state changes to Slack / Discord / ntfy / any webhook.
 
 ## Scope
 

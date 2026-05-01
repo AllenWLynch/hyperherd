@@ -11,6 +11,7 @@ The configuration file is YAML. Every field is documented below with its type, w
 | `launcher`    | string | **yes**  | —       | Path to the launcher bash script. Relative paths are resolved relative to the config file's directory. See [Launcher Script](launcher.md). |
 | `slurm`       | object | no       | see below | SLURM resource requests. See [slurm](#slurm). |
 | `hydra`       | object | no       | see below | Static Hydra overrides. See [hydra](#hydra). |
+| `watch`       | object | no       | see below | Settings for the `herd watch` notification daemon. See [watch](#watch). |
 | `parameters`  | object | **yes**  | —       | Hyperparameter definitions. At least one parameter is required. See [parameters](#parameters). |
 | `conditions`  | list   | no       | `[]`    | Conditional rules that filter or modify parameter combinations. See [Conditions](conditions.md). |
 
@@ -71,6 +72,87 @@ slurm:
     - "--export=ALL"
     - "--exclusive"
 ```
+
+## `watch`
+
+Settings for the [`herd watch`](commands.md#herd-watch) daemon — a polling loop that posts trial state changes to a webhook (Slack, Discord, ntfy.sh, or any URL that accepts a POST). All fields are optional; the entire `watch:` block can be omitted, in which case the defaults below apply and `herd watch` falls back to a per-workspace ntfy.sh topic generated on first run.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `webhook` | string | *unset* | Webhook URL to POST events to. Unset → daemon prints a generated `https://ntfy.sh/herd-{slug}-{random}` URL on startup. |
+| `format` | enum | `raw` | Payload shape: `slack`, `discord`, `ntfy`, or `raw`. |
+| `interval_seconds` | int | `60` | How often to poll SLURM. Lower = faster failure alerts, more `sacct` calls. |
+| `heartbeat_minutes` | int or null | `5` | Minimum gap between heartbeat digests. Required if `heartbeat` is in `events`. |
+| `events` | list | `[failed, done, heartbeat]` | Which events to deliver. Choices: `failed`, `done`, `heartbeat`. |
+| `summarize` | bool | `false` | When `true`, shells out to the `claude` CLI on `failed` events for a 1–2 sentence diagnosis built from the SLURM cause + stderr tail. Replaces the raw stderr tail in slack/discord/ntfy bodies; the unabridged tail still appears in `raw` payloads. |
+
+```yaml
+watch:
+  webhook: https://hooks.slack.com/services/T.../B.../xxxx
+  format: slack
+  interval_seconds: 60
+  heartbeat_minutes: 30
+  events: [failed, done, heartbeat]
+```
+
+### Events
+
+- **`failed`** — fires once per trial when it transitions into `failed` or `cancelled`. Skipped on the very first poll so a daemon started mid-sweep doesn't replay history. The payload carries a [diagnosis block](#failure-diagnosis) (SLURM cause + stderr tail).
+- **`done`** — fires once when every trial is in a terminal state (`completed` / `failed` / `cancelled`). Re-arms if you resubmit a trial.
+- **`heartbeat`** — periodic digest with current totals. Suppressed if nothing has changed since the last heartbeat, so a queued sweep stuck behind a partition doesn't spam you.
+
+### Format
+
+`slack`, `discord`, and `ntfy` all send the same one-line text body, just wrapped in the right shape for each service:
+
+| Format | Body | Content-Type |
+|--------|------|--------------|
+| `slack` | `{"text": "..."}` | `application/json` |
+| `discord` | `{"content": "..."}` | `application/json` |
+| `ntfy` | the line as plain text | `text/plain` |
+| `raw` | the full event JSON (event, trial, totals, sweep, timestamp, summary) | `application/json` |
+
+The line looks like `[mnist_sweep] trial 7 (lr-0.001_opt-sgd) failed — 12/19 done, 4 running, 1 failed`. Pick `raw` if you want to render your own message in a downstream consumer.
+
+### Failure diagnosis
+
+`failed` events automatically carry a diagnosis block built from `sacct` and the trial's stderr log:
+
+| Field | Source | Example |
+|-------|--------|---------|
+| `cause` | SLURM `State` + `ExitCode` | `TIMEOUT`, `OUT_OF_MEMORY`, `SIGSEGV`, `exit code 1` |
+| `slurm_state` | sacct `State` | `TIMEOUT` |
+| `exit_code` / `signal` | sacct `ExitCode` | `1` / `0` |
+| `reason` | sacct `Reason` | `JobOutOfTime` |
+| `job_id` | manifest job ledger | `12345` |
+| `stderr_tail` | `.hyperherd/logs/<idx>.err` | last 20 lines / 1500 bytes |
+| `stderr_truncated` | bool | `true` when the cap kicked in |
+
+In **slack / discord / ntfy** bodies, the `cause` is appended to the summary line and the stderr tail is included in a triple-backtick code block:
+
+```
+[mnist_sweep] trial 7 (lr-0.001_opt-sgd) failed (TIMEOUT) — 12/19 done, 4 running, 1 failed
+```
+Traceback (most recent call last):
+  File "train.py", line 42, in <module>
+    main()
+slurmstepd: error: JOB 12345 ON node-04 CANCELLED AT ... DUE TO TIME LIMIT
+```
+```
+
+In **`raw`** payloads, the full block is exposed as `failure: {...}` so a downstream consumer can render it however it wants.
+
+With `summarize: true`, a Claude-generated 1–2 sentence diagnosis replaces the stderr code block in slack/discord/ntfy (the raw tail is still present in `raw` payloads). If `claude` isn't on PATH or the call fails, the daemon silently falls back to the stderr tail.
+
+### Zero-config ntfy fallback
+
+Leave `webhook` unset and the daemon will:
+
+1. Generate `herd-{sweep-slug}-{random}` on first run, persist it to `.hyperherd/watch.json`, and reuse it on every subsequent run.
+2. Print the resulting `https://ntfy.sh/...` URL plus subscribe instructions to stderr at startup.
+3. Force `format: ntfy` regardless of what's configured (the URL only accepts the ntfy shape).
+
+The topic is unguessable in practice (~48 bits of entropy in the random suffix), but the public ntfy.sh broker is read-by-URL, so anyone with the URL can read your notifications. Use a private webhook for sensitive sweeps.
 
 ## `static_overrides`
 

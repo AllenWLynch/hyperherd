@@ -4,3 +4,29 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Virtualenvs
+.venv/
+venv/
+
+# MkDocs build output
+site/
+
+# HyperHerd workspace state (per-sweep)
+.hyperherd/
+.hyperwhip/
+
+# NFS lock turds
+.nfs*
+**/.nfs*
+
+# Example run artifacts
+examples/*/data/
+examples/*/outputs/
+examples/*/mock_sweep/
+examples/*/logs/

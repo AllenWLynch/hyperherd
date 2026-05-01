@@ -28,6 +28,18 @@ launcher: ./launch.sh
 # static_overrides:
 #   - "data.path=/scratch/datasets"
 
+# `herd watch` posts trial state changes to a webhook (Slack/Discord/ntfy/
+# anything that accepts a JSON or plain-text POST). Run in a nohup/tmux/
+# screen session. With no `webhook` set, falls back to a per-workspace
+# ntfy.sh topic and prints the subscribe URL on startup.
+# watch:
+#   webhook: https://hooks.slack.com/services/T.../B.../xxxx
+#   format: slack                     # slack | discord | ntfy | raw
+#   interval_seconds: 60              # how often to poll SLURM
+#   heartbeat_minutes: 5              # min gap between heartbeat digests
+#   events: [failed, done, heartbeat] # which events to deliver
+#   summarize: true                   # opt-in: `claude -p` paragraph in raw payloads
+
 parameters:
 {parameters_block}
 """

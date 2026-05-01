@@ -367,6 +367,88 @@ def _query_squeue(job_ids: List[str]) -> Dict[Tuple[str, int], str]:
     return statuses
 
 
+@dataclasses.dataclass
+class FailureInfo:
+    """Diagnostic facts pulled from sacct for one failed array task.
+
+    `state` is the raw SLURM state string (`TIMEOUT`, `OUT_OF_MEMORY`,
+    `NODE_FAIL`, `FAILED`, `CANCELLED`, ...). `exit_code` and `signal` come
+    from sacct's `ExitCode` field, which has the form `<exit>:<signal>`.
+    `reason` carries any additional context SLURM attaches (e.g., the user
+    who cancelled the job).
+    """
+    state: str = "UNKNOWN"
+    exit_code: Optional[int] = None
+    signal: Optional[int] = None
+    reason: str = ""
+
+
+def query_failure_info(job_id: str, array_idx: int) -> FailureInfo:
+    """Fetch diagnostic info for a single (job_id, array_idx) from sacct.
+
+    Returns FailureInfo(state="UNKNOWN") if sacct is unavailable, times out,
+    or returns no rows for this task — callers should treat that as
+    "diagnosis not available", not as a hard error.
+    """
+    target = f"{job_id}_{array_idx}"
+    try:
+        result = subprocess.run(
+            [
+                "sacct",
+                "-j", target,
+                "--format=JobID,State,ExitCode,Reason",
+                "--noheader",
+                "--parsable2",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_SLURM_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return FailureInfo()
+
+    if result.returncode != 0:
+        return FailureInfo()
+
+    return parse_failure_info(result.stdout, target)
+
+
+def parse_failure_info(sacct_output: str, target: str) -> FailureInfo:
+    """Pure parser for `sacct --format=JobID,State,ExitCode,Reason` output.
+
+    The parent row (e.g. `12345_0`) carries State/ExitCode; if both the
+    parent and the `.batch` step appear, the parent wins. Split out so the
+    test suite can drive it without invoking sacct.
+    """
+    info = FailureInfo()
+    for line in sacct_output.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        job_id_str, state_field = parts[0], parts[1]
+        # Match the parent row exactly; ignore `.batch`/`.extern` steps.
+        if job_id_str != target:
+            continue
+        info.state = state_field.split()[0] if state_field else "UNKNOWN"
+        if len(parts) >= 3 and parts[2]:
+            ec = parts[2].split(":")
+            try:
+                info.exit_code = int(ec[0])
+            except ValueError:
+                pass
+            if len(ec) >= 2:
+                try:
+                    info.signal = int(ec[1])
+                except ValueError:
+                    pass
+        if len(parts) >= 4:
+            info.reason = parts[3].strip()
+        return info
+    return info
+
+
 def cancel_jobs(job_ids: List[str]) -> None:
     """Cancel SLURM jobs via scancel."""
     if not job_ids:

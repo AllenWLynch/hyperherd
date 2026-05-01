@@ -229,6 +229,33 @@ class SlurmConfig(BaseModel):
     extra_args: List[str] = Field(default_factory=list)
 
 
+WatchEvent = Literal["failed", "done", "heartbeat"]
+
+
+class WatchConfig(BaseModel):
+    """Settings for `herd watch` — the polling daemon that posts trial state
+    changes to a webhook. All fields are optional; without `webhook` the
+    daemon refuses to start.
+    """
+
+    webhook: Optional[str] = None
+    format: Literal["slack", "discord", "ntfy", "raw"] = "raw"
+    interval_seconds: int = Field(default=60, ge=5)
+    heartbeat_minutes: Optional[int] = Field(default=5, ge=1)
+    events: List[WatchEvent] = Field(
+        default_factory=lambda: ["failed", "done", "heartbeat"]
+    )
+    summarize: bool = False
+
+    @model_validator(mode="after")
+    def _validate_heartbeat(self):
+        if "heartbeat" in self.events and self.heartbeat_minutes is None:
+            raise ValueError(
+                "watch.events includes 'heartbeat' but watch.heartbeat_minutes is unset"
+            )
+        return self
+
+
 class Config(BaseModel):
     name: str
     workspace: str = ""  # set by load_config from the config file's directory
@@ -240,6 +267,7 @@ class Config(BaseModel):
     grid: Optional[Union[Literal["all"], List[str]]] = None
 
     slurm: SlurmConfig = Field(default_factory=SlurmConfig)
+    watch: WatchConfig = Field(default_factory=WatchConfig)
 
     # Extra override tokens appended to every trial's argument string. The
     # format is whatever the launcher expects — for Hydra trainers this is

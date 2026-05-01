@@ -577,6 +577,63 @@ def cmd_clean(args):
     return 0
 
 
+def cmd_watch(args):
+    """Poll the manifest and post trial state changes to a webhook.
+
+    Settings come from the `watch:` block in hyperherd.yaml (webhook URL,
+    format, interval, heartbeat, events). Foreground process — wrap in
+    `nohup`, `tmux`, or `screen` to outlive your shell.
+    """
+    from hyperherd import watch
+
+    config = load_config(args.workspace)
+
+    if not manifest.workspace_exists(config.workspace):
+        print("No workspace found. Run 'herd run' first.", file=sys.stderr)
+        return 1
+
+    try:
+        watch.run(config, once=args.once, pidfile=args.pidfile)
+    except watch.WatchError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_msg(args):
+    """Post a free-text message to the watch webhook configured for this
+    workspace (or its zero-config ntfy fallback). Lets you announce things
+    like 'sweep started' or 'manual restart' alongside the daemon's events.
+    """
+    from hyperherd import watch
+
+    config = load_config(args.workspace)
+
+    if not manifest.workspace_exists(config.workspace):
+        print("No workspace found. Run 'herd run' first.", file=sys.stderr)
+        return 1
+
+    text = " ".join(args.message).strip()
+    if not text:
+        print("Error: empty message.", file=sys.stderr)
+        return 1
+
+    webhook = config.watch.webhook
+    fmt = config.watch.format
+    if not webhook:
+        webhook, _ = watch.resolve_default_webhook(config.workspace, config.name)
+        fmt = "ntfy"
+
+    try:
+        watch.post_message(webhook, fmt, text, config.name)
+    except OSError as e:
+        print(f"Error: webhook POST failed: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Posted to {webhook}")
+    return 0
+
+
 def cmd_init(args):
     """Scaffold a new hyperherd.yaml and launch.sh."""
     directory = args.directory or "."
@@ -598,6 +655,19 @@ def cmd_init(args):
     print("  1. Edit hyperherd.yaml to define your parameters and SLURM resources")
     print("  2. Edit launch.sh to set up your container/environment")
     print(f"  3. Run: herd run {directory} --dry-run")
+    return 0
+
+
+_DOG_ASCII = r"""
+        __
+   (___()'`;       Woof! Ready to herd some hyperparameters.
+   /,    /`
+   \\"--\\
+"""
+
+
+def cmd_dog(args):
+    print(_DOG_ASCII)
     return 0
 
 
@@ -767,6 +837,38 @@ def main():
     p_stop.add_argument("index", nargs="?", type=int, default=None, help="Trial index to cancel")
     p_stop.add_argument("-a", "--all", action="store_true", help="Cancel every running/queued trial in the workspace")
 
+    # watch — polling daemon that posts trial state changes to a webhook
+    p_watch = subparsers.add_parser(
+        "watch",
+        help="Poll trial state and post events to the webhook from hyperherd.yaml",
+    )
+    p_watch.add_argument(
+        "workspace", nargs="?", default=".",
+        help="Workspace directory (default: current dir)",
+    )
+    p_watch.add_argument(
+        "--once", action="store_true",
+        help="Run a single poll and exit (for cron-driven setups)",
+    )
+    p_watch.add_argument(
+        "--pidfile", default=None,
+        help="Write the daemon PID here (for external supervisors / kill scripts)",
+    )
+
+    # msg — post a free-text message to the same webhook
+    p_msg = subparsers.add_parser(
+        "msg",
+        help="Post a free-text message to the watch webhook",
+    )
+    p_msg.add_argument(
+        "-w", "--workspace", default=".",
+        help="Workspace directory (default: current dir)",
+    )
+    p_msg.add_argument(
+        "message", nargs="+",
+        help="Message text (quote multi-word messages)",
+    )
+
     # clean
     p_clean = subparsers.add_parser("clean", help="Cancel jobs and clean up workspace")
     p_clean.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
@@ -787,6 +889,9 @@ def main():
     p_skill.add_argument(
         "-f", "--force", action="store_true", help="Overwrite an existing install",
     )
+
+    # dog — easter egg, hidden from --help.
+    subparsers.add_parser("dog", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -815,7 +920,10 @@ def main():
         "res": cmd_results,
         "stop": cmd_stop,
         "clean": cmd_clean,
+        "watch": cmd_watch,
+        "msg": cmd_msg,
         "install-skill": cmd_install_skill,
+        "dog": cmd_dog,
     }
 
     try:

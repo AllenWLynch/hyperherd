@@ -1,0 +1,5 @@
+hyperherd
+hydra-core>=1.3
+pytorch-lightning>=2.0
+torch>=2.0
+torchvision>=0.15
