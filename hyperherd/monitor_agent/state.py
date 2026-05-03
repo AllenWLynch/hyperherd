@@ -179,20 +179,43 @@ def _read_plan(workspace: Path) -> str:
 
 
 def _drain_inbox(workspace: Path) -> List[InboundMessage]:
-    """Read inbox.jsonl, return parsed messages, append each to the chat
-    history rolling buffer, then truncate the file.
+    """Atomically drain inbox.jsonl: rename it aside, read it, delete it.
 
-    Truncating rather than deleting keeps the file's inode stable for any
-    process that's tailing it for debugging. Lines that fail to parse are
-    silently dropped — we'd rather lose one message than abort the tick.
+    The rename is the critical bit. The previous implementation did
+    `read_text()` then `write_text("")` non-atomically, so any append that
+    landed between those two steps was silently truncated on disk —
+    Discord messages just disappeared.
+
+    With rename: writers that already had the file open before the
+    rename keep writing into the renamed file (POSIX fds track inodes,
+    not paths), so we still capture their data. Writers that open AFTER
+    the rename create a fresh inbox.jsonl, which is preserved for the
+    next tick. Either way, no message is lost.
+
+    Lines that fail to parse are silently dropped — we'd rather lose
+    one message than abort the tick.
     """
     path = _hyperherd_dir(workspace) / INBOX_FILE
     if not path.is_file():
         return []
+
+    drain_path = _hyperherd_dir(workspace) / (INBOX_FILE + ".draining")
     try:
-        raw = path.read_text()
+        os.replace(path, drain_path)
     except OSError:
+        # Couldn't rename — another drain in flight, or the file
+        # vanished. Skip; next tick will retry.
         return []
+
+    try:
+        raw = drain_path.read_text()
+    except OSError:
+        raw = ""
+    finally:
+        try:
+            drain_path.unlink()
+        except OSError:
+            pass
 
     msgs: List[InboundMessage] = []
     for line in raw.splitlines():
@@ -224,11 +247,6 @@ def _drain_inbox(workspace: Path) -> List[InboundMessage]:
         except Exception:
             pass
 
-    # Truncate after a successful read.
-    try:
-        path.write_text("")
-    except OSError:
-        pass
     return msgs
 
 

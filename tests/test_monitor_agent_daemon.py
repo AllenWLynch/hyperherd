@@ -197,5 +197,55 @@ class TestDaemonSlurmEventWake(unittest.TestCase):
         self.assertTrue(out.halted)
 
 
+class TestDaemonInboxRequeue(unittest.TestCase):
+    """If a user message lands on disk after state.compute drained the
+    inbox (i.e. during the tick itself), the wake event was drained but
+    the data is in a fresh inbox.jsonl. The daemon must detect this and
+    fire an immediate user_message tick instead of sleeping the full
+    scheduled delay."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.workspace = Path(self.tmp)
+        (self.workspace / ".hyperherd").mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_post_tick_inbox_content_triggers_wake(self):
+        triggers = []
+        results = iter([
+            TickResult(next_delay_seconds=600, halted=False,
+                       halt_reason=None, cost_usd=0.01, turns=1),
+            TickResult(next_delay_seconds=None, halted=True,
+                       halt_reason="acknowledged",
+                       cost_usd=0.01, turns=1),
+        ])
+
+        async def fake_run_tick(workspace, trigger, **_):
+            triggers.append(trigger)
+            if trigger == "boot":
+                # Simulate a writer landing inbox content AFTER state.compute
+                # has already drained — write to inbox.jsonl directly.
+                inbox = self.workspace / ".hyperherd" / "inbox.jsonl"
+                inbox.write_text(
+                    '{"timestamp":"t1","source":"discord",'
+                    '"author":"alice","text":"hi"}\n'
+                )
+            return next(results)
+
+        out = asyncio.run(daemon_mod.run_daemon(
+            self.workspace, run_tick=fake_run_tick,
+            enable_slurm_poll=False, post_final=False,
+        ))
+
+        # Without the re-queue fix, triggers would be ["boot"] and the
+        # daemon would sleep the full 600s before checking again. With
+        # the fix, the daemon detects post-tick inbox content and fires
+        # an immediate user_message tick.
+        self.assertEqual(triggers, ["boot", "user_message"])
+        self.assertTrue(out.halted)
+
+
 if __name__ == "__main__":
     unittest.main()

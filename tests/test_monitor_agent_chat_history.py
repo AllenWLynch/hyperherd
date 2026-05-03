@@ -98,8 +98,72 @@ class TestChatHistoryRecording(unittest.TestCase):
         self.assertEqual(history[0]["text"], "pause")
         # Timestamps are preserved from the inbox entries.
         self.assertEqual(history[0]["timestamp"], "2026-05-03T00:00:00")
-        # The inbox file is truncated.
-        self.assertEqual(inbox_path.read_text(), "")
+        # The inbox file is gone after drain (rename + unlink); the next
+        # writer recreates it. Either absent or empty is acceptable.
+        if inbox_path.exists():
+            self.assertEqual(inbox_path.read_text(), "")
+
+
+class TestDrainInboxAtomicity(unittest.TestCase):
+    """The previous read-then-truncate path lost messages that arrived
+    in the gap. Now uses rename → read → unlink so writes that happen
+    *during* the drain still land on disk and aren't silently dropped.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.workspace = Path(self.tmp)
+        (self.workspace / ".hyperherd").mkdir()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp)
+
+    def _seed_inbox(self, lines):
+        path = self.workspace / ".hyperherd" / state_mod.INBOX_FILE
+        path.write_text("\n".join(lines) + "\n")
+
+    def test_drain_uses_rename_not_truncate(self):
+        """A writer that opens after the drain should see an empty
+        (or absent) inbox.jsonl — its append creates a fresh file
+        whose contents are NOT consumed by this drain."""
+        import json as _json
+        self._seed_inbox([
+            _json.dumps({"timestamp": "t1", "source": "discord",
+                         "author": "alice", "text": "msg1"}),
+        ])
+
+        # Simulate "writer appends after our read but before our cleanup"
+        # by patching the unlink step to run a writer first.
+        path = self.workspace / ".hyperherd" / state_mod.INBOX_FILE
+
+        original_unlink = Path.unlink
+        late_writes = []
+
+        def unlink_with_writer_in_between(self_path):
+            if self_path.name.endswith(".draining"):
+                # Simulate a concurrent writer: appender opens the new
+                # inbox.jsonl (which doesn't exist yet, so creates fresh).
+                with open(path, "a") as f:
+                    f.write(_json.dumps({
+                        "timestamp": "t2", "source": "discord",
+                        "author": "bob", "text": "msg2",
+                    }) + "\n")
+                late_writes.append("written")
+            return original_unlink(self_path)
+
+        from unittest import mock as _m
+        with _m.patch.object(Path, "unlink", unlink_with_writer_in_between):
+            msgs = state_mod._drain_inbox(self.workspace)
+
+        # First drain returns msg1 (was in the file at rename time).
+        self.assertEqual([m.text for m in msgs], ["msg1"])
+        self.assertEqual(late_writes, ["written"])
+
+        # Critically: msg2 is preserved — it's in the fresh inbox.jsonl
+        # that the writer created after the rename. Next drain picks it up.
+        msgs2 = state_mod._drain_inbox(self.workspace)
+        self.assertEqual([m.text for m in msgs2], ["msg2"])
 
 
 class TestStateReadsChatHistory(unittest.TestCase):

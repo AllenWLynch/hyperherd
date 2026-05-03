@@ -179,6 +179,19 @@ async def run_daemon(
             # redundant tick for events the agent has already seen.
             _drain(event_q)
 
+            # BUT: if a user message landed AFTER state.compute renamed
+            # the inbox aside (i.e. during the tick itself), the wake
+            # event was already drained, but the message is durable on
+            # disk in a fresh inbox.jsonl. Re-queue a wake so we read it
+            # promptly instead of waiting for the scheduled timeout.
+            inbox_path = workspace / ".hyperherd" / "inbox.jsonl"
+            try:
+                if inbox_path.is_file() and inbox_path.stat().st_size > 0:
+                    log.info("Inbox has post-tick content; queuing immediate wake.")
+                    event_q.put_nowait(WakeEvent(trigger="user_message"))
+            except OSError:
+                pass
+
             delay = result.next_delay_seconds or 1800
             log.info("Sleeping up to %ds until next tick.", delay)
 
