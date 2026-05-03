@@ -84,8 +84,9 @@ def render_state(state: TickState) -> str:
                      "phased rollout.")
 
     lines.append("")
-    lines.append("Decide, take 1-3 actions via tools, post one `msg` summarizing the tick "
-                 "(prefixed with 'Herd dog:'), call `schedule_next` with the cadence-table "
-                 "delay, and end your turn.")
+    lines.append("Decide, take 1-3 actions via tools, post one `tick_summary` "
+                 "for the heartbeat (and a separate `msg` if there's user "
+                 "conversation to address), call `schedule_next` with the "
+                 "cadence-table delay, and end your turn.")
 
     return "\n".join(lines)

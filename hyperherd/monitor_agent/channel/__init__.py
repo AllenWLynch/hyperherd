@@ -115,8 +115,13 @@ def make_inbox_writer(
         try:
             await loop.run_in_executor(None, _append_line, inbox_path, line)
         except OSError as e:
-            log.warning("Failed to write inbox event: %s", e)
+            log.warning("Failed to write inbox event from %s: %s",
+                        event.author, e)
             return
+        log.info(
+            "Inbox: wrote message from %s (text head: %r)",
+            event.author, event.text[:80],
+        )
         if on_write is not None:
             try:
                 on_write()

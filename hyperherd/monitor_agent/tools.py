@@ -231,8 +231,8 @@ async def stop_all(args: Dict[str, Any]) -> Dict[str, Any]:
     "questions, or anything else that's part of the back-and-forth. "
     "Recorded in chat history so future ticks remember it. For the "
     "obligatory per-tick heartbeat summary, use `tick_summary` instead. "
-    "Voice rule: prefix the body with 'Herd dog:' so the user can spot "
-    "agent messages.",
+    "The Discord bot's display name is already attached to every post, "
+    "so don't prefix the text with the bot name.",
     {"text": str},
 )
 async def msg(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -252,7 +252,7 @@ async def msg(args: Dict[str, Any]) -> Dict[str, Any]:
         _audit("msg", text=text[:200], via=channel.name)
         record_chat_entry(
             Path(_CTX["workspace"]),
-            role="agent", text=text, via=channel.name, author="Herd dog",
+            role="agent", text=text, via=channel.name, author="agent",
         )
         return _text_response({"posted": True, "via": channel.name})
     except Exception as e:
@@ -268,7 +268,7 @@ async def msg(args: Dict[str, Any]) -> Dict[str, Any]:
     "Post the obligatory per-tick heartbeat summary. Same routing as "
     "`msg`, but NOT recorded in chat history — heartbeats would otherwise "
     "drown out actual conversation. Use this for the once-per-tick "
-    "'Herd dog: tick clean — ... Next tick in X' message and nothing else.",
+    "'tick clean — ... Next tick in X' message and nothing else.",
     {"text": str},
 )
 async def tick_summary(args: Dict[str, Any]) -> Dict[str, Any]:

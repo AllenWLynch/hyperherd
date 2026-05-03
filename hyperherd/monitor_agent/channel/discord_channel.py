@@ -472,11 +472,11 @@ class DiscordChannel(MessageChannel):
         async def stop_cmd(interaction: discord.Interaction) -> None:
             if self._on_stop is None:
                 await interaction.response.send_message(
-                    "Herd dog: not connected to a daemon — nothing to stop.",
+                    "Not connected to a daemon — nothing to stop.",
                 )
                 return
             await interaction.response.send_message(
-                "Herd dog: stopping daemon. Final summary will follow.",
+                "Stopping daemon. Final summary will follow.",
             )
             try:
                 self._on_stop()

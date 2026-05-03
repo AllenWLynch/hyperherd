@@ -110,8 +110,8 @@ The agent understands phrases like:
 Each tick posts a one-line summary, even quiet ones — silence means the daemon crashed:
 
 ```
-Herd dog: tick clean — 4 running, 5 completed, 0 failed. Next tick in 30 min.
-Herd dog: bumped slurm.time 1h→1h30m after 1 TIMEOUT (idx 3); resubmitting. Next tick in 5 min.
+tick clean — 4 running, 5 completed, 0 failed. Next tick in 30 min.
+bumped slurm.time 1h→1h30m after 1 TIMEOUT (idx 3); resubmitting. Next tick in 5 min.
 ```
 
 Tick cadence is adaptive: 2–5 min during rollout and just after activity, 30–60 min steady-state. Every message ends with a `Next tick in <duration>` countdown.

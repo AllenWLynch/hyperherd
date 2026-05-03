@@ -133,5 +133,74 @@ class TestSlurmPoll(unittest.IsolatedAsyncioTestCase):
         self.assertIn(WakeEvent(trigger="failure"), events)
 
 
+class TestSlurmPollChannelPosts(unittest.IsolatedAsyncioTestCase):
+    """The poller posts emoji-prefixed notifications to the channel for
+    each transition, in addition to queuing wake events for the daemon."""
+
+    async def asyncSetUp(self):
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.posts: list = []
+
+        class FakeChannel:
+            name = "fake"
+
+            async def post(_self, body):
+                self.posts.append(body)
+
+        self.poller = SlurmPoll(
+            workspace="/tmp/anywhere",
+            interval_seconds=0.01,
+            channel=FakeChannel(),
+        )
+
+    async def _pump(self, snapshots):
+        snap_iter = iter(snapshots)
+
+        async def fake_snapshot():
+            try:
+                return next(snap_iter)
+            except StopIteration:
+                raise asyncio.CancelledError()
+
+        with mock.patch.object(self.poller, "_snapshot", side_effect=fake_snapshot):
+            task = asyncio.create_task(self.poller.run(self.queue))
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def test_transitions_post_with_emoji(self):
+        running_snap = {"trials": [{"index": 0, "status": "running"}]}
+        complete_snap = {"trials": [
+            {"index": 0, "status": "completed"},
+            {"index": 1, "status": "failed"},
+        ]}
+        await self._pump([
+            {"trials": []},        # baseline empty
+            running_snap,          # idx 0 starts
+            complete_snap,         # idx 0 done, idx 1 fails
+        ])
+
+        joined = "\n".join(self.posts)
+        self.assertIn("▶️ Trial 0 started running", joined)
+        self.assertIn("✅ Trial 0 completed", joined)
+        self.assertIn("⚠️ Trial 1 failed", joined)
+
+    async def test_baseline_does_not_post(self):
+        # Trials already in any state at startup must NOT trigger posts.
+        await self._pump([
+            {"trials": [
+                {"index": 0, "status": "running"},
+                {"index": 1, "status": "completed"},
+            ]},
+        ])
+        self.assertEqual(self.posts, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,52 @@ from typing import Optional
 async def _noop_thinking_cm():
     yield
 
+
+async def _heartbeat_loop(
+    channel,
+    workspace: Path,
+    runtime_stats: dict,
+    interval_seconds: int,
+) -> None:
+    """Periodic 'still alive' digest to the channel. Non-agent — no
+    model spend, posts the totals + tick count from the most recent
+    snapshot. Suppressed when the snapshot is missing (e.g. before the
+    first tick has run)."""
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            return
+
+        text = _build_heartbeat_text(workspace, runtime_stats)
+        if text is None:
+            continue
+        try:
+            await channel.post(text)
+        except Exception as e:
+            log.warning("Heartbeat post failed: %s", e)
+
+
+def _build_heartbeat_text(workspace: Path, runtime_stats: dict) -> Optional[str]:
+    """Format the heartbeat from .hyperherd/last-snapshot.json + runtime
+    stats. Returns None if there's no snapshot yet."""
+    import json
+    snap_path = workspace / ".hyperherd" / "last-snapshot.json"
+    if not snap_path.is_file():
+        return None
+    try:
+        snap = json.loads(snap_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    totals = snap.get("totals") or {}
+    order = ["ready", "submitted", "queued", "running",
+             "completed", "failed", "cancelled"]
+    parts = [f"{totals[k]} {k}" for k in order if totals.get(k)]
+    digest = ", ".join(parts) or "no trials yet"
+    ticks = runtime_stats.get("ticks", 0)
+    return f"🐾 {digest} · {ticks} agent tick(s) so far."
+
 from hyperherd.monitor_agent import tick as tick_mod
 from hyperherd.monitor_agent.channel import (
     MessageChannel, build_channel, make_inbox_writer,
@@ -57,6 +103,7 @@ async def run_daemon(
     channel: Optional[MessageChannel] = None,  # if None, built from config
     enable_slurm_poll: bool = True,
     slurm_poll_interval: Optional[float] = None,
+    heartbeat_seconds: int = 300,
     post_final: bool = True,
 ) -> DaemonResult:
     """Run ticks in a loop until the agent halts or a signal arrives.
@@ -133,9 +180,21 @@ async def run_daemon(
         kwargs = {}
         if slurm_poll_interval is not None:
             kwargs["interval_seconds"] = slurm_poll_interval
-        poller = SlurmPoll(workspace, **kwargs)
+        poller = SlurmPoll(workspace, channel=channel, **kwargs)
         slurm_task = asyncio.create_task(
             poller.run(event_q), name="slurm-poll",
+        )
+
+    # Start the periodic heartbeat. Posts a one-line totals digest to
+    # the channel every few minutes so the user always knows the daemon
+    # is alive, even when the agent's tick cadence is long.
+    heartbeat_task: Optional[asyncio.Task] = None
+    if channel is not None and heartbeat_seconds > 0:
+        heartbeat_task = asyncio.create_task(
+            _heartbeat_loop(
+                channel, workspace, runtime_stats, heartbeat_seconds,
+            ),
+            name="heartbeat",
         )
 
     ticks = 0
@@ -214,6 +273,12 @@ async def run_daemon(
             slurm_task.cancel()
             try:
                 await slurm_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
             except (asyncio.CancelledError, Exception):
                 pass
 
@@ -326,7 +391,7 @@ async def _post_final_message(
         reason_text = "stopped (max-ticks reached)"
 
     body = (
-        f"Herd dog: daemon {reason_text}. "
+        f"🛑 Daemon {reason_text}. "
         f"Ran {ticks} tick(s), ${total_cost_usd:.4f} total. "
         f"Won't post again unless you restart it."
     )

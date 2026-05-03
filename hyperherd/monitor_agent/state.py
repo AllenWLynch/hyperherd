@@ -55,7 +55,7 @@ class ChatEntry:
     questions to replies across ticks without noise."""
     timestamp: str
     role: str             # "user" | "agent"
-    author: str           # Discord username for user; "Herd dog" for agent
+    author: str           # Discord username for user; "agent" for the bot
     via: str              # "discord" / "webhook" / etc.
     text: str
 
@@ -218,6 +218,7 @@ def _drain_inbox(workspace: Path) -> List[InboundMessage]:
             pass
 
     msgs: List[InboundMessage] = []
+    bad = 0
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -231,7 +232,19 @@ def _drain_inbox(workspace: Path) -> List[InboundMessage]:
                 text=d.get("text", ""),
             ))
         except (json.JSONDecodeError, KeyError):
+            bad += 1
             continue
+
+    # Diagnostic log so when messages go missing the daemon log shows
+    # exactly what state.compute saw.
+    import logging
+    _log = logging.getLogger(__name__)
+    if msgs or bad:
+        _log.info(
+            "Drained inbox: %d message(s)%s",
+            len(msgs),
+            f" ({bad} unparseable line(s) dropped)" if bad else "",
+        )
 
     # Mirror each inbound message into the chat history buffer so the
     # agent has cross-tick context once the inbox is drained.

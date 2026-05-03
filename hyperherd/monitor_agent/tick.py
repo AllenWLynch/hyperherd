@@ -79,6 +79,15 @@ async def run_tick(
     workspace = Path(workspace).resolve()
     s = state_mod.compute(workspace, trigger)
 
+    import logging
+    _log = logging.getLogger(__name__)
+    _log.info(
+        "Tick state assembled: trigger=%s inbox=%d newly_failed=%d "
+        "newly_completed=%d totals=%s",
+        trigger, len(s.inbox), len(s.newly_failed),
+        len(s.newly_completed), s.totals,
+    )
+
     # Bind tool context before the agent starts — tools read this dict
     # since their @tool schemas can't carry workspace as an argument.
     tools_mod.set_context(

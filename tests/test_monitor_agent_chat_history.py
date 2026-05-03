@@ -39,7 +39,7 @@ class TestChatHistoryRecording(unittest.TestCase):
     def test_record_round_trip(self):
         record_chat_entry(
             self.workspace,
-            role="agent", text="Herd dog: hi", via="discord", author="Herd dog",
+            role="agent", text="hi", via="discord", author="agent",
         )
         record_chat_entry(
             self.workspace,
@@ -49,7 +49,7 @@ class TestChatHistoryRecording(unittest.TestCase):
         entries = self._read_history()
         self.assertEqual(len(entries), 2)
         self.assertEqual(entries[0]["role"], "agent")
-        self.assertEqual(entries[0]["author"], "Herd dog")
+        self.assertEqual(entries[0]["author"], "agent")
         self.assertEqual(entries[1]["role"], "user")
         self.assertEqual(entries[1]["text"], "how's it going")
 
@@ -59,7 +59,7 @@ class TestChatHistoryRecording(unittest.TestCase):
             record_chat_entry(
                 self.workspace,
                 role="agent", text=f"msg-{i}",
-                via="discord", author="Herd dog",
+                via="discord", author="agent",
             )
 
         entries = self._read_history()
@@ -176,8 +176,8 @@ class TestStateReadsChatHistory(unittest.TestCase):
 
     def test_read_chat_history_parses_entries(self):
         record_chat_entry(self.workspace, role="agent",
-                          text="Herd dog: starting", via="discord",
-                          author="Herd dog")
+                          text="starting", via="discord",
+                          author="agent")
         record_chat_entry(self.workspace, role="user",
                           text="thanks", via="discord", author="alice")
 
@@ -221,8 +221,8 @@ class TestChatHistoryInvariant(unittest.TestCase):
         records. Nothing else writes to the file."""
         # Agent msg: records.
         record_chat_entry(self.workspace, role="agent",
-                          text="Herd dog: a real reply",
-                          via="discord", author="Herd dog")
+                          text="a real reply",
+                          via="discord", author="agent")
 
         # User mention via inbox-drain (the only path that should write
         # role=user entries — slash commands and plain chatter never

@@ -247,5 +247,35 @@ class TestDaemonInboxRequeue(unittest.TestCase):
         self.assertTrue(out.halted)
 
 
+class TestHeartbeatBuilder(unittest.TestCase):
+    """The heartbeat helper formats a one-line digest from
+    .hyperherd/last-snapshot.json plus runtime tick count."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.workspace = Path(self.tmp)
+        (self.workspace / ".hyperherd").mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_returns_none_without_snapshot(self):
+        text = daemon_mod._build_heartbeat_text(self.workspace, {"ticks": 0})
+        self.assertIsNone(text)
+
+    def test_renders_totals_and_ticks(self):
+        import json as _json
+        snap = self.workspace / ".hyperherd" / "last-snapshot.json"
+        snap.write_text(_json.dumps({
+            "totals": {"total": 3, "running": 1, "completed": 2}
+        }))
+        text = daemon_mod._build_heartbeat_text(self.workspace, {"ticks": 4})
+        self.assertIsNotNone(text)
+        self.assertTrue(text.startswith("🐾"))
+        self.assertIn("1 running", text)
+        self.assertIn("2 completed", text)
+        self.assertIn("4 agent tick", text)
+
+
 if __name__ == "__main__":
     unittest.main()
