@@ -89,6 +89,14 @@ tick from the agent, and starts listening for your replies in that channel.
   `Herd dog:`. You can reply at any time — your message lands in the
   agent's inbox, and the daemon wakes immediately to run a `user_message`
   tick.
+- Three ways to address the bot:
+    1. **Discord-resolved mention** — type `@` and pick the bot from the
+       autocomplete dropdown. Renders as a clickable link.
+    2. **Reply** to one of the bot's messages.
+    3. **Plain-text prefix** — `@HerdDog ...`, `HerdDog: ...`, or
+       `HerdDog, ...` (case-insensitive). Useful on mobile or when the
+       autocomplete doesn't fire.
+  Plain channel chatter that doesn't address the bot is ignored.
 - When the agent halts (sweep complete, recurring failure, or you said so),
   the daemon posts a final "stopped" message and exits.
 

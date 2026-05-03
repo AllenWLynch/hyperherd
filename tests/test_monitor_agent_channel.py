@@ -19,8 +19,48 @@ from hyperherd.monitor_agent import daemon as daemon_mod
 from hyperherd.monitor_agent.channel import (
     InboundEvent, MessageChannel, make_inbox_writer,
 )
-from hyperherd.monitor_agent.channel.discord_channel import sweep_to_channel_name
+from hyperherd.monitor_agent.channel.discord_channel import (
+    _strip_name_prefix, sweep_to_channel_name,
+)
 from hyperherd.monitor_agent.tick import TickResult
+
+
+class TestStripNamePrefix(unittest.TestCase):
+    """Plain-text address detection — for users who type @HerdDog instead
+    of picking the bot from Discord's autocomplete (which would otherwise
+    drop on the floor since Discord didn't resolve a real mention)."""
+
+    def test_at_prefix_with_space(self):
+        out = _strip_name_prefix("@HerdDog please pause", "HerdDog")
+        self.assertEqual(out, "please pause")
+
+    def test_at_prefix_case_insensitive(self):
+        out = _strip_name_prefix("@herddog status?", "HerdDog")
+        self.assertEqual(out, "status?")
+
+    def test_bare_name_with_colon(self):
+        out = _strip_name_prefix("HerdDog: bump mem to 16G", "HerdDog")
+        self.assertEqual(out, "bump mem to 16G")
+
+    def test_bare_name_with_comma(self):
+        out = _strip_name_prefix("HerdDog, what's idx 3 doing?", "HerdDog")
+        self.assertEqual(out, "what's idx 3 doing?")
+
+    def test_leading_whitespace_tolerated(self):
+        out = _strip_name_prefix("   @HerdDog hi", "HerdDog")
+        self.assertEqual(out, "hi")
+
+    def test_no_prefix_returns_none(self):
+        self.assertIsNone(_strip_name_prefix("hi everyone", "HerdDog"))
+
+    def test_substring_match_rejected(self):
+        """`HerdDoggy` shouldn't be treated as addressing `HerdDog`."""
+        self.assertIsNone(_strip_name_prefix("HerdDoggy how's it going", "HerdDog"))
+
+    def test_at_prefix_alone_returns_empty(self):
+        """Just `@HerdDog` with nothing after — caller should drop."""
+        out = _strip_name_prefix("@HerdDog", "HerdDog")
+        self.assertEqual(out, "")
 
 
 class TestSweepToChannelName(unittest.TestCase):

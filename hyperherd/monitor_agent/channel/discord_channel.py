@@ -65,6 +65,31 @@ def strip_mention(text: str, bot_user_id: int) -> str:
     return pattern.sub("", text).strip()
 
 
+def _strip_name_prefix(text: str, bot_name: str) -> Optional[str]:
+    """Detect a plain-text address like `@HerdDog ...`, `HerdDog: ...`,
+    or `HerdDog, ...` (case-insensitive) and return the body without the
+    prefix. Returns None if no prefix is present.
+
+    This catches users who type the name by hand instead of picking the
+    bot from Discord's autocomplete dropdown — without it, the message
+    would not register as a mention and would be silently dropped.
+    """
+    if not bot_name:
+        return None
+    s = text.lstrip()
+    name_lower = bot_name.lower()
+    s_lower = s.lower()
+
+    for prefix in (f"@{name_lower}", name_lower):
+        if s_lower.startswith(prefix):
+            after = s[len(prefix):]
+            # Require a separator so we don't match "HerdDoggy" as an
+            # address to "HerdDog".
+            if not after or after[0] in " :,\t\n":
+                return after.lstrip(" :,\t\n").rstrip()
+    return None
+
+
 class DiscordChannel(MessageChannel):
     """`MessageChannel` over Discord's gateway via discord.py.
 
@@ -181,24 +206,44 @@ class DiscordChannel(MessageChannel):
         if message.channel.id != self._channel.id:
             return
 
-        is_mention = self._client.user in message.mentions
+        bot_user = self._client.user
+        raw = message.content or ""
+
+        # Three ways to address the bot, in priority order:
+        #   1. Real Discord mention (autocomplete-resolved <@USERID>).
+        #   2. A reply to one of the bot's messages.
+        #   3. Plain-text "@<botname>" / "<botname>:" / "<botname>," prefix —
+        #      a fallback for users who type the name manually instead of
+        #      picking it from the autocomplete dropdown. Without this,
+        #      "@HerdDog please pause" would silently drop on the floor.
+        is_mention = bot_user in message.mentions
         is_reply_to_bot = (
             message.reference is not None
             and message.reference.resolved is not None
             and getattr(message.reference.resolved.author, "id", None)
-                == self._client.user.id
+                == bot_user.id
         )
-        if not (is_mention or is_reply_to_bot):
-            # Plain channel chatter — ignored on purpose. The agent only
-            # responds when explicitly addressed.
+        text_after_prefix = _strip_name_prefix(raw, bot_user.name)
+        is_text_address = text_after_prefix is not None
+
+        if not (is_mention or is_reply_to_bot or is_text_address):
+            # Plain channel chatter — ignored on purpose.
             return
 
         if self._on_inbound is None:
             return
 
-        cleaned = strip_mention(message.content or "", self._client.user.id)
-        if not cleaned:
-            # An @mention with no content — nothing for the agent to act on.
+        if is_text_address:
+            cleaned = text_after_prefix
+        else:
+            cleaned = strip_mention(raw, bot_user.id)
+            # Real mentions can also coexist with text-prefix forms; strip
+            # both so we never forward "@HerdDog HerdDog: please pause".
+            stripped_again = _strip_name_prefix(cleaned, bot_user.name)
+            if stripped_again is not None:
+                cleaned = stripped_again
+
+        if not cleaned.strip():
             return
 
         event = InboundEvent(
