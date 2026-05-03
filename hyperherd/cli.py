@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 
 from hyperherd import agent_output
@@ -1006,9 +1007,19 @@ def cmd_monitor_v2(args):
 
     workspace = args.workspace
     if not manifest.workspace_exists(workspace):
-        print("No workspace found. Run 'herd run' (even just '--dry-run') "
-              "first so there's a manifest to monitor.", file=sys.stderr)
-        return 1
+        # Auto-initialize so the cold-start UX is seamless: drop a
+        # hyperherd.yaml, `herd monitor-v2`, daemon launches, and the
+        # agent runs the boot interview against a freshly-materialized
+        # greenfield workspace. Equivalent to `herd run --dry-run`.
+        print(f"No workspace at {workspace} — initializing manifest "
+              f"(equivalent to `herd run --dry-run`).", file=sys.stderr)
+        proc = subprocess.run(
+            [sys.executable, "-m", "hyperherd.cli", "run", "--dry-run", workspace],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            print(f"Workspace init failed:\n{proc.stderr}", file=sys.stderr)
+            return 1
 
     if args.dry_run:
         from hyperherd.monitor_agent import tick as tick_mod
