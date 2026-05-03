@@ -37,6 +37,6 @@ HyperHerd is opinionated. It assumes:
 - **[Getting started](getting-started.md)** — install, scaffold, run your first sweep.
 - **[Sweep config reference](configuration.md)** — every field in `hyperherd.yaml`.
 - **[Command reference](commands.md)** — every `herd` subcommand.
-- **[Claude Code skills](claude-skill.md)** — generate configs by asking Claude.
+- **[Claude Code skill](claude-skill.md)** — generate configs by asking Claude.
 
 </div>

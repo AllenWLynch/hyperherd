@@ -107,14 +107,21 @@ The agent understands phrases like:
 
 ## What you'll see during a sweep
 
-Each tick posts a one-line summary, even quiet ones — silence means the daemon crashed:
+Every channel post wears an emoji prefix so you can tell at a glance who's speaking:
+
+| Prefix | Source | Cost |
+|---|---|---|
+| 🐕 | The agent (decisions, replies, tick summaries) | Model spend per tick |
+| ▶️ ✅ ⚠️ | SLURM poller — trial transitions (running / completed / failed) | Free |
+| 🐾 | Periodic daemon heartbeat with current totals (every 5 min) | Free |
+| 🛑 | Final daemon-stopped notification | Free |
+
+Each agent tick posts one summary message, even on quiet ticks — silence means the daemon crashed. Tick cadence is adaptive: 2–5 min during rollout and just after activity, 30–60 min steady-state. Every agent message ends with a `Next tick in <duration>` countdown.
 
 ```
 🐕 tick clean — 4 running, 5 completed, 0 failed. Next tick in 30 min.
 🐕 bumped slurm.time 1h→1h30m after 1 TIMEOUT (idx 3); resubmitting. Next tick in 5 min.
 ```
-
-Tick cadence is adaptive: 2–5 min during rollout and just after activity, 30–60 min steady-state. Every message ends with a `Next tick in <duration>` countdown.
 
 ## Failure triage
 
@@ -139,3 +146,7 @@ The daemon writes an audit log of every tool call to `<workspace>/.hyperherd/age
 ## Tweaking the agent's behavior
 
 The agent's playbook lives in `hyperherd/monitor_agent/prompt/monitor.md` inside the package. If you want to change cadence, triage policy, or interview questions, edit it and restart the daemon.
+
+## Authoring the sweep itself
+
+`herd monitor` operates a sweep — it doesn't author the YAML. For that, install the [Claude Code skill](claude-skill.md) and ask Claude to write the config. Two different shapes of work: open-ended codebase exploration (skill) vs. closed-loop automation (daemon).
