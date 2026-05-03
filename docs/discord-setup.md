@@ -83,17 +83,20 @@ tick from the agent, and starts listening for your replies in that channel.
 ## What you'll see
 
 - A new text channel appears (e.g. `#mnist-sweep`) the first time you run.
-- Each tick, the agent posts one summary message under the bot's display
-  name. You can reply at any time — the bot adds a 👀 reaction to your
-  message immediately so you know it was received, and the daemon wakes
-  to run a `user_message` tick within a second or two. While the agent
-  is working on a tick, Discord shows a "Bot is typing…" indicator at
-  the bottom of the channel.
-- Daemon-side notifications use emoji prefixes so you can tell at a
-  glance which voice is which:
+- Each tick, the agent posts a summary message. You can reply at any
+  time — the bot adds a 👀 reaction to your message immediately so you
+  know it was received, and the daemon wakes to run a `user_message`
+  tick within a second or two. While the agent is working on a tick,
+  Discord shows a "Bot is typing…" indicator at the bottom of the
+  channel.
+- Every post wears an emoji prefix so you can tell at a glance who's
+  speaking:
+    - 🐕 the agent (decisions, replies, tick summaries — every model-
+      driven post)
     - ▶️ trial started running, ✅ trial completed, ⚠️ trial failed
-      (free, posted the moment SLURM reports the transition)
-    - 🐾 periodic heartbeat with current totals (every 5 min)
+      (free, posted by the SLURM poller the moment a transition is
+      detected)
+    - 🐾 periodic daemon heartbeat with current totals (every 5 min)
     - 🛑 final daemon-stopped notification
 - Three ways to address the bot:
     1. **Discord-resolved mention** — type `@` and pick the bot from the

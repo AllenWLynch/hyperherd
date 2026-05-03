@@ -237,6 +237,7 @@ async def stop_all(args: Dict[str, Any]) -> Dict[str, Any]:
 )
 async def msg(args: Dict[str, Any]) -> Dict[str, Any]:
     text = args["text"]
+    body = _agent_prefix(text)
     channel = _CTX.get("channel")
     if channel is None:
         # No chat surface configured — message has nowhere to go. Audit
@@ -248,7 +249,7 @@ async def msg(args: Dict[str, Any]) -> Dict[str, Any]:
             is_error=True,
         )
     try:
-        await channel.post(text)
+        await channel.post(body)
         _audit("msg", text=text[:200], via=channel.name)
         record_chat_entry(
             Path(_CTX["workspace"]),
@@ -273,6 +274,7 @@ async def msg(args: Dict[str, Any]) -> Dict[str, Any]:
 )
 async def tick_summary(args: Dict[str, Any]) -> Dict[str, Any]:
     text = args["text"]
+    body = _agent_prefix(text)
     channel = _CTX.get("channel")
     if channel is None:
         _audit("tick_summary_skipped_no_channel", text=text[:200])
@@ -281,7 +283,7 @@ async def tick_summary(args: Dict[str, Any]) -> Dict[str, Any]:
             is_error=True,
         )
     try:
-        await channel.post(text)
+        await channel.post(body)
         _audit("tick_summary", text=text[:200], via=channel.name)
         return _text_response({"posted": True, "via": channel.name})
     except Exception as e:
@@ -290,6 +292,19 @@ async def tick_summary(args: Dict[str, Any]) -> Dict[str, Any]:
             {"posted": False, "error": str(e), "via": channel.name},
             is_error=True,
         )
+
+
+_AGENT_EMOJI = "🐕"
+
+
+def _agent_prefix(text: str) -> str:
+    """Prepend the agent emoji to outbound posts so the user can spot
+    agent voice against the daemon-side ▶️/✅/⚠️/🐾/🛑 stream. Idempotent
+    if the text already starts with the emoji."""
+    stripped = text.lstrip()
+    if stripped.startswith(_AGENT_EMOJI):
+        return text
+    return f"{_AGENT_EMOJI} {text}"
 
 
 # --- chat history ----------------------------------------------------------
