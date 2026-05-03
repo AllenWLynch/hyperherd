@@ -158,8 +158,13 @@ def _resolve_outcome(next_tick_path: Path, *, cost_usd: float, turns: int) -> Ti
         return TickResult(next_delay_seconds=1800, halted=False, halt_reason=None,
                           cost_usd=cost_usd, turns=turns)
     if data.get("halted"):
+        # Coerce reason to str — older buggy tool calls could leave a
+        # nested dict here, and downstream formatting expects a string.
+        reason = data.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            reason = str(reason)
         return TickResult(next_delay_seconds=None, halted=True,
-                          halt_reason=data.get("reason"),
+                          halt_reason=reason,
                           cost_usd=cost_usd, turns=turns)
     return TickResult(
         next_delay_seconds=int(data.get("delay_seconds", 1800)),

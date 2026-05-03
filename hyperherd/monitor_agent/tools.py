@@ -1,23 +1,27 @@
-"""The agent's complete action surface — exactly 11 typed tools.
+"""The agent's complete action surface — typed in-process MCP tools.
 
-Each function is a thin wrapper that either calls existing HyperHerd
-machinery directly (msg, manifest reads) or shells out to the `herd` CLI
-with `--json` so we don't duplicate the launch/stop logic. Every wrapper
-records what happened in `.hyperherd/agent_log.jsonl` for the audit trail.
+The Claude Agent SDK's `@tool` decorator passes a single dict argument
+matching the declared schema and expects a `{"content": [{"type": "text",
+"text": ...}], ...}` return — a deviation from "normal" Python signatures
+that I learned the hard way during smoke testing. Each tool here unpacks
+the args dict and returns a wrapped text response via `_text_response`.
 
-`schedule_next` and `halt` are special — they don't take action against the
-workspace; they communicate the agent's intent for the *next* tick by
-writing to `.hyperherd/next-tick.json`. The daemon's outer loop reads that
-file after `agent.run()` returns.
+Tools either call existing HyperHerd machinery directly (msg, manifest
+reads) or shell out to the `herd` CLI with `--json`. Every wrapper
+records what happened in `.hyperherd/agent_log.jsonl` for the audit
+trail.
 
-The SDK's `@tool` decorator wraps these into in-process MCP tools; we
-register them under a single `hyperherd` MCP server and the agent calls them
+`schedule_next` and `halt` don't take action against the workspace; they
+communicate the agent's intent for the *next* tick by writing to
+`.hyperherd/next-tick.json`. The daemon's outer loop reads that file
+after `query()` returns.
+
+Tools register under a single `hyperherd` MCP server; the agent calls them
 as `mcp__hyperherd__<name>`.
 """
 
 import asyncio
 import json
-import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,7 +56,7 @@ def set_context(
     channel=None,
 ) -> None:
     """Bind the per-tick context. Called by `tick.run_tick` before
-    `agent.run()`. The agent's tools read this dict instead of taking the
+    `query()`. The agent's tools read this dict instead of taking the
     workspace as an arg (the SDK's tool schemas are flat — no closures)."""
     _CTX.clear()
     _CTX["workspace"] = Path(workspace)
@@ -64,7 +68,26 @@ def set_context(
     _CTX["channel"] = channel
 
 
-# --- audit log --------------------------------------------------------------
+# --- response helper -------------------------------------------------------
+
+def _text_response(value: Any, *, is_error: bool = False) -> Dict[str, Any]:
+    """Wrap a value into the SDK's expected return shape:
+    `{"content": [{"type": "text", "text": "..."}]}`. Strings are kept
+    as-is; everything else is JSON-encoded so the agent can parse it."""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    out: Dict[str, Any] = {"content": [{"type": "text", "text": text}]}
+    if is_error:
+        out["is_error"] = True
+    return out
+
+
+# --- audit log -------------------------------------------------------------
 
 def _audit(event: str, **fields: Any) -> None:
     """Append a JSON line to `.hyperherd/agent_log.jsonl`. Best-effort —
@@ -85,7 +108,7 @@ def _audit(event: str, **fields: Any) -> None:
         pass
 
 
-# --- tools ------------------------------------------------------------------
+# --- tools -----------------------------------------------------------------
 
 @tool(
     "read_state",
@@ -96,9 +119,9 @@ def _audit(event: str, **fields: Any) -> None:
     "live-phase decisions or to re-check after a long tool chain.",
     {},
 )
-async def read_state() -> Dict[str, Any]:
+async def read_state(args: Dict[str, Any]) -> Dict[str, Any]:
     raw = _CTX.get("last_state_json", "{}")
-    return json.loads(raw)
+    return _text_response(json.loads(raw))
 
 
 @tool(
@@ -108,14 +131,14 @@ async def read_state() -> Dict[str, Any]:
     "verify what was saved.",
     {},
 )
-async def read_plan() -> str:
+async def read_plan(args: Dict[str, Any]) -> Dict[str, Any]:
     path = _CTX.get("plan_path")
     if path is None or not path.is_file():
-        return ""
+        return _text_response("")
     try:
-        return path.read_text()
-    except OSError:
-        return ""
+        return _text_response(path.read_text())
+    except OSError as e:
+        return _text_response(f"failed to read plan: {e}", is_error=True)
 
 
 @tool(
@@ -124,12 +147,13 @@ async def read_plan() -> str:
     "advances Phase, increments Quiet ticks, or adds a trial to Warned indices.",
     {"plan": str},
 )
-async def write_plan(plan: str) -> Dict[str, str]:
+async def write_plan(args: Dict[str, Any]) -> Dict[str, Any]:
+    plan = args["plan"]
     path = _CTX["plan_path"]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(plan)
     _audit("write_plan", bytes=len(plan))
-    return {"path": str(path), "bytes": len(plan)}
+    return _text_response({"path": str(path), "bytes": len(plan)})
 
 
 @tool(
@@ -139,8 +163,8 @@ async def write_plan(plan: str) -> Dict[str, str]:
     "tracks this in MONITOR_PLAN.md, not here.",
     {"percent": int},
 )
-async def bump_mem(percent: int) -> Dict[str, str]:
-    return await _bump_yaml_resource("mem", percent)
+async def bump_mem(args: Dict[str, Any]) -> Dict[str, Any]:
+    return _text_response(await _bump_yaml_resource("mem", int(args["percent"])))
 
 
 @tool(
@@ -148,8 +172,8 @@ async def bump_mem(percent: int) -> Dict[str, str]:
     "Increase slurm.time by `percent` percent. Same shape and same cap as bump_mem.",
     {"percent": int},
 )
-async def bump_time(percent: int) -> Dict[str, str]:
-    return await _bump_yaml_resource("time", percent)
+async def bump_time(args: Dict[str, Any]) -> Dict[str, Any]:
+    return _text_response(await _bump_yaml_resource("time", int(args["percent"])))
 
 
 @tool(
@@ -159,15 +183,19 @@ async def bump_time(percent: int) -> Dict[str, str]:
     "re-run failed trials.",
     {"indices": list, "force": bool},
 )
-async def run_indices(indices: List[int], force: bool = False) -> Dict[str, Any]:
+async def run_indices(args: Dict[str, Any]) -> Dict[str, Any]:
+    indices = args.get("indices") or []
+    force = bool(args.get("force", False))
     if not indices:
-        return {"slurm_job_id": None, "submitted_indices": []}
-    spec = ",".join(str(i) for i in sorted(indices))
+        return _text_response({"slurm_job_id": None, "submitted_indices": []})
+    spec = ",".join(str(int(i)) for i in sorted(indices))
     cmd = ["herd", "run", "--json", "-i", spec, str(_CTX["workspace"])]
     if force:
         cmd.append("--force")
-    return await _run_herd_json(cmd, audit_event="run_indices",
-                                 audit_fields={"indices": indices, "force": force})
+    return _text_response(await _run_herd_json(
+        cmd, audit_event="run_indices",
+        audit_fields={"indices": indices, "force": force},
+    ))
 
 
 @tool(
@@ -176,10 +204,12 @@ async def run_indices(indices: List[int], force: bool = False) -> Dict[str, Any]
     "previous_status}]} (empty list if the trial wasn't live).",
     {"index": int},
 )
-async def stop_index(index: int) -> Dict[str, Any]:
+async def stop_index(args: Dict[str, Any]) -> Dict[str, Any]:
+    index = int(args["index"])
     cmd = ["herd", "stop", "--json", str(_CTX["workspace"]), str(index)]
-    return await _run_herd_json(cmd, audit_event="stop_index",
-                                 audit_fields={"index": index})
+    return _text_response(await _run_herd_json(
+        cmd, audit_event="stop_index", audit_fields={"index": index},
+    ))
 
 
 @tool(
@@ -188,9 +218,11 @@ async def stop_index(index: int) -> Dict[str, Any]:
     "shape as stop_index, with one entry per cancelled trial.",
     {},
 )
-async def stop_all() -> Dict[str, Any]:
+async def stop_all(args: Dict[str, Any]) -> Dict[str, Any]:
     cmd = ["herd", "stop", "--json", "--all", str(_CTX["workspace"])]
-    return await _run_herd_json(cmd, audit_event="stop_all", audit_fields={})
+    return _text_response(await _run_herd_json(
+        cmd, audit_event="stop_all", audit_fields={},
+    ))
 
 
 @tool(
@@ -203,9 +235,8 @@ async def stop_all() -> Dict[str, Any]:
     "agent messages.",
     {"text": str},
 )
-async def msg(text: str) -> Dict[str, Any]:
-    # Channel takes priority over webhook when both are configured —
-    # the user explicitly opted into a channel by setting it up.
+async def msg(args: Dict[str, Any]) -> Dict[str, Any]:
+    text = args["text"]
     channel = _CTX.get("channel")
     if channel is not None:
         try:
@@ -215,10 +246,13 @@ async def msg(text: str) -> Dict[str, Any]:
                 Path(_CTX["workspace"]),
                 role="agent", text=text, via=channel.name, author="Herd dog",
             )
-            return {"posted": True, "via": channel.name}
+            return _text_response({"posted": True, "via": channel.name})
         except Exception as e:
             _audit("msg_failed", error=str(e), via=channel.name)
-            return {"posted": False, "error": str(e), "via": channel.name}
+            return _text_response(
+                {"posted": False, "error": str(e), "via": channel.name},
+                is_error=True,
+            )
 
     from hyperherd import watch
     from hyperherd.config import load_config
@@ -236,13 +270,13 @@ async def msg(text: str) -> Dict[str, Any]:
         )
     except OSError as e:
         _audit("msg_failed", error=str(e))
-        return {"posted": False, "error": str(e)}
+        return _text_response({"posted": False, "error": str(e)}, is_error=True)
     _audit("msg", text=text[:200], via="webhook")
     record_chat_entry(
         Path(_CTX["workspace"]),
         role="agent", text=text, via="webhook", author="Herd dog",
     )
-    return {"posted": True, "via": "webhook", "webhook": webhook}
+    return _text_response({"posted": True, "via": "webhook", "webhook": webhook})
 
 
 @tool(
@@ -253,16 +287,20 @@ async def msg(text: str) -> Dict[str, Any]:
     "'Herd dog: tick clean — ... Next tick in X' message and nothing else.",
     {"text": str},
 )
-async def tick_summary(text: str) -> Dict[str, Any]:
+async def tick_summary(args: Dict[str, Any]) -> Dict[str, Any]:
+    text = args["text"]
     channel = _CTX.get("channel")
     if channel is not None:
         try:
             await channel.post(text)
             _audit("tick_summary", text=text[:200], via=channel.name)
-            return {"posted": True, "via": channel.name}
+            return _text_response({"posted": True, "via": channel.name})
         except Exception as e:
             _audit("tick_summary_failed", error=str(e), via=channel.name)
-            return {"posted": False, "error": str(e), "via": channel.name}
+            return _text_response(
+                {"posted": False, "error": str(e), "via": channel.name},
+                is_error=True,
+            )
 
     from hyperherd import watch
     from hyperherd.config import load_config
@@ -280,9 +318,9 @@ async def tick_summary(text: str) -> Dict[str, Any]:
         )
     except OSError as e:
         _audit("tick_summary_failed", error=str(e))
-        return {"posted": False, "error": str(e)}
+        return _text_response({"posted": False, "error": str(e)}, is_error=True)
     _audit("tick_summary", text=text[:200], via="webhook")
-    return {"posted": True, "via": "webhook", "webhook": webhook}
+    return _text_response({"posted": True, "via": "webhook", "webhook": webhook})
 
 
 # --- chat history ----------------------------------------------------------
@@ -312,7 +350,6 @@ def record_chat_entry(
         if path.is_file():
             existing = [ln for ln in path.read_text().splitlines() if ln.strip()]
         if timestamp is None:
-            from datetime import datetime, timezone
             timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         line = json.dumps({
             "timestamp": timestamp,
@@ -335,8 +372,8 @@ def record_chat_entry(
     "daemon's scheduler reads this immediately after the agent's turn ends.",
     {"delay_seconds": int},
 )
-async def schedule_next(delay_seconds: int) -> Dict[str, int]:
-    delay = max(60, min(3600, int(delay_seconds)))
+async def schedule_next(args: Dict[str, Any]) -> Dict[str, Any]:
+    delay = max(60, min(3600, int(args["delay_seconds"])))
     path = _CTX["next_tick_path"]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
@@ -344,7 +381,7 @@ async def schedule_next(delay_seconds: int) -> Dict[str, int]:
         "scheduled_at": datetime.now(timezone.utc).isoformat(),
     }))
     _audit("schedule_next", delay_seconds=delay)
-    return {"delay_seconds": delay}
+    return _text_response({"delay_seconds": delay})
 
 
 @tool(
@@ -354,7 +391,8 @@ async def schedule_next(delay_seconds: int) -> Dict[str, int]:
     "stops scheduling new ticks once this is called.",
     {"reason": str},
 )
-async def halt(reason: str) -> Dict[str, str]:
+async def halt(args: Dict[str, Any]) -> Dict[str, Any]:
+    reason = str(args["reason"])
     path = _CTX["next_tick_path"]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
@@ -363,7 +401,7 @@ async def halt(reason: str) -> Dict[str, str]:
         "halted_at": datetime.now(timezone.utc).isoformat(),
     }))
     _audit("halt", reason=reason)
-    return {"halted": True, "reason": reason}
+    return _text_response({"halted": True, "reason": reason})
 
 
 # --- helpers ----------------------------------------------------------------
