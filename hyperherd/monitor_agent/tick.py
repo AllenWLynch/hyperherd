@@ -59,12 +59,11 @@ async def run_tick(
     Importing the SDK lazily so a missing `claude-agent-sdk` install only
     bites users on the live path, not on dry runs / unit tests.
     """
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. The agent-SDK monitor requires "
-            "an Anthropic API key. Set it and retry, or use the v1 path "
-            "(`herd monitor`) which uses Claude Code instead."
-        )
+    # Auth: the SDK shells out to the `claude` CLI, which accepts either an
+    # ANTHROPIC_API_KEY (pay-per-token API console billing) or the OAuth
+    # credentials from `claude /login` (subscription billing). We don't
+    # require the env var here — if neither is present, the CLI itself will
+    # surface a clear auth error.
 
     try:
         from claude_agent_sdk import (  # type: ignore
@@ -118,13 +117,25 @@ async def run_tick(
 
     cost_usd = 0.0
     turns = 0
-    async for message in query(prompt=user_msg, options=options):
-        # The SDK yields typed message objects. We use duck-typing because
-        # the exact class names vary across SDK minor versions and the only
-        # thing we rely on is the `type`/role/cost fields.
-        cost_usd += float(getattr(message, "total_cost_usd", 0.0) or 0.0)
-        if getattr(message, "role", None) == "assistant":
-            turns += 1
+    last_error_text: Optional[str] = None
+    try:
+        async for message in query(prompt=user_msg, options=options):
+            # The SDK yields typed message objects. We use duck-typing because
+            # the exact class names vary across SDK minor versions and the only
+            # thing we rely on is the `type`/role/cost fields.
+            cost_usd += float(getattr(message, "total_cost_usd", 0.0) or 0.0)
+            if getattr(message, "role", None) == "assistant":
+                turns += 1
+            # ResultMessage carries is_error/result. The SDK's transport layer
+            # raises a generic "Command failed with exit code 1" when the CLI
+            # exits non-zero (e.g. billing errors), without surfacing the
+            # actual reason — capture it here so we can re-raise with context.
+            if getattr(message, "is_error", False):
+                last_error_text = getattr(message, "result", None) or str(message)
+    except Exception as e:
+        if last_error_text:
+            raise RuntimeError(f"Agent SDK call failed: {last_error_text}") from e
+        raise
 
     # Read the next-tick file the schedule_next/halt tool wrote.
     return _resolve_outcome(next_tick_path, cost_usd=cost_usd, turns=turns)

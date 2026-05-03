@@ -1027,23 +1027,43 @@ def cmd_monitor_v2(args):
         print(result["user_message"])
         return 0
 
-    if not args.once:
-        print("herd monitor-v2 currently only supports --once or --dry-run "
-              "(daemon mode lands in a later phase).", file=sys.stderr)
-        return 1
+    if args.once:
+        from hyperherd.monitor_agent import tick as tick_mod
+        try:
+            result = asyncio.run(tick_mod.run_tick(workspace, trigger=args.trigger))
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
 
-    from hyperherd.monitor_agent import tick as tick_mod
+        print(f"Tick complete. cost=${result.cost_usd:.4f} turns={result.turns}")
+        if result.halted:
+            print(f"Agent halted: {result.halt_reason or '(no reason)'}")
+        elif result.next_delay_seconds is not None:
+            print(f"Next tick in {result.next_delay_seconds}s")
+        return 0
+
+    # Daemon mode: loop until agent halts or signal arrives.
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    from hyperherd.monitor_agent import daemon as daemon_mod
     try:
-        result = asyncio.run(tick_mod.run_tick(workspace, trigger=args.trigger))
+        outcome = asyncio.run(
+            daemon_mod.run_daemon(workspace, max_ticks=args.max_ticks)
+        )
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    print(f"Tick complete. cost=${result.cost_usd:.4f} turns={result.turns}")
-    if result.halted:
-        print(f"Agent halted: {result.halt_reason or '(no reason)'}")
-    elif result.next_delay_seconds is not None:
-        print(f"Next tick in {result.next_delay_seconds}s")
+    print(
+        f"Daemon stopped. ticks={outcome.ticks} "
+        f"total_cost=${outcome.total_cost_usd:.4f} "
+        f"halted={outcome.halted} signaled={outcome.stopped_by_signal}"
+    )
+    if outcome.halted:
+        print(f"Agent halted: {outcome.halt_reason or '(no reason)'}")
     return 0
 
 
@@ -1459,10 +1479,10 @@ def main():
         help="Stop the background watch for this workspace and exit (does not touch Claude Code sessions)",
     )
 
-    # monitor-v2 — experimental: agent-SDK-based monitor (Phase 1 of PLAN.md).
+    # monitor-v2 — experimental: agent-SDK-based monitor (Phases 1-2 of PLAN.md).
     p_mv2 = subparsers.add_parser(
         "monitor-v2",
-        help="(experimental) Agent-SDK-based monitor — single-tick mode for now",
+        help="(experimental) Agent-SDK-based monitor daemon",
     )
     p_mv2.add_argument(
         "workspace", nargs="?", default=".",
@@ -1470,16 +1490,20 @@ def main():
     )
     p_mv2.add_argument(
         "--once", action="store_true",
-        help="Run exactly one tick (live — calls Anthropic API)",
+        help="Run exactly one tick and exit (live — calls the model)",
     )
     p_mv2.add_argument(
         "--dry-run", action="store_true",
-        help="Assemble state + render the prompt; no API call. Use this to verify the deterministic path before paying for tokens.",
+        help="Assemble state + render the prompt; no model call. Use this to verify the deterministic path before paying for tokens.",
     )
     p_mv2.add_argument(
-        "--trigger", default="scheduled",
+        "--trigger", default="boot",
         choices=["scheduled", "failure", "completion", "user_message", "boot"],
-        help="What kind of tick this is (affects how the agent reads the state)",
+        help="Trigger for --once / --dry-run (daemon mode picks its own)",
+    )
+    p_mv2.add_argument(
+        "--max-ticks", type=int, default=None,
+        help="Stop the daemon after N ticks (safety cap for testing)",
     )
 
     # snapshot — bundled JSON for agent loops (status + stats + failed stderr)
