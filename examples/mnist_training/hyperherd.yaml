@@ -24,6 +24,9 @@ watch:
     heartbeat_minutes: 1
     summarize: true
 
+discord:
+  guild_id: "1500357438547955863"
+
 parameters:
   learning_rate:
     abbrev: lr

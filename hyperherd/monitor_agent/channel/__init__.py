@@ -19,11 +19,15 @@ outbound only).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Optional, Protocol, runtime_checkable
+from typing import (
+    AsyncContextManager, Awaitable, Callable, Optional, Protocol,
+    runtime_checkable,
+)
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +44,8 @@ class InboundEvent:
 
 
 InboundHandler = Callable[[InboundEvent], Awaitable[None]]
+StopHandler = Callable[[], None]
+InfoHandler = Callable[[], dict]
 
 
 @runtime_checkable
@@ -60,6 +66,21 @@ class MessageChannel(Protocol):
 
     def set_inbound_handler(self, handler: InboundHandler) -> None:
         """Register a callback fired for each user message."""
+
+    def set_stop_handler(self, handler: StopHandler) -> None:
+        """Register a callback the channel can invoke to ask the daemon
+        to shut down (e.g. from a `/stop` slash command). Optional —
+        transports without a way to receive 'stop' commands can ignore."""
+
+    def set_info_handler(self, handler: InfoHandler) -> None:
+        """Register a callback the channel can invoke to fetch live
+        daemon stats (tick count, total cost, uptime). The dict should
+        match the kwargs of `commands.cmd_info`."""
+
+    def thinking(self) -> AsyncContextManager:
+        """Async context manager that signals 'agent is working' to the
+        user (Discord typing indicator, Slack 'Bot is typing...', etc.).
+        Default no-op for transports without an analogue."""
 
 
 # --- inbox writer ----------------------------------------------------------

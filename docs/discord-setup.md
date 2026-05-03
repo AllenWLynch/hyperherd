@@ -26,12 +26,14 @@ guild ID in each sweep's `hyperherd.yaml`.
 ## 2. Invite the bot to your server
 
 1. In the left nav, open **OAuth2 → URL Generator**.
-2. Under **Scopes**, check `bot`.
+2. Under **Scopes**, check **`bot`** and **`applications.commands`**
+   (the latter enables `/status`, `/stop`, etc.).
 3. Under **Bot Permissions**, check:
     - View Channels
     - Send Messages
     - Read Message History
-    - Manage Channels  *(needed for the auto-create channel-per-sweep behavior)*
+    - Add Reactions  *(for the 👀 ack on inbound messages)*
+    - Manage Channels  *(for auto-creating a channel per sweep)*
 4. Copy the generated URL, paste it in your browser, pick the server, and
    authorize.
 
@@ -86,9 +88,11 @@ tick from the agent, and starts listening for your replies in that channel.
 
 - A new text channel appears (e.g. `#mnist-sweep`) the first time you run.
 - Each tick, the agent posts one summary message starting with
-  `Herd dog:`. You can reply at any time — your message lands in the
-  agent's inbox, and the daemon wakes immediately to run a `user_message`
-  tick.
+  `Herd dog:`. You can reply at any time — the bot adds a 👀 reaction to
+  your message immediately so you know it was received, and the daemon
+  wakes to run a `user_message` tick within a second or two. While the
+  agent is working on a tick, Discord shows a "Bot is typing…" indicator
+  at the bottom of the channel.
 - Three ways to address the bot:
     1. **Discord-resolved mention** — type `@` and pick the bot from the
        autocomplete dropdown. Renders as a clickable link.
@@ -100,12 +104,37 @@ tick from the agent, and starts listening for your replies in that channel.
 - When the agent halts (sweep complete, recurring failure, or you said so),
   the daemon posts a final "stopped" message and exits.
 
+## Slash commands (deterministic — no agent in the loop)
+
+These commands run locally against the workspace and post the answer in
+the channel. No model call, no rate-limit window consumed.
+
+| Command | What it does |
+|---|---|
+| `/status` | Sweep totals + per-trial table |
+| `/stats` | Per-trial timing + memory usage |
+| `/params` | Parameter grid: spec + every trial combo |
+| `/info` | Daemon metadata: phase, uptime, tick count, total cost |
+| `/plan` | The agent's `MONITOR_PLAN.md` contents |
+| `/run <index>` | Submit (or resubmit) one trial |
+| `/run_all` | Submit every ready trial |
+| `/cancel <index>` | Cancel one trial |
+| `/cancel_all` | Cancel every live trial |
+| `/tail <index> [lines]` | Last N lines of a trial's stderr (default 20) |
+| `/stop` | Stop the monitor daemon entirely |
+| `/help` | List of these commands |
+
+Discord auto-completes the names and validates parameter types. They're
+guild-scoped, so they appear instantly when the daemon connects.
+
 ## Common phrases the agent understands
+
+When you @-mention the bot, it wakes the agent for a model-driven reply.
 
 | You say | Effect |
 |---|---|
-| `pause` / `stop` / `halt` | Agent halts; daemon exits. |
-| `how's it going?` / `status` | Posts a fresh status summary on the next tick (≤ a few seconds). |
+| `pause` / `stop` / `halt` | Agent halts; daemon exits. (Or use `/stop`.) |
+| `how's it going?` | Posts a fresh status summary on the next tick. (Or use `/status`.) |
 | `bump mem to 32G` | Bumps `slurm.mem` and resubmits affected trials. |
 | `give it more time` | Bumps `slurm.time`. |
 | `set metric to val_acc` / `watch wandb run XYZ` | Updates the plan's metric source. |

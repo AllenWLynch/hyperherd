@@ -112,11 +112,123 @@ class TestTail(unittest.TestCase):
         self.assertIn("must be between", out)
 
 
+class TestStats(unittest.TestCase):
+    def test_strips_ansi_and_returns_output(self):
+        out_with_ansi = "\x1b[1mheader\x1b[0m\n\x1b[32mCOMPLETED\x1b[0m  data"
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout=out_with_ansi)):
+            text = cmd_mod.cmd_stats(Path("/tmp/anything"))
+        self.assertIn("header", text)
+        self.assertIn("COMPLETED", text)
+        self.assertNotIn("\x1b[", text)
+
+    def test_failure_surfaced(self):
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(returncode=1, stderr="boom")):
+            text = cmd_mod.cmd_stats(Path("/tmp/anything"))
+        self.assertIn("failed", text)
+        self.assertIn("boom", text)
+
+
+class TestParams(unittest.TestCase):
+    def test_renders_against_real_workspace(self):
+        # Use the mnist example which has a real hyperherd.yaml.
+        ws = Path("/n/data1/hms/dbmi/park/allen_l/hyperwhip/examples/mnist_training")
+        if not ws.is_dir():
+            self.skipTest("mnist example not present")
+        text = cmd_mod.cmd_params(ws)
+        self.assertIn("mnist_sweep", text)
+        self.assertIn("Parameters:", text)
+        self.assertIn("learning_rate", text)
+        self.assertIn("Trials:", text)
+
+
+class TestRun(unittest.TestCase):
+    def test_run_one_returns_confirmation(self):
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout="Submitted job 99999_0\n")):
+            out = cmd_mod.cmd_run(Path("/tmp/anything"), index=2)
+        self.assertIn("Submitted trial 2", out)
+        self.assertIn("99999_0", out)
+
+    def test_run_all_returns_confirmation(self):
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout="Submitted job 88888 with 5 trials\n")):
+            out = cmd_mod.cmd_run_all(Path("/tmp/anything"))
+        self.assertIn("all ready trials", out)
+        self.assertIn("88888", out)
+
+    def test_run_failure_surfaced(self):
+        err = cmd_mod.subprocess.CalledProcessError(1, "run", stderr="bad", output="")
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(returncode=1, stderr="bad")):
+            out = cmd_mod.cmd_run(Path("/tmp/anything"), index=0)
+        self.assertIn("failed", out)
+
+
+class TestPlan(unittest.TestCase):
+    def setUp(self):
+        import shutil, tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.workspace = Path(self.tmp)
+        (self.workspace / ".hyperherd").mkdir()
+        self._cleanup = lambda: shutil.rmtree(self.tmp)
+
+    def tearDown(self):
+        self._cleanup()
+
+    def test_returns_plan_contents(self):
+        plan = "# Monitor plan\n- Phase: live\n- Remediation: notify\n"
+        (self.workspace / ".hyperherd" / "MONITOR_PLAN.md").write_text(plan)
+        out = cmd_mod.cmd_plan(self.workspace)
+        self.assertIn("Phase: live", out)
+        self.assertIn("Remediation: notify", out)
+
+    def test_missing_plan_returns_friendly_message(self):
+        out = cmd_mod.cmd_plan(self.workspace)
+        self.assertIn("No plan yet", out)
+
+
+class TestInfo(unittest.TestCase):
+    def setUp(self):
+        import shutil, tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.workspace = Path(self.tmp)
+        (self.workspace / ".hyperherd").mkdir()
+        self._cleanup = lambda: shutil.rmtree(self.tmp)
+
+    def tearDown(self):
+        self._cleanup()
+
+    def test_basic_fields(self):
+        out = cmd_mod.cmd_info(self.workspace, ticks=5, total_cost_usd=0.123,
+                               started_at_iso="2026-05-03T00:00:00+00:00")
+        self.assertIn(str(self.workspace), out)
+        self.assertIn("Ticks completed: 5", out)
+        self.assertIn("$0.1230", out)
+        self.assertIn("uptime", out.lower())
+
+    def test_phase_parsed_from_plan(self):
+        plan = "# Monitor plan\n- Phase: phase2-pending\n"
+        (self.workspace / ".hyperherd" / "MONITOR_PLAN.md").write_text(plan)
+        out = cmd_mod.cmd_info(self.workspace, ticks=2)
+        self.assertIn("phase2-pending", out)
+
+    def test_halted_state_shown(self):
+        import json as _json
+        nt = self.workspace / ".hyperherd" / "next-tick.json"
+        nt.write_text(_json.dumps({"halted": True, "reason": "sweep complete"}))
+        out = cmd_mod.cmd_info(self.workspace)
+        self.assertIn("Halted", out)
+        self.assertIn("sweep complete", out)
+
+
 class TestHelp(unittest.TestCase):
     def test_lists_each_command(self):
         text = cmd_mod.cmd_help()
-        for keyword in ("/status", "/stop", "/stop_all", "/tail", "/help",
-                        "@HerdDog"):
+        for keyword in ("/status", "/stats", "/params", "/info", "/plan",
+                        "/run", "/run_all", "/cancel", "/cancel_all",
+                        "/tail", "/stop", "/help"):
             self.assertIn(keyword, text)
 
 

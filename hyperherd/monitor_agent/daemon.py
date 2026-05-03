@@ -18,11 +18,17 @@ fallback) so the user sees the daemon is no longer running.
 """
 
 import asyncio
+import contextlib
 import logging
 import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+@contextlib.asynccontextmanager
+async def _noop_thinking_cm():
+    yield
 
 from hyperherd.monitor_agent import tick as tick_mod
 from hyperherd.monitor_agent.channel import (
@@ -71,6 +77,16 @@ async def run_daemon(
     shutdown = asyncio.Event()
     event_q: asyncio.Queue = asyncio.Queue()
 
+    # Mutable runtime stats — the channel's /info slash command reads
+    # these via an info_handler callback. We update the dict in-place
+    # each tick so the callback sees fresh values.
+    from datetime import datetime, timezone
+    runtime_stats = {
+        "ticks": 0,
+        "total_cost_usd": 0.0,
+        "started_at_iso": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
     def _on_signal(signum):
         log.info("Received signal %s, shutting down after current tick.", signum)
         shutdown.set()
@@ -97,6 +113,10 @@ async def run_daemon(
     if channel is not None:
         writer = make_inbox_writer(workspace, on_write=_on_inbox_write)
         channel.set_inbound_handler(writer)
+        # Let /stop trigger the same shutdown path SIGINT/SIGTERM use.
+        channel.set_stop_handler(lambda: shutdown.set())
+        # /info pulls live runtime stats via this callback.
+        channel.set_info_handler(lambda: dict(runtime_stats))
         try:
             await channel.start()
             log.info("Channel '%s' connected.", channel.name)
@@ -127,9 +147,18 @@ async def run_daemon(
     try:
         while not shutdown.is_set():
             log.info("Tick %d starting (trigger=%s)", ticks + 1, trigger)
-            result = await run_tick(workspace, trigger=trigger, channel=channel)
+            # Show the platform's "thinking" indicator (Discord typing dots,
+            # etc.) for the duration of the tick. No-op if no channel.
+            thinking_cm = (
+                channel.thinking() if channel is not None
+                else _noop_thinking_cm()
+            )
+            async with thinking_cm:
+                result = await run_tick(workspace, trigger=trigger, channel=channel)
             ticks += 1
             total_cost += result.cost_usd
+            runtime_stats["ticks"] = ticks
+            runtime_stats["total_cost_usd"] = total_cost
             log.info(
                 "Tick %d done. cost=$%.4f turns=%d halted=%s next_delay=%s",
                 ticks, result.cost_usd, result.turns, result.halted,

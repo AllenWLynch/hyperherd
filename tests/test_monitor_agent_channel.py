@@ -129,6 +129,8 @@ class _FakeChannel:
     _stopped: bool = False
     _posts: Optional[List[str]] = None
     _handler = None
+    _stop_handler = None
+    _info_handler = None
 
     def __post_init__(self):
         self._posts = []
@@ -144,6 +146,20 @@ class _FakeChannel:
 
     def set_inbound_handler(self, handler):
         self._handler = handler
+
+    def set_stop_handler(self, handler):
+        self._stop_handler = handler
+
+    def set_info_handler(self, handler):
+        self._info_handler = handler
+
+    def thinking(self):
+        import contextlib
+
+        @contextlib.asynccontextmanager
+        async def _cm():
+            yield
+        return _cm()
 
     async def inject(self, event: InboundEvent) -> None:
         """Test-only hook: simulate an incoming user message."""

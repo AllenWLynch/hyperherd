@@ -34,14 +34,15 @@ connect (instant; global sync would take an hour to propagate).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 from pathlib import Path
-from typing import Optional
+from typing import AsyncContextManager, Optional
 
 from hyperherd.monitor_agent import commands as cmd_mod
 from hyperherd.monitor_agent.channel import (
-    InboundEvent, InboundHandler, MessageChannel,
+    InboundEvent, InboundHandler, InfoHandler, MessageChannel, StopHandler,
 )
 
 log = logging.getLogger(__name__)
@@ -122,10 +123,28 @@ class DiscordChannel(MessageChannel):
         self._client_task: Optional[asyncio.Task] = None
         self._channel = None
         self._on_inbound: Optional[InboundHandler] = None
+        self._on_stop: Optional[StopHandler] = None
+        self._on_info: Optional[InfoHandler] = None
         self._ready = asyncio.Event()
 
     def set_inbound_handler(self, handler: InboundHandler) -> None:
         self._on_inbound = handler
+
+    def set_stop_handler(self, handler: StopHandler) -> None:
+        self._on_stop = handler
+
+    def set_info_handler(self, handler: InfoHandler) -> None:
+        self._on_info = handler
+
+    def thinking(self) -> AsyncContextManager:
+        """Return an async context manager that shows Discord's typing
+        indicator for the duration. Falls back to a no-op if the channel
+        isn't connected yet."""
+        if self._channel is None:
+            return _noop_async_cm()
+        # discord.py's `Messageable.typing()` returns an async CM that
+        # auto-renews while the body runs.
+        return self._channel.typing()
 
     async def start(self) -> None:
         try:
@@ -264,6 +283,15 @@ class DiscordChannel(MessageChannel):
             message.author, is_mention, is_reply_to_bot, is_text_address,
         )
 
+        # Immediate ack so the user knows we saw their message — even if
+        # the agent is mid-tick and won't respond properly for a few
+        # seconds. The 👀 reaction is the conventional "I see you, working
+        # on it" signal in chat platforms.
+        try:
+            await message.add_reaction("👀")
+        except Exception as e:
+            log.debug("Couldn't add reaction (missing permission?): %s", e)
+
         if self._on_inbound is None:
             return
 
@@ -301,37 +329,118 @@ class DiscordChannel(MessageChannel):
         are awaited when Discord delivers an Interaction."""
         import discord
         guild = discord.Object(id=self._guild_id)
+        ws = self._workspace
 
         @self._tree.command(
             name="status",
-            description="Show sweep totals and per-trial table",
+            description="Sweep totals + per-trial table",
             guild=guild,
         )
         async def status_cmd(interaction: discord.Interaction) -> None:
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
-                None, cmd_mod.cmd_status, self._workspace,
+                None, cmd_mod.cmd_status, ws,
             )
             await interaction.followup.send(_codeblock(text))
 
         @self._tree.command(
-            name="stop", description="Cancel a single trial", guild=guild,
+            name="stats",
+            description="Per-trial timing and memory stats",
+            guild=guild,
         )
-        @app_commands.describe(index="Trial index to stop")
-        async def stop_cmd(interaction: discord.Interaction, index: int) -> None:
+        async def stats_cmd(interaction: discord.Interaction) -> None:
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
-                None, cmd_mod.cmd_stop, self._workspace, index,
+                None, cmd_mod.cmd_stats, ws,
+            )
+            await interaction.followup.send(_codeblock(text))
+
+        @self._tree.command(
+            name="params",
+            description="Parameter grid: sweep config and all trial combos",
+            guild=guild,
+        )
+        async def params_cmd(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(thinking=True)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, cmd_mod.cmd_params, ws,
+            )
+            await interaction.followup.send(_codeblock(text))
+
+        @self._tree.command(
+            name="run", description="Submit (or resubmit) one trial", guild=guild,
+        )
+        @app_commands.describe(index="Trial index to run")
+        async def run_cmd(
+            interaction: discord.Interaction, index: int,
+        ) -> None:
+            await interaction.response.defer(thinking=True)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, cmd_mod.cmd_run, ws, index,
             )
             await interaction.followup.send(text)
 
         @self._tree.command(
-            name="stop_all", description="Cancel every live trial", guild=guild,
+            name="run_all",
+            description="Submit every ready trial",
+            guild=guild,
         )
-        async def stop_all_cmd(interaction: discord.Interaction) -> None:
+        async def run_all_cmd(interaction: discord.Interaction) -> None:
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
-                None, cmd_mod.cmd_stop_all, self._workspace,
+                None, cmd_mod.cmd_run_all, ws,
+            )
+            await interaction.followup.send(text)
+
+        @self._tree.command(
+            name="plan",
+            description="Show the agent's MONITOR_PLAN.md",
+            guild=guild,
+        )
+        async def plan_cmd(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(thinking=True)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, cmd_mod.cmd_plan, ws,
+            )
+            await interaction.followup.send(_codeblock(text))
+
+        @self._tree.command(
+            name="info",
+            description="Daemon metadata: phase, uptime, tick count, total cost",
+            guild=guild,
+        )
+        async def info_cmd(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(thinking=True)
+            stats = self._on_info() if self._on_info is not None else {}
+
+            def _build():
+                return cmd_mod.cmd_info(ws, **stats)
+
+            text = await asyncio.get_running_loop().run_in_executor(None, _build)
+            await interaction.followup.send(_codeblock(text))
+
+        @self._tree.command(
+            name="cancel", description="Cancel one trial", guild=guild,
+        )
+        @app_commands.describe(index="Trial index to cancel")
+        async def cancel_cmd(
+            interaction: discord.Interaction, index: int,
+        ) -> None:
+            await interaction.response.defer(thinking=True)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, cmd_mod.cmd_stop, ws, index,
+            )
+            await interaction.followup.send(text)
+
+        @self._tree.command(
+            name="cancel_all",
+            description="Cancel every live trial",
+            guild=guild,
+        )
+        async def cancel_all_cmd(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(thinking=True)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, cmd_mod.cmd_stop_all, ws,
             )
             await interaction.followup.send(text)
 
@@ -351,9 +460,28 @@ class DiscordChannel(MessageChannel):
         ) -> None:
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
-                None, cmd_mod.cmd_tail, self._workspace, index, lines,
+                None, cmd_mod.cmd_tail, ws, index, lines,
             )
             await interaction.followup.send(_codeblock(text))
+
+        @self._tree.command(
+            name="stop",
+            description="Stop the monitor daemon entirely",
+            guild=guild,
+        )
+        async def stop_cmd(interaction: discord.Interaction) -> None:
+            if self._on_stop is None:
+                await interaction.response.send_message(
+                    "Herd dog: not connected to a daemon — nothing to stop.",
+                )
+                return
+            await interaction.response.send_message(
+                "Herd dog: stopping daemon. Final summary will follow.",
+            )
+            try:
+                self._on_stop()
+            except Exception as e:
+                log.warning("Stop handler raised: %s", e)
 
         @self._tree.command(
             name="help", description="List of HerdDog commands", guild=guild,
@@ -419,3 +547,8 @@ def _codeblock(text: str) -> str:
     if len(text) > MAX_BODY:
         text = text[:MAX_BODY] + "\n... (truncated)"
     return f"```\n{text}\n```"
+
+
+@contextlib.asynccontextmanager
+async def _noop_async_cm():
+    yield
