@@ -66,7 +66,9 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Autonomous monitor: monitor.md
+  - Autonomous monitor:
+      - Overview: monitor.md
+      - Discord setup: discord-setup.md
   - Getting started: getting-started.md
   - Configuration:
       - Sweep config (hyperherd.yaml): configuration.md

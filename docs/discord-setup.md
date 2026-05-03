@@ -1,0 +1,121 @@
+# Discord setup for the monitor daemon
+
+The monitor daemon can use Discord as both its outbound notification channel
+and its inbound message inbox. Per sweep, it auto-creates a text channel
+named after the sweep (e.g. `mnist-sweep`) inside a server you provision.
+You and the agent talk in that channel; the agent reads your replies on its
+next tick.
+
+This page is the one-time setup. After it's done you only need to set the
+guild ID in each sweep's `hyperherd.yaml`.
+
+!!! note "Experimental"
+    Discord support is part of the v2 monitor daemon (`herd monitor-v2`).
+    The current `herd monitor` doesn't use it.
+
+## 1. Create the bot
+
+1. Go to <https://discord.com/developers/applications> and click
+   **New Application**. Pick a name (it's your call — "HyperHerd" works).
+2. In the left nav, open **Bot**. Click **Reset Token**, then **Copy** the
+   token. You'll paste it into your shell environment in step 4.
+3. On the same page, scroll to **Privileged Gateway Intents** and turn on
+   **MESSAGE CONTENT INTENT**. The bot needs this to read your replies.
+4. Save.
+
+## 2. Invite the bot to your server
+
+1. In the left nav, open **OAuth2 → URL Generator**.
+2. Under **Scopes**, check `bot`.
+3. Under **Bot Permissions**, check:
+    - View Channels
+    - Send Messages
+    - Read Message History
+    - Manage Channels  *(needed for the auto-create channel-per-sweep behavior)*
+4. Copy the generated URL, paste it in your browser, pick the server, and
+   authorize.
+
+## 3. Get the server (guild) ID
+
+1. In Discord, open **User Settings → Advanced** and turn on **Developer
+   Mode**.
+2. Right-click the server name in the sidebar → **Copy Server ID**.
+
+That's the value you'll put in `hyperherd.yaml` as `discord.guild_id`.
+
+## 4. Set up the daemon's environment
+
+Set the bot token in the environment where the daemon runs (don't put it in
+YAML):
+
+```bash
+export DISCORD_BOT_TOKEN='your-bot-token-here'
+```
+
+Persisting it in your shell rc, a `.env` file, or your job-scheduler
+environment is fine — wherever you'd put any other secret.
+
+## 5. Configure the sweep
+
+In the workspace's `hyperherd.yaml`:
+
+```yaml
+discord:
+  guild_id: "1234567890123456789"
+```
+
+Optional overrides:
+
+```yaml
+discord:
+  guild_id: "1234567890123456789"
+  channel_name: "my-experiment"     # otherwise derived from the sweep name
+  channel_id: "9876543210987654321" # pin to an existing channel; skips auto-create
+```
+
+## 6. Run
+
+```bash
+herd monitor-v2 my-sweep/
+```
+
+The daemon connects, finds-or-creates the channel, posts a startup-style
+tick from the agent, and starts listening for your replies in that channel.
+
+## What you'll see
+
+- A new text channel appears (e.g. `#mnist-sweep`) the first time you run.
+- Each tick, the agent posts one summary message starting with
+  `Herd dog:`. You can reply at any time — your message lands in the
+  agent's inbox, and the daemon wakes immediately to run a `user_message`
+  tick.
+- When the agent halts (sweep complete, recurring failure, or you said so),
+  the daemon posts a final "stopped" message and exits.
+
+## Common phrases the agent understands
+
+| You say | Effect |
+|---|---|
+| `pause` / `stop` / `halt` | Agent halts; daemon exits. |
+| `how's it going?` / `status` | Posts a fresh status summary on the next tick (≤ a few seconds). |
+| `bump mem to 32G` | Bumps `slurm.mem` and resubmits affected trials. |
+| `give it more time` | Bumps `slurm.time`. |
+| `set metric to val_acc` / `watch wandb run XYZ` | Updates the plan's metric source. |
+| anything else | Agent acknowledges and asks for clarification if needed. |
+
+## Troubleshooting
+
+**"Bot can't see guild"** — the bot wasn't invited to the server. Re-run
+the OAuth invite from step 2.
+
+**"Failed to create channel"** — the bot lacks the *Manage Channels*
+permission. Re-invite with the right boxes checked, or pre-create the
+channel manually and pin it via `discord.channel_id`.
+
+**Daemon prints "DISCORD_BOT_TOKEN is not in the environment"** — the
+env var didn't propagate to the daemon's shell. Source it in the same
+shell you launch `herd monitor-v2` from.
+
+**No reply lands in the inbox** — the bot doesn't have the *MESSAGE
+CONTENT INTENT* enabled in the Developer Portal (step 1.3). Discord
+silently strips message content for bots without it.

@@ -256,6 +256,27 @@ class WatchConfig(BaseModel):
         return self
 
 
+class DiscordConfig(BaseModel):
+    """Settings for the agent-SDK monitor's Discord channel.
+
+    The token comes from the `DISCORD_BOT_TOKEN` environment variable —
+    don't put secrets in YAML. If `guild_id` is set and the env var is
+    present, the daemon connects on startup and uses Discord for both
+    outbound posts and inbound user messages. Otherwise it ignores this
+    section entirely.
+    """
+
+    guild_id: Optional[str] = None
+    """Discord server (guild) ID. Required to enable the Discord channel."""
+
+    channel_id: Optional[str] = None
+    """Pin to a specific existing channel; skips auto-create."""
+
+    channel_name: Optional[str] = None
+    """Override the sweep-derived channel name. Discord lowercases it
+    automatically; non [a-z0-9-] chars get stripped."""
+
+
 class Config(BaseModel):
     name: str
     workspace: str = ""  # set by load_config from the config file's directory
@@ -268,6 +289,7 @@ class Config(BaseModel):
 
     slurm: SlurmConfig = Field(default_factory=SlurmConfig)
     watch: WatchConfig = Field(default_factory=WatchConfig)
+    discord: DiscordConfig = Field(default_factory=DiscordConfig)
 
     # Extra override tokens appended to every trial's argument string. The
     # format is whatever the launcher expects — for Hydra trainers this is

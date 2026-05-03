@@ -45,7 +45,12 @@ except ImportError:  # pragma: no cover
 _CTX: Dict[str, Any] = {}
 
 
-def set_context(workspace: Path, sweep_name: str, last_state_json: str) -> None:
+def set_context(
+    workspace: Path,
+    sweep_name: str,
+    last_state_json: str,
+    channel=None,
+) -> None:
     """Bind the per-tick context. Called by `tick.run_tick` before
     `agent.run()`. The agent's tools read this dict instead of taking the
     workspace as an arg (the SDK's tool schemas are flat — no closures)."""
@@ -56,6 +61,7 @@ def set_context(workspace: Path, sweep_name: str, last_state_json: str) -> None:
     _CTX["audit_log_path"] = Path(workspace) / ".hyperherd" / "agent_log.jsonl"
     _CTX["next_tick_path"] = Path(workspace) / ".hyperherd" / "next-tick.json"
     _CTX["plan_path"] = Path(workspace) / ".hyperherd" / "MONITOR_PLAN.md"
+    _CTX["channel"] = channel
 
 
 # --- audit log --------------------------------------------------------------
@@ -186,12 +192,25 @@ async def stop_all() -> Dict[str, Any]:
 
 @tool(
     "msg",
-    "Post a notification to the configured webhook (Discord/ntfy/Slack). The "
-    "sweep prefix is added automatically — pass only the body. Voice rule: "
-    "prefix the body with 'Herd dog:' so the user can spot agent messages.",
+    "Post a notification to the user. Routes through the configured chat "
+    "channel (Discord) if available, otherwise the legacy webhook. Voice "
+    "rule: prefix the body with 'Herd dog:' so the user can spot agent "
+    "messages.",
     {"text": str},
 )
-async def msg(text: str) -> Dict[str, str]:
+async def msg(text: str) -> Dict[str, Any]:
+    # Channel takes priority over webhook when both are configured —
+    # the user explicitly opted into a channel by setting it up.
+    channel = _CTX.get("channel")
+    if channel is not None:
+        try:
+            await channel.post(text)
+            _audit("msg", text=text[:200], via=channel.name)
+            return {"posted": True, "via": channel.name}
+        except Exception as e:
+            _audit("msg_failed", error=str(e), via=channel.name)
+            return {"posted": False, "error": str(e), "via": channel.name}
+
     from hyperherd import watch
     from hyperherd.config import load_config
     config = load_config(str(_CTX["workspace"]))
@@ -201,8 +220,6 @@ async def msg(text: str) -> Dict[str, str]:
         webhook, _ = watch.resolve_default_webhook(config.workspace, config.name)
         fmt = "ntfy"
 
-    # `watch.post_message` is sync (urllib); run it off the event loop so a
-    # slow webhook doesn't block the agent's tool dispatch.
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(
@@ -211,8 +228,8 @@ async def msg(text: str) -> Dict[str, str]:
     except OSError as e:
         _audit("msg_failed", error=str(e))
         return {"posted": False, "error": str(e)}
-    _audit("msg", text=text[:200])
-    return {"posted": True, "webhook": webhook}
+    _audit("msg", text=text[:200], via="webhook")
+    return {"posted": True, "via": "webhook", "webhook": webhook}
 
 
 @tool(

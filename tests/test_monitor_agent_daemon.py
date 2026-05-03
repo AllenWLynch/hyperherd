@@ -20,7 +20,7 @@ def _make_run_tick(results, calls):
     each call's trigger into the `calls` list."""
     it = iter(results)
 
-    async def fake_run_tick(workspace, trigger):
+    async def fake_run_tick(workspace, trigger, **_):
         calls.append(trigger)
         return next(it)
 
