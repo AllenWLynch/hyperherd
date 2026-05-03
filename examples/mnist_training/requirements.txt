@@ -1,5 +1,13 @@
-hyperherd
+# Trial-side dependencies — installed in the conda/venv that SLURM jobs run in.
+# This env is separate from where you launch `herd monitor-v2`; it doesn't need
+# the monitor extras (Python ≥ 3.10, claude-agent-sdk, discord.py).
 hydra-core>=1.3
 pytorch-lightning>=2.0
 torch>=2.0
 torchvision>=0.15
+
+# Optional: enables `from hyperherd import log_result` so trial-end metrics
+# show up in `herd results`. The trial code in train.py falls back to plain
+# stdout if hyperherd isn't installed, so this line is safe to drop in
+# environments where you don't want any HyperHerd code in the trial path.
+hyperherd
