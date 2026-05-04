@@ -10,7 +10,9 @@ from unittest import mock
 
 from hyperherd import manifest
 from hyperherd.logging import (
+    list_metric_streams,
     load_all_results,
+    load_metric_stream,
     load_trial_results,
     log_result,
     parse_overrides,
@@ -59,6 +61,31 @@ class TestLogResult(unittest.TestCase):
         os.environ.pop("HYPERHERD_TRIAL_ID")
         with self.assertRaises(RuntimeError):
             log_result("x", 1)
+
+    def test_streaming_appends_per_step(self):
+        log_result("val_loss", 0.9, step=0)
+        log_result("val_loss", 0.7, step=100)
+        log_result("val_loss", 0.5, step=200)
+
+        stream = load_metric_stream(self.tmpdir, 3, "val_loss")
+        self.assertEqual(len(stream), 3)
+        self.assertEqual(stream[0]["step"], 0)
+        self.assertEqual(stream[2]["value"], 0.5)
+
+        # Stream and final-summary modes don't share storage.
+        results = load_trial_results(self.tmpdir, 3)
+        self.assertNotIn("val_loss", results)
+
+    def test_list_metric_streams(self):
+        log_result("val_loss", 0.5, step=0)
+        log_result("train_loss", 0.6, step=0)
+        names = list_metric_streams(self.tmpdir, 3)
+        self.assertEqual(set(names), {"val_loss", "train_loss"})
+
+    def test_list_metric_streams_empty(self):
+        # No streaming calls yet.
+        log_result("test_acc", 0.9)
+        self.assertEqual(list_metric_streams(self.tmpdir, 3), [])
 
 
 class TestLoadAllResults(unittest.TestCase):

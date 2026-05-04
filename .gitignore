@@ -36,3 +36,6 @@ examples/*/.claude/
 
 # setuptools_scm-generated version file (derived from git tags at build time)
 hyperherd/_version.py
+
+# Personal release-process notes
+PYPI.md

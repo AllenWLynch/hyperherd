@@ -3,7 +3,11 @@
 Demonstrates idempotent training with HyperHerd:
 - Checkpoints to a deterministic path based on experiment_name
 - Resumes from checkpoint automatically on re-run
-- Logs final test metrics via hyperherd.log_result()
+- **Streams `val_loss` / `val_acc` per validation epoch via
+  `log_result(name, value, step=...)`** so the autonomous monitor's
+  `compute_metric` tool can see training trajectories and make
+  pruning decisions. See `HyperHerdStreamCallback` below.
+- Logs final test metrics via `log_result()` at the end of the run.
 """
 
 import os
@@ -13,11 +17,51 @@ import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from torch import nn
 from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from torchvision.datasets import MNIST
+
+
+class HyperHerdStreamCallback(Callback):
+    """Stream validation metrics to HyperHerd's per-trial JSONL files.
+
+    Lightning records every `self.log("name", value)` call into
+    `trainer.callback_metrics`; this callback reads the values that the
+    just-finished validation pass produced and forwards them to
+    `hyperherd.log_result(name, value, step=trainer.global_step)`. Each
+    metric ends up in `.hyperherd/results/<idx>/stream/<name>.jsonl` for
+    the autonomous monitor.
+
+    No-op outside a HyperHerd trial — safe to leave in the trainer when
+    running locally (`python train.py`) for development.
+    """
+
+    METRIC_NAMES = ("val_loss", "val_acc")
+
+    def on_validation_epoch_end(self, trainer, pl_module):  # noqa: ARG002
+        # `HYPERHERD_TRIAL_ID` only set when the trial is launched via
+        # `herd run` / `herd test`. Local debugging skips streaming.
+        if os.environ.get("HYPERHERD_TRIAL_ID") is None:
+            return
+        try:
+            from hyperherd import log_result
+        except ImportError:
+            return
+
+        step = int(trainer.global_step)
+        for name in self.METRIC_NAMES:
+            v = trainer.callback_metrics.get(name)
+            if v is None:
+                continue
+            if hasattr(v, "item"):
+                v = v.item()
+            try:
+                log_result(name, v, step=step)
+            except (RuntimeError, OSError):
+                # Don't let logging failures kill training.
+                pass
 
 
 class MNISTClassifier(pl.LightningModule):
@@ -174,7 +218,7 @@ def main(cfg: DictConfig) -> None:
         max_epochs=cfg.max_epochs,
         accelerator=cfg.accelerator,
         devices=1,
-        callbacks=[checkpoint_cb],
+        callbacks=[checkpoint_cb, HyperHerdStreamCallback()],
         default_root_dir=output_dir,
         enable_progress_bar=True,
         gradient_clip_val=cfg.gradient_clip_val,

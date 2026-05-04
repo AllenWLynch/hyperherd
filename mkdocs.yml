@@ -70,6 +70,7 @@ nav:
   - Autonomous monitor:
       - Overview: monitor.md
       - Discord setup: discord-setup.md
+      - Logger MCP integrations: mcp-integrations.md
   - Getting started: getting-started.md
   - Configuration:
       - Sweep config (hyperherd.yaml): configuration.md

@@ -11,10 +11,29 @@ Two entrypoints:
 """
 
 import json
+import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
+
+_log = logging.getLogger(__name__)
+
+
+_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+
+
+def _resolve_env(env: Dict[str, str]) -> Dict[str, str]:
+    """Expand `${VAR}` references in values from the daemon's environment.
+    Missing vars become empty strings — the subprocess MCP can decide
+    whether that's fatal."""
+    out = {}
+    for k, v in env.items():
+        out[k] = _ENV_VAR_PATTERN.sub(
+            lambda m: os.environ.get(m.group(1), ""), v
+        )
+    return out
 
 from hyperherd.monitor_agent import state as state_mod
 from hyperherd.monitor_agent import tools as tools_mod
@@ -79,13 +98,11 @@ async def run_tick(
     workspace = Path(workspace).resolve()
     s = state_mod.compute(workspace, trigger)
 
-    import logging
-    _log = logging.getLogger(__name__)
     _log.info(
         "Tick state assembled: trigger=%s inbox=%d newly_failed=%d "
-        "newly_completed=%d totals=%s",
+        "newly_completed=%d newly_pruned=%d totals=%s",
         trigger, len(s.inbox), len(s.newly_failed),
-        len(s.newly_completed), s.totals,
+        len(s.newly_completed), len(s.newly_pruned), s.totals,
     )
 
     # Bind tool context before the agent starts — tools read this dict
@@ -104,10 +121,34 @@ async def run_tick(
         next_tick_path.unlink()
 
     in_process = create_sdk_mcp_server(name="hyperherd", tools=tools_mod.ALL)
+    mcp_servers = {"hyperherd": in_process}
+
+    # User-configured external MCP servers (wandb, mlflow, etc.) loaded
+    # from `mcp_servers:` in hyperherd.yaml. They get passed through to
+    # the SDK as subprocess MCPs; tools appear to the agent under
+    # `mcp__<name>__*`. Allowed-tools includes a wildcard for each so
+    # the agent can use any tool the server exposes without us
+    # enumerating them up front.
+    extra_allowed: list = []
+    try:
+        from hyperherd.config import load_config
+        config = load_config(str(workspace))
+        for server in config.mcp_servers:
+            mcp_servers[server.name] = {
+                "command": server.command,
+                "args": list(server.args),
+                "env": _resolve_env(server.env),
+            }
+            extra_allowed.append(f"mcp__{server.name}__*")
+    except Exception as e:
+        # A bad mcp_servers block shouldn't kill the tick — log and run
+        # with just the built-in server.
+        _log.warning("Could not load external MCP servers: %s", e)
+
     options = ClaudeAgentOptions(
         system_prompt=prompt.system_prompt(),
         max_turns=max_turns,
-        mcp_servers={"hyperherd": in_process},
+        mcp_servers=mcp_servers,
         allowed_tools=[
             "mcp__hyperherd__read_state",
             "mcp__hyperherd__read_plan",
@@ -117,10 +158,13 @@ async def run_tick(
             "mcp__hyperherd__run_indices",
             "mcp__hyperherd__stop_index",
             "mcp__hyperherd__stop_all",
+            "mcp__hyperherd__prune_index",
+            "mcp__hyperherd__compute_metric",
             "mcp__hyperherd__msg",
             "mcp__hyperherd__tick_summary",
             "mcp__hyperherd__schedule_next",
             "mcp__hyperherd__halt",
+            *extra_allowed,
         ],
         permission_mode="acceptEdits",
     )

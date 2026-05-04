@@ -71,6 +71,7 @@ class TickState:
     trials: List[Dict[str, Any]]        # straight from `herd snapshot`'s trials[]
     newly_failed: List[FailureView]
     newly_completed: List[int]
+    newly_pruned: List[int]
     inbox: List[InboundMessage]
     chat_history: List[ChatEntry]   # rolling buffer of recent real messages
 
@@ -85,6 +86,7 @@ class TickState:
             "trials": self.trials,
             "newly_failed": [asdict(f) for f in self.newly_failed],
             "newly_completed": self.newly_completed,
+            "newly_pruned": self.newly_pruned,
             "inbox": [asdict(m) for m in self.inbox],
             "chat_history": [asdict(m) for m in self.chat_history],
         }
@@ -164,6 +166,12 @@ def _diff_completed(prev: Optional[Dict[str, Any]], cur: Dict[str, Any]) -> List
     cur_done = _indices_with_status(cur, "completed")
     prev_done = _indices_with_status(prev, "completed") if prev else set()
     return sorted(cur_done - prev_done)
+
+
+def _diff_pruned(prev: Optional[Dict[str, Any]], cur: Dict[str, Any]) -> List[int]:
+    cur_pruned = _indices_with_status(cur, "pruned")
+    prev_pruned = _indices_with_status(prev, "pruned") if prev else set()
+    return sorted(cur_pruned - prev_pruned)
 
 
 # --- plan + inbox -----------------------------------------------------------
@@ -314,6 +322,7 @@ def compute(workspace: Path, trigger: TickTrigger = "scheduled") -> TickState:
         trials=cur.get("trials", []),
         newly_failed=_diff_failed(prev, cur),
         newly_completed=_diff_completed(prev, cur),
+        newly_pruned=_diff_pruned(prev, cur),
         inbox=_drain_inbox(workspace),
         chat_history=_read_chat_history(workspace),
     )

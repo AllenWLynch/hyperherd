@@ -46,20 +46,40 @@ def _results_path() -> str:
     return os.path.join(_results_dir(), f"{trial_id}.json")
 
 
-def log_result(name: str, value) -> None:
+def log_result(name: str, value, step: Optional[int] = None) -> None:
     """Log a named metric for the current trial.
 
-    Can be called multiple times — results accumulate in a single JSON file
-    per trial. If called with the same name twice, the later value overwrites.
+    Two modes:
+
+    * **Final-summary mode** (no `step`): writes to
+      `.hyperherd/results/<trial_id>.json` as a flat `{name: value}` dict.
+      Calling twice with the same name overwrites. This is the original
+      behavior, preserved for backward compatibility.
+    * **Streaming mode** (`step` given): appends `{step, value}` to
+      `.hyperherd/results/<trial_id>/stream/<name>.jsonl`. The autonomous
+      monitor reads these streams to make decisions (warnings, pruning).
+
+    The two modes are not mutually exclusive — call streaming
+    `log_result("val_loss", v, step=s)` during training, then the bare
+    `log_result("test_acc", final)` at the end. The flat JSON keeps
+    `herd res`'s TSV view clean while the per-metric stream files give
+    the agent detail.
 
     Args:
-        name: Metric name (e.g. "test_accuracy", "final_loss").
+        name: Metric name (e.g. "val_loss", "test_accuracy").
         value: Metric value (must be JSON-serializable).
+        step: Optional step counter. If given, switches to streaming mode.
     """
+    if step is None:
+        _log_result_final(name, value)
+    else:
+        _log_result_stream(name, value, step)
+
+
+def _log_result_final(name: str, value) -> None:
     path = _results_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    # Load existing results if any
     if os.path.isfile(path):
         with open(path, "r") as f:
             data = json.load(f)
@@ -70,6 +90,67 @@ def log_result(name: str, value) -> None:
 
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def _log_result_stream(name: str, value, step: int) -> None:
+    """Append one (step, value, ts) record to the per-metric stream file.
+    `ts` is the Unix timestamp at append time — lets the agent ask
+    'val_loss over the last 5 minutes' against the file."""
+    import time
+    trial_id = os.environ.get("HYPERHERD_TRIAL_ID")
+    if trial_id is None:
+        raise RuntimeError(
+            "HYPERHERD_TRIAL_ID not set. "
+            "log_result() must be called from within a HyperHerd trial."
+        )
+    stream_dir = os.path.join(_results_dir(), str(trial_id), "stream")
+    os.makedirs(stream_dir, exist_ok=True)
+    stream_path = os.path.join(stream_dir, f"{name}.jsonl")
+    with open(stream_path, "a") as f:
+        f.write(json.dumps({
+            "step": int(step),
+            "value": value,
+            "ts": time.time(),
+        }) + "\n")
+
+
+def load_metric_stream(workspace: str, trial_id: int, name: str) -> list:
+    """Read the per-step stream for one metric of one trial.
+
+    Returns a list of `{"step": int, "value": ...}` dicts in append order
+    (which is usually but not guaranteed to be step order). Empty list if
+    the stream doesn't exist.
+    """
+    path = os.path.join(
+        workspace, WORKSPACE_DIR, RESULTS_DIR,
+        str(trial_id), "stream", f"{name}.jsonl",
+    )
+    if not os.path.isfile(path):
+        return []
+    out = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def list_metric_streams(workspace: str, trial_id: int) -> list:
+    """List the metric names that have a stream file for this trial."""
+    stream_dir = os.path.join(
+        workspace, WORKSPACE_DIR, RESULTS_DIR, str(trial_id), "stream",
+    )
+    if not os.path.isdir(stream_dir):
+        return []
+    return sorted(
+        f[:-len(".jsonl")] for f in os.listdir(stream_dir)
+        if f.endswith(".jsonl")
+    )
 
 
 def load_trial_results(workspace: str, trial_id: int) -> dict:

@@ -250,6 +250,35 @@ class DiscordConfig(BaseModel):
     automatically; non [a-z0-9-] chars get stripped."""
 
 
+class McpServerConfig(BaseModel):
+    """One external MCP server, wired into the agent's tool surface.
+
+    Mirrors the Claude Agent SDK's external-MCP shape — the entries are
+    passed straight through to `ClaudeAgentOptions.mcp_servers` so the
+    agent sees the server's tools as `mcp__<name>__<tool>`. Use this to
+    plug in vendor MCP servers (wandb, mlflow, ClickUp, custom in-house
+    ones) without HyperHerd having to wrap or abstract them.
+
+    `env` values are looked up from the environment of the daemon
+    process — no secrets in YAML.
+    """
+
+    name: str
+    """Name the agent sees in tool prefixes (e.g. `wandb` →
+    `mcp__wandb__*`)."""
+
+    command: str
+    """Executable to launch — `uvx`, `npx`, an absolute path, etc."""
+
+    args: List[str] = Field(default_factory=list)
+    """Argv tail passed to `command`."""
+
+    env: Dict[str, str] = Field(default_factory=dict)
+    """Environment variables to set in the subprocess. Values are
+    typically env-var references like `${WANDB_API_KEY}` — the daemon
+    expands these from its own environment at startup."""
+
+
 class Config(BaseModel):
     name: str
     workspace: str = ""  # set by load_config from the config file's directory
@@ -262,6 +291,7 @@ class Config(BaseModel):
 
     slurm: SlurmConfig = Field(default_factory=SlurmConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
+    mcp_servers: List[McpServerConfig] = Field(default_factory=list)
 
     # Extra override tokens appended to every trial's argument string. The
     # format is whatever the launcher expects — for Hydra trainers this is

@@ -1016,8 +1016,18 @@ def _sync_slurm_status(workspace: str):
         "OUT_OF_MEMORY": "failed",
     }
 
+    # Trials marked `pruned` are algorithmic decisions made by the
+    # autonomous monitor; they're typically also CANCELLED in SLURM
+    # (because the agent calls `scancel`), but we must not let SLURM's
+    # status sync flip them back to `cancelled`. The `pruned` label is
+    # the source of truth for those trials.
+    trials = manifest.load_manifest(workspace)
+    pruned_set = {t["index"] for t in trials if t.get("status") == "pruned"}
+
     updates = {}
     for (_, array_idx), slurm_state in statuses.items():
+        if array_idx in pruned_set:
+            continue
         our_status = state_map.get(slurm_state, slurm_state.lower())
         updates[array_idx] = our_status
 

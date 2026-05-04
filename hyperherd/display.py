@@ -18,6 +18,7 @@ _STATUS_COLORS = {
     "SUBMITTED": "\033[33m",  # yellow
     "FAILED": "\033[31m",     # red
     "CANCELLED": "\033[90m",  # gray
+    "PRUNED": "\033[35m",     # magenta — algorithmic kill, distinct from cancelled
     "TIMEOUT": "\033[31m",    # red
 }
 

@@ -4,7 +4,10 @@ The repo ships a complete end-to-end sweep at `examples/mnist_training/`. PyTorc
 
 ## What the example does
 
-A 4-step learning rate (1e-4 → 1e-1, log-scaled) crossed with three optimizers (`adam`, `sgd`, `adamw`) — 12 combinations, reduced to 11 after a condition drops `sgd` at `lr > 0.05` (it's unstable). Each trial trains a small MLP on MNIST for 50 epochs and logs `test_acc`, `test_loss`, and `best_val_acc` back to HyperHerd via `log_result()`.
+A 4-step learning rate (1e-4 → 1e-1, log-scaled) crossed with three optimizers (`adam`, `sgd`, `adamw`) — 12 combinations, reduced to 11 after a condition drops `sgd` at `lr > 0.05` (it's unstable). Each trial trains a small MLP on MNIST for 50 epochs and logs:
+
+- **Final** `test_acc` / `test_loss` / `best_val_acc` via plain `log_result(name, value)` — these show up in `herd res`.
+- **Streaming** `val_loss` / `val_acc` per validation epoch via `log_result(name, value, step=trainer.global_step)`, wired in through a `HyperHerdStreamCallback` in `train.py`. The autonomous monitor's `compute_metric` reads these for pruning decisions.
 
 The config showcases all four condition forms — programmatic predicate, literal-extra injection, expression-computed extra, structured force — so you can see what the YAML looks like beyond the bare minimum.
 
