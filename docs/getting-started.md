@@ -68,14 +68,19 @@ herd init my_experiment --config /path/to/existing.yaml --launcher /path/to/laun
 ### 2. Validate before submitting
 
 ```bash
-# Preview the full sweep (no SLURM interaction, runs preflight checks):
+# List every trial in the sweep (no SLURM interaction):
+herd ls my_experiment
+
+# Preview the submission plan — pending indices + the sbatch script:
 herd run my_experiment --dry-run
 
 # Hydra users: validate Hydra config for trial 0 by running locally with --cfg job:
 herd test my_experiment
 ```
 
-`herd test` is the only Hydra-specific subcommand — it appends `--cfg job` to the override string so Hydra prints the resolved config and exits without running training. If your trainer doesn't use Hydra, skip it and use `herd run --dry-run` + `herd local` instead.
+The two preview commands answer different questions: **`herd ls`** is "what does my sweep look like?" (every combination, status-agnostic); **`herd run --dry-run`** is "what would `herd run` do right now?" (only the trials that would actually be submitted, plus the sbatch script).
+
+`herd test` is the only Hydra-specific subcommand — it appends `--cfg job` to the override string so Hydra prints the resolved config and exits without running training. If your trainer doesn't use Hydra, skip it and use `herd run --dry-run` + `herd test` instead.
 
 ### 3. Launch
 

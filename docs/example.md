@@ -28,7 +28,10 @@ pip install -r examples/mnist_training/requirements.txt
 # Edit examples/mnist_training/hyperherd.yaml: change `slurm.partition`
 # to one your cluster has. Defaults to `short`.
 
-# Preview the sweep — no SLURM submission, just shows the trial table:
+# List every trial the YAML produces — no SLURM, status-agnostic:
+herd ls examples/mnist_training/
+
+# Preview the submission plan (sbatch script + pending indices):
 herd run examples/mnist_training/ --dry-run
 
 # Submit:

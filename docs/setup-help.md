@@ -135,7 +135,10 @@ For container/conda/module patterns, fetch `https://allenwlynch.github.io/hyperh
 ## Phase 3 — Validate before submitting
 
 ```bash
-# Render the sbatch script + show the trial list, no SLURM interaction:
+# List every trial the YAML produces (status-agnostic):
+herd ls <workspace>
+
+# Submission preview — pending indices + the sbatch script:
 herd run <workspace> --dry-run
 
 # Run a single trial locally (no SLURM) to sanity-check the launcher + trainer:
@@ -145,7 +148,7 @@ herd test <workspace> 0
 herd test <workspace> 0 --cfg-job
 ```
 
-Read the output carefully — the dry-run prints the exact bash that will run on the compute node. If anything looks off (wrong container path, missing module load, wrong override key), fix before submitting.
+`herd ls` answers "what's in the sweep?"; `herd run --dry-run` answers "what would `herd run` do right now?". Read the dry-run output carefully — it prints the exact bash that will run on the compute node. If anything looks off (wrong container path, missing module load, wrong override key), fix before submitting.
 
 ---
 

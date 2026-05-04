@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
-from typing import Dict
+from typing import Dict, Optional
 
 from hyperherd import agent_output
 from hyperherd.config import ConfigError, load_config
@@ -19,6 +19,7 @@ from hyperherd.display import (
     print_stats_table,
     print_status_table,
     print_summary,
+    print_trial_listing,
 )
 from hyperherd.init import scaffold
 from hyperherd.preflight import PreflightError, run_preflight
@@ -77,6 +78,83 @@ def _apply_reconciliation(config, diff, force: bool) -> bool:
     return True
 
 
+def _parse_pin_args(pin_args, config):
+    """Parse `--pin name=value` strings into a {name: coerced_value} dict.
+
+    Raises ValueError with a user-facing message on:
+      - malformed entries (no `=`)
+      - names not in config.parameters (incl. static_overrides keys —
+        those aren't sweep parameters and pinning to them is meaningless)
+
+    Coerces the RHS by trying int → float → str, in that order. Trial
+    params are stored with their original YAML types so a stored `32`
+    (int) still matches a `--pin batch_size=32` (coerced int 32).
+    """
+    if not pin_args:
+        return {}
+
+    sweep_params = set(config.parameters.keys())
+    static_keys = {
+        s.split("=", 1)[0] for s in (config.static_overrides or [])
+    }
+
+    pins = {}
+    for entry in pin_args:
+        if "=" not in entry:
+            raise ValueError(
+                f"--pin {entry!r}: expected 'name=value', got no '='"
+            )
+        name, raw = entry.split("=", 1)
+        name = name.strip()
+        raw = raw.strip()
+        if not name:
+            raise ValueError(f"--pin {entry!r}: empty parameter name")
+        if name in static_keys:
+            raise ValueError(
+                f"--pin {name!r}: that's a static_overrides key, not a "
+                f"sweep parameter. --pin only accepts sweep parameter "
+                f"names. Sweep parameters: {sorted(sweep_params)}"
+            )
+        if name not in sweep_params:
+            raise ValueError(
+                f"--pin {name!r}: unknown parameter. "
+                f"Sweep parameters: {sorted(sweep_params)}"
+            )
+
+        # Type coercion: int → float → str.
+        coerced: object = raw
+        try:
+            coerced = int(raw)
+        except ValueError:
+            try:
+                coerced = float(raw)
+            except ValueError:
+                coerced = raw
+
+        pins[name] = coerced
+
+    return pins
+
+
+def _filter_trials_by_pins(trials, pins):
+    """Return the subset of trials whose `params` match every pin.
+
+    Comparison uses `==`, which gives loose numeric equality (int 32
+    matches float 32.0) but strict string equality. Trials are
+    expected to be dicts with a `params` sub-dict, as stored in the
+    manifest.
+    """
+    if not pins:
+        return list(trials)
+
+    out = []
+    for t in trials:
+        params = t.get("params", {})
+        if all(params.get(k) == v for k, v in pins.items()):
+            out.append(t)
+    return out
+
+
 def cmd_launch(args):
     """Launch (or re-launch) a hyperparameter sweep as a SLURM job array."""
     config = load_config(args.workspace)
@@ -85,6 +163,14 @@ def cmd_launch(args):
     def _say(*a, **kw):
         if not json_mode:
             print(*a, **kw)
+
+    # Parse --pin early so config validation errors surface before any
+    # SLURM/manifest work.
+    try:
+        pins = _parse_pin_args(getattr(args, "pin", None), config)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     # Preflight checks
     try:
@@ -192,6 +278,32 @@ def cmd_launch(args):
         pending = requested
         _say(f"  Submitting {len(pending)} requested trial(s): {args.indices}")
 
+    # Apply --pin filter (after status- and indices-based filtering), so
+    # the user's pinned params narrow the candidate pool to matching
+    # trials only. An empty result is a hard error: the user expected
+    # specific trials and we shouldn't silently submit nothing.
+    pin_filter_summary: Optional[str] = None
+    if pins:
+        all_trials = manifest.load_manifest(config.workspace)
+        matching = _filter_trials_by_pins(all_trials, pins)
+        matching_indices = {t["index"] for t in matching}
+        before = len(pending)
+        pending = [i for i in pending if i in matching_indices]
+        pin_desc = ", ".join(f"{k}={v}" for k, v in pins.items())
+        if not pending:
+            print(
+                f"Error: no submittable trials match --pin {pin_desc}. "
+                f"({len(matching)} total trials match the pin, but none "
+                f"were in the {before} pending after status/indices "
+                f"filtering — they may already be running or completed.)",
+                file=sys.stderr,
+            )
+            return 1
+        pin_filter_summary = (
+            f"--pin {pin_desc} narrowed from {before} to {len(pending)} trial(s)"
+        )
+        _say(f"  {pin_filter_summary}.")
+
     # Generate sbatch script
     script = slurm.generate_sbatch_script(config, pending, args.max_concurrent)
 
@@ -206,7 +318,12 @@ def cmd_launch(args):
                 sbatch_script=script,
             ))
             return 0
-        print_dry_run(trials, script, defaults=config.defaults)
+        print_dry_run(
+            sbatch_script=script,
+            pending_indices=pending,
+            total_trials=len(trials),
+            filter_summary=pin_filter_summary,
+        )
         return 0
 
     # Submit
@@ -233,6 +350,78 @@ def cmd_launch(args):
         n_trials=len(pending),
         workspace=manifest.workspace_path(config.workspace),
         logs=manifest.logs_path(config.workspace),
+    )
+    return 0
+
+
+def cmd_ls(args):
+    """List every trial in the sweep with its swept parameters.
+
+    Status-agnostic: shows the *shape* of the sweep, not what `herd
+    run` would do next. Reads the manifest if present; otherwise
+    materializes the combinations from the config so users can `herd
+    ls` BEFORE the first `herd run` to sanity-check the YAML.
+
+    Supports the same `--pin name=value` filter as `herd run` for
+    inspecting a slice of the grid.
+    """
+    config = load_config(args.workspace)
+
+    try:
+        pins = _parse_pin_args(getattr(args, "pin", None), config)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    if manifest.workspace_exists(config.workspace):
+        trials = manifest.load_manifest(config.workspace)
+        show_status = True
+        title = None
+    else:
+        # Pre-`herd run`: render combinations on the fly so this still
+        # works as a YAML sanity check.
+        try:
+            warnings = run_preflight(config)
+        except PreflightError as e:
+            print(f"Preflight check failed: {e}", file=sys.stderr)
+            return 1
+        for w in warnings:
+            print(f"Warning: {w}", file=sys.stderr)
+        combos = apply_constraints(generate_combinations(config), config.conditions)
+        if not combos:
+            print(
+                "No valid parameter combinations after applying conditions.",
+                file=sys.stderr,
+            )
+            return 1
+        # Render to manifest-shaped dicts without persisting anything.
+        from hyperherd.manifest import _trial_record
+        trials = [
+            _trial_record(i, c.params, c.extras, config.abbrevs, config.labels)
+            for i, c in enumerate(combos)
+        ]
+        show_status = False
+        title = (
+            "(no manifest yet — showing combinations from hyperherd.yaml)"
+        )
+
+    if pins:
+        before = len(trials)
+        trials = _filter_trials_by_pins(trials, pins)
+        if not trials:
+            pin_desc = ", ".join(f"{k}={v}" for k, v in pins.items())
+            print(
+                f"No trials match --pin {pin_desc} "
+                f"(of {before} total).",
+                file=sys.stderr,
+            )
+            return 1
+
+    print_trial_listing(
+        trials,
+        defaults=config.defaults,
+        show_status=show_status,
+        title=title,
     )
     return 0
 
@@ -1237,11 +1426,37 @@ def main():
         help="Submit only these trial indices (SLURM-style spec, e.g. '0-3,5,7-9')"
     )
     p_launch.add_argument(
+        "-p", "--pin", nargs="+", default=None, metavar="NAME=VALUE",
+        help=(
+            "Only submit trials whose swept parameters match every pin "
+            "(e.g. `--pin batch_size=32 optimizer=adam`). Names must be "
+            "sweep parameters; values are coerced to int/float/str. "
+            "Combines with --indices and the standard status filter."
+        ),
+    )
+    p_launch.add_argument(
         "-f", "--force", action="store_true",
         help=(
             "Override safety checks: with --indices, resubmit trials that are "
             "already running or completed; without --indices, allow config "
             "edits that drop running/completed trials (kept as orphans)"
+        ),
+    )
+
+    # ls — pure trial listing (status-agnostic), works pre- or post-`herd run`
+    p_ls = subparsers.add_parser(
+        "ls",
+        help="List every trial in the sweep with its swept parameters",
+    )
+    p_ls.add_argument(
+        "workspace", nargs="?", default=".",
+        help="Workspace directory (default: current dir)",
+    )
+    p_ls.add_argument(
+        "-p", "--pin", nargs="+", default=None, metavar="NAME=VALUE",
+        help=(
+            "Filter to trials whose swept params match every pin "
+            "(e.g. `--pin batch_size=32 optimizer=adam`)"
         ),
     )
 
@@ -1398,6 +1613,7 @@ def main():
     handlers = {
         "init": cmd_init,
         "run": cmd_launch,
+        "ls": cmd_ls,
         "test": cmd_test,
         "status": cmd_status,
         "stats": cmd_stats,

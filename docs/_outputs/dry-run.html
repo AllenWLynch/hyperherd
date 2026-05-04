@@ -1,27 +1,52 @@
-<pre class="terminal"><code><span class="ansi-bold">Trials: 6</span>
+<pre class="terminal"><code><span class="ansi-bold">============================================================</span>
+<span class="ansi-bold">DRY RUN — No jobs will be submitted</span>
+<span class="ansi-bold">============================================================</span>
 
-<span class="ansi-bold ansi-fg-white">[0]</span>  <span class="ansi-fg-magenta">lr-0.0001_opt-adam</span>
-    <span class="ansi-bg-highlight"></span><span class="ansi-fg-cyan">learning_rate</span><span class="ansi-bg-highlight">=</span><span class="ansi-fg-yellow">0.0001</span>
-    <span class="ansi-fg-cyan">optimizer</span>=<span class="ansi-fg-yellow">adam</span>
+<span class="ansi-dim">Generated sbatch script (per-trial lookup elided for brevity):</span>
+<span class="ansi-dim">----------------------------------------</span>
+<span class="ansi-dim">#!/bin/bash</span>
+<span class="ansi-dim">#SBATCH --job-name=hyperherd_lr_sweep</span>
+<span class="ansi-dim">#SBATCH --array=0-11</span>
+<span class="ansi-dim">#SBATCH --partition=short</span>
+<span class="ansi-dim">#SBATCH --time=01:00:00</span>
+<span class="ansi-dim">#SBATCH --mem=2G</span>
+<span class="ansi-dim">#SBATCH --cpus-per-task=1</span>
+<span class="ansi-dim">#SBATCH --output=/path/to/lr_sweep/.hyperherd/logs/%a.out</span>
+<span class="ansi-dim">#SBATCH --error=/path/to/lr_sweep/.hyperherd/logs/%a.err</span>
+<span class="ansi-dim">#SBATCH --open-mode=append</span>
+<span class="ansi-dim"></span>
+<span class="ansi-dim"># Run divider — visible in both stdout and stderr after append</span>
+<span class="ansi-dim">_HH_DIVIDER=&quot;==== HyperHerd run: job ${SLURM_JOB_ID} array-task ${SLURM_ARRAY_TASK_ID} $(date -Iseconds) ====&quot;</span>
+<span class="ansi-dim">printf &quot;\n%s\n\n&quot; &quot;$_HH_DIVIDER&quot;</span>
+<span class="ansi-dim">printf &quot;\n%s\n\n&quot; &quot;$_HH_DIVIDER&quot; &gt;&amp;2</span>
+<span class="ansi-dim"></span>
+<span class="ansi-dim"># Export HyperHerd environment variables</span>
+<span class="ansi-dim">export HYPERHERD_WORKSPACE=/path/to/lr_sweep</span>
+<span class="ansi-dim">export HYPERHERD_SWEEP_NAME=lr_sweep</span>
+<span class="ansi-dim">export HYPERHERD_TRIAL_ID=&quot;$SLURM_ARRAY_TASK_ID&quot;</span>
+<span class="ansi-dim"></span>
+<span class="ansi-dim"># Per-trial lookup baked at submission time (no Python required here).</span>
+<span class="ansi-dim">case &quot;$SLURM_ARRAY_TASK_ID&quot; in</span>
+<span class="ansi-dim">  0)</span>
+<span class="ansi-dim">    HYPERHERD_TRIAL_NAME=lr-0.0001_opt-adam</span>
+<span class="ansi-dim">    HYPERHERD_EXPERIMENT_NAME=lr-0.0001_opt-adam</span>
+<span class="ansi-dim">    OVERRIDES=&#x27;experiment_name=lr-0.0001_opt-adam learning_rate=0.0001 optimizer=adam&#x27;</span>
+<span class="ansi-dim">    ;;</span>
+<span class="ansi-dim">  # ... [11 more trial arm(s) elided in dry-run; full script is submitted] ...</span>
+<span class="ansi-dim">  *)</span>
+<span class="ansi-dim">    echo &quot;HyperHerd: no lookup entry for SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID&quot; &gt;&amp;2</span>
+<span class="ansi-dim">    exit 1</span>
+<span class="ansi-dim">    ;;</span>
+<span class="ansi-dim">esac</span>
+<span class="ansi-dim">export HYPERHERD_TRIAL_NAME HYPERHERD_EXPERIMENT_NAME</span>
+<span class="ansi-dim"></span>
+<span class="ansi-dim"># Invoke the user&#x27;s launcher script</span>
+<span class="ansi-dim">bash /path/to/lr_sweep/launch.sh &quot;$OVERRIDES&quot;</span>
+<span class="ansi-dim">----------------------------------------</span>
 
-<span class="ansi-bold ansi-fg-white">[1]</span>  <span class="ansi-fg-magenta">lr-0.0001_opt-sgd</span>
-    <span class="ansi-bg-highlight"></span><span class="ansi-fg-cyan">learning_rate</span><span class="ansi-bg-highlight">=</span><span class="ansi-fg-yellow">0.0001</span>
-    <span class="ansi-bg-highlight"></span><span class="ansi-fg-cyan">optimizer</span><span class="ansi-bg-highlight">=</span><span class="ansi-fg-yellow">sgd</span>
-
-<span class="ansi-bold ansi-fg-white">[2]</span>  <span class="ansi-fg-magenta">lr-0.001_opt-adam</span>
-    <span class="ansi-fg-cyan">learning_rate</span>=<span class="ansi-fg-yellow">0.001</span>
-    <span class="ansi-fg-cyan">optimizer</span>=<span class="ansi-fg-yellow">adam</span>
-
-<span class="ansi-bold ansi-fg-white">[3]</span>  <span class="ansi-fg-magenta">lr-0.001_opt-sgd</span>
-    <span class="ansi-fg-cyan">learning_rate</span>=<span class="ansi-fg-yellow">0.001</span>
-    <span class="ansi-bg-highlight"></span><span class="ansi-fg-cyan">optimizer</span><span class="ansi-bg-highlight">=</span><span class="ansi-fg-yellow">sgd</span>
-
-<span class="ansi-bold ansi-fg-white">[4]</span>  <span class="ansi-fg-magenta">lr-0.01_opt-adam</span>
-    <span class="ansi-bg-highlight"></span><span class="ansi-fg-cyan">learning_rate</span><span class="ansi-bg-highlight">=</span><span class="ansi-fg-yellow">0.01</span>
-    <span class="ansi-fg-cyan">optimizer</span>=<span class="ansi-fg-yellow">adam</span>
-
-<span class="ansi-bold ansi-fg-white">[5]</span>  <span class="ansi-fg-magenta">lr-0.01_opt-sgd</span>
-    <span class="ansi-bg-highlight"></span><span class="ansi-fg-cyan">learning_rate</span><span class="ansi-bg-highlight">=</span><span class="ansi-fg-yellow">0.01</span>
-    <span class="ansi-bg-highlight"></span><span class="ansi-fg-cyan">optimizer</span><span class="ansi-bg-highlight">=</span><span class="ansi-fg-yellow">sgd</span>
+<span class="ansi-bold">Submission plan</span>
+  Pending: 12 of 12 trial(s)
+  Indices: 0-11
+  Use <span class="ansi-bold">herd ls</span> to see every trial in the sweep.
 
 </code></pre>

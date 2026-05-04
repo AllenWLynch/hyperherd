@@ -50,9 +50,10 @@ Generates the trial manifest, runs preflight checks, writes the sbatch script to
 
 | Flag | Description |
 |------|-------------|
-| `-n, --dry-run` | Print the sbatch script and trial list; don't submit |
+| `-n, --dry-run` | Print the submission plan (sbatch script + pending indices); don't submit. Use [`herd ls`](#herd-ls) for the full trial list. |
 | `-j, --max-concurrent N` | Cap concurrent running tasks (overrides `slurm.max_concurrent`) |
 | `-i, --indices SPEC` | Submit only these trial indices, e.g. `0-3,5,7-9` |
+| `-p, --pin NAME=VALUE [NAME=VALUE ...]` | Submit only trials whose swept params match every pin (e.g. `--pin batch_size=32 optimizer=adam`). Names must be sweep parameters; values are coerced to int/float/str. |
 | `-f, --force` | With `--indices`, allow resubmitting running/completed trials. Without, allow config edits that drop running/completed trials (kept as orphans). |
 
 **Editing the config mid-sweep is supported.** If you edit `hyperherd.yaml` between runs, `herd run` reconciles the new manifest against the old one: new trials are appended, removed trials are dropped (or kept as orphans with `-f` if they were already running/completed). See [Re-running and reconciliation](workspace.md#re-running-and-reconciliation) for the rules.
@@ -65,7 +66,7 @@ Generates the trial manifest, runs preflight checks, writes the sbatch script to
 
 --8<-- "_outputs/dry-run.html"
 
-**Agent mode** — `herd run --dry-run --json` emits the full enumeration of hparam combinations the sweep would submit, without touching SLURM. The intended workflow for an agent is to call this, inspect the candidate trials, then call `herd run --json` to actually submit.
+**Agent mode** — `herd run --dry-run --json` emits the submission plan (the indices + sbatch script that would actually be submitted right now, given current status / `--pin` / `--indices`). For the full sweep enumeration regardless of status, use `herd ls` (or its JSON variant when added). The intended workflow for an agent is to inspect the trials, then call `herd run --json` to submit.
 
 ```json
 {
@@ -84,6 +85,26 @@ Generates the trial manifest, runs preflight checks, writes the sbatch script to
 ```
 
 A real (non-dry-run) `herd run --json` returns the same shape with `dry_run: false`, `slurm_job_id` populated, `sbatch_path` set to where the script was written (`.hyperherd/job.sbatch`), and `sbatch_script: null`.
+
+## `herd ls`
+
+List every trial in the sweep with its swept parameters.
+
+```bash
+herd ls [WORKSPACE] [-p NAME=VALUE ...]
+```
+
+Status-agnostic — shows the *shape* of the sweep, not what `herd run` would do next. Reads the manifest if present; otherwise materializes the combinations from `hyperherd.yaml` so you can `herd ls` BEFORE the first `herd run` to sanity-check the YAML.
+
+| Flag | Description |
+|------|-------------|
+| `-p, --pin NAME=VALUE [NAME=VALUE ...]` | Filter to trials whose swept params match every pin (e.g. `--pin batch_size=32 optimizer=adam`). |
+
+Use `herd status` for the SLURM-synced status table (this command does not touch SLURM); use `herd run --dry-run` for a submission preview.
+
+**Example output**
+
+--8<-- "_outputs/ls.html"
 
 ## `herd status`
 

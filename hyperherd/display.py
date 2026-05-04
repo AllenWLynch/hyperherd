@@ -206,24 +206,79 @@ def _condense_case_block(script: str, keep_first: int = 1) -> str:
     return "\n".join(lines[: open_idx + 1] + new_body + lines[close_idx:])
 
 
-def print_dry_run(
+def print_trial_listing(
     trials: List[dict],
-    sbatch_script: str,
     defaults: Optional[Dict[str, Any]] = None,
+    show_status: bool = False,
+    title: Optional[str] = None,
 ) -> None:
-    """Print dry-run output with verbose, colored trial listing.
+    """Print a verbose per-trial parameter dump.
 
-    Non-default parameter values are highlighted with a grey background.
-    The baked per-trial `case` block is condensed for readability — the
-    full block is what actually gets submitted, and the per-trial details
-    are shown explicitly below in the Trials section.
+    One stanza per trial: header (`[idx] experiment_name`) plus the
+    swept params (one per line, non-defaults highlighted) plus any
+    constraint-injected `extras`. With `show_status=True` the header
+    also carries the trial's status emoji + label.
+
+    This is the canonical "what does the sweep look like" view —
+    `herd ls` calls it for the full sweep; the run dry-run no longer
+    uses it (the dry-run is now a narrow submission preview).
+    """
+    if title:
+        print(f"{_BOLD}{title}{_RESET}")
+    print(f"{_BOLD}Trials: {len(trials)}{_RESET}")
+    print()
+
+    for trial in trials:
+        idx = trial["index"]
+        exp_name = trial.get("experiment_name", "")
+        params = trial.get("params", {})
+
+        header = f"{_TRIAL_HEADER}[{idx}]{_RESET}"
+        if exp_name:
+            header += f"  {_EXP_NAME}{exp_name}{_RESET}"
+        if show_status:
+            status = trial.get("status", "?")
+            color = _STATUS_COLORS.get(status.upper(), "")
+            if color:
+                header += f"  {color}{status}{_RESET}"
+            else:
+                header += f"  {status}"
+        print(header)
+
+        for name, value in params.items():
+            highlight = _is_non_default(name, value, defaults)
+            print(f"    {_format_param_kv(name, value, is_non_default=highlight)}")
+
+        extras = trial.get("extras") or {}
+        if extras:
+            print(f"    {_DIM}# constraint set:{_RESET}")
+            for name, value in extras.items():
+                print(f"    {_format_param_kv(name, value, is_non_default=True)}")
+        print()
+
+
+def print_dry_run(
+    sbatch_script: str,
+    pending_indices: List[int],
+    total_trials: int,
+    filter_summary: Optional[str] = None,
+) -> None:
+    """Print the submission preview: sbatch script + pending summary.
+
+    Narrow scope by design — what `herd run` *would* submit right now,
+    given current status, --indices, --pin, and config-reconciliation
+    state. The full per-trial parameter table belongs to `herd ls`,
+    which is status-agnostic and meant for sweep-shape inspection.
+
+    `filter_summary` is an optional one-liner describing how the
+    pending set was narrowed (e.g. "--pin lr=0.001 narrowed from 6
+    to 1 trial"); printed if provided.
     """
     print(f"{_BOLD}{'=' * 60}{_RESET}")
     print(f"{_BOLD}DRY RUN — No jobs will be submitted{_RESET}")
     print(f"{_BOLD}{'=' * 60}{_RESET}")
     print()
 
-    # Sbatch script
     print(f"{_DIM}Generated sbatch script (per-trial lookup elided for brevity):{_RESET}")
     print(f"{_DIM}{'-' * 40}{_RESET}")
     for line in _condense_case_block(sbatch_script).rstrip().split("\n"):
@@ -231,33 +286,20 @@ def print_dry_run(
     print(f"{_DIM}{'-' * 40}{_RESET}")
     print()
 
-    # Trial listing
-    print(f"{_BOLD}Trials: {len(trials)}{_RESET}")
+    print(f"{_BOLD}Submission plan{_RESET}")
+    print(f"  Pending: {len(pending_indices)} of {total_trials} trial(s)")
+    if pending_indices:
+        # Render as a compact range spec when possible.
+        try:
+            from hyperherd.slurm import _indices_to_array_spec
+            spec = _indices_to_array_spec(pending_indices)
+            print(f"  Indices: {spec}")
+        except Exception:
+            print(f"  Indices: {pending_indices}")
+    if filter_summary:
+        print(f"  Filter:  {filter_summary}")
+    print(f"  Use {_BOLD}herd ls{_RESET} to see every trial in the sweep.")
     print()
-
-    for trial in trials:
-        idx = trial["index"]
-        exp_name = trial.get("experiment_name", "")
-        params = trial["params"]
-
-        # Trial header line
-        header = f"{_TRIAL_HEADER}[{idx}]{_RESET}"
-        if exp_name:
-            header += f"  {_EXP_NAME}{exp_name}{_RESET}"
-        print(header)
-
-        # Parameter lines, one per param, indented
-        for name, value in params.items():
-            highlight = _is_non_default(name, value, defaults)
-            print(f"    {_format_param_kv(name, value, is_non_default=highlight)}")
-
-        # Constraint-injected extras, if any
-        extras = trial.get("extras") or {}
-        if extras:
-            print(f"    {_DIM}# constraint set:{_RESET}")
-            for name, value in extras.items():
-                print(f"    {_format_param_kv(name, value, is_non_default=True)}")
-        print()
 
 
 _MEM_UNIT_BYTES = {
