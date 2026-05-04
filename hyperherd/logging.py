@@ -95,7 +95,13 @@ def _log_result_final(name: str, value) -> None:
 def _log_result_stream(name: str, value, step: int) -> None:
     """Append one (step, value, ts) record to the per-metric stream file.
     `ts` is the Unix timestamp at append time — lets the agent ask
-    'val_loss over the last 5 minutes' against the file."""
+    'val_loss over the last 5 minutes' against the file.
+
+    Slashes in `name` are honored as nested subdirectories under
+    ``stream/`` (so Lightning-style metric names like ``train/loss``
+    land at ``stream/train/loss.jsonl``). Names that try to escape
+    ``stream/`` (absolute paths, ``..`` components) are rejected.
+    """
     import time
     trial_id = os.environ.get("HYPERHERD_TRIAL_ID")
     if trial_id is None:
@@ -104,8 +110,13 @@ def _log_result_stream(name: str, value, step: int) -> None:
             "log_result() must be called from within a HyperHerd trial."
         )
     stream_dir = os.path.join(_results_dir(), str(trial_id), "stream")
-    os.makedirs(stream_dir, exist_ok=True)
+    if os.path.isabs(name) or ".." in name.replace("\\", "/").split("/"):
+        raise ValueError(
+            f"Invalid metric name {name!r}: must be relative and must not "
+            f"contain '..' components."
+        )
     stream_path = os.path.join(stream_dir, f"{name}.jsonl")
+    os.makedirs(os.path.dirname(stream_path), exist_ok=True)
     with open(stream_path, "a") as f:
         f.write(json.dumps({
             "step": int(step),
@@ -141,16 +152,27 @@ def load_metric_stream(workspace: str, trial_id: int, name: str) -> list:
 
 
 def list_metric_streams(workspace: str, trial_id: int) -> list:
-    """List the metric names that have a stream file for this trial."""
+    """List the metric names that have a stream file for this trial.
+
+    Recurses into ``stream/``, so nested names like ``train/loss``
+    (written by ``log_result("train/loss", ...)``) appear in the result
+    with the slash preserved. Always returns POSIX-style separators
+    regardless of host OS.
+    """
     stream_dir = os.path.join(
         workspace, WORKSPACE_DIR, RESULTS_DIR, str(trial_id), "stream",
     )
     if not os.path.isdir(stream_dir):
         return []
-    return sorted(
-        f[:-len(".jsonl")] for f in os.listdir(stream_dir)
-        if f.endswith(".jsonl")
-    )
+    names = []
+    for root, _dirs, files in os.walk(stream_dir):
+        for f in files:
+            if not f.endswith(".jsonl"):
+                continue
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, stream_dir)
+            names.append(rel[:-len(".jsonl")].replace(os.sep, "/"))
+    return sorted(names)
 
 
 def load_trial_results(workspace: str, trial_id: int) -> dict:

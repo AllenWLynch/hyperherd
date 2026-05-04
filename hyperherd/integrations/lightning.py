@@ -123,13 +123,13 @@ class HyperHerdLogger(Logger):
         if not self._enabled:
             return
         s = 0 if step is None else int(step)
-        for raw_name, raw_value in metrics.items():
+        for name, raw_value in metrics.items():
             value = _coerce_scalar(raw_value)
             if value is None:
                 continue
-            # log_result writes <name>.jsonl; '/' would create nested dirs.
-            name = raw_name.replace("/", "__")
             try:
+                # log_result honors '/' as nested subdirs under stream/, so
+                # Lightning-style names like 'train/loss' are preserved.
                 log_result(name, value, step=s)
                 self._latest[name] = value
             except Exception as e:
