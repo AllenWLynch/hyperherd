@@ -18,7 +18,18 @@ Python 3.10+ is required for the daemon. Trial training code can still run on ol
 pip install 'hyperherd[monitor]'
 ```
 
-Then create a Discord bot once by walking through [Discord setup](discord-setup.md). After that, you'll have:
+### Anthropic credentials
+
+The agent talks to Claude through the Claude Agent SDK, which needs auth one of two ways:
+
+- **API key** (recommended for servers) — sign in to <https://console.anthropic.com>, fund the workspace, create an API key, and `export ANTHROPIC_API_KEY=...` on the daemon's machine. Pay-per-token, separate from your Claude Code subscription. Works on any server with no Claude Code install needed.
+- **Claude Code subscription OAuth** (works on dev machines that already have Claude Code) — leave `ANTHROPIC_API_KEY` unset, and run `claude /login` once on the same machine that will run the daemon. The SDK uses the stored tokens; usage counts against your Claude Code session limits.
+
+The startup check prints which path is active. To switch from one to the other, set/unset `ANTHROPIC_API_KEY` and restart.
+
+### Discord bot
+
+Create a Discord bot once by walking through [Discord setup](discord-setup.md). After that, you'll have:
 
 - a `DISCORD_BOT_TOKEN` env var on the machine that runs the daemon
 - a Discord server (guild) ID you'll add to each sweep:
