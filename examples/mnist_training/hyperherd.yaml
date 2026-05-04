@@ -3,7 +3,7 @@ name: mnist_sweep
 grid: [learning_rate, optimizer]
 
 slurm:
-  partition: short,park
+  partition: short
   time: "01:00:00"
   mem: "1500MB"
   cpus_per_task: 1
@@ -22,7 +22,7 @@ static_overrides:
 # Without this block, `herd monitor` still runs (failure triage, resubmits,
 # etc.) but has no chat surface to post status messages to.
 discord:
-  guild_id: "1500357438547955863"
+  guild_id: "REPLACE_WITH_YOUR_GUILD_ID"
 
 parameters:
   learning_rate:

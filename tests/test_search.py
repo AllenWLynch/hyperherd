@@ -12,6 +12,7 @@ def _make_config(parameters, grid=None):
         "workspace": "/tmp/test_ws",
         "parameters": parameters,
         "launcher": "./launch.sh",
+        "slurm": {"partition": "short"},
     }
     if grid is not None:
         raw["grid"] = grid

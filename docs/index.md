@@ -1,5 +1,8 @@
 # HyperHerd
 
+!!! warning "Pre-release / actively developed"
+    HyperHerd is in soft launch — the YAML schema, CLI flags, and Python API may change without notice between versions. Pin to an exact version (`hyperherd==X.Y.Z`) if you build on top of it, and expect breaking changes until a tagged 1.0.
+
 **Hyperparameter sweeps on SLURM, run by an autonomous agent.** Declare your search in YAML, hand over a one-line launcher script, and walk away — [`herd monitor`](monitor.md) submits trials in stages, diagnoses failures, retries when SLURM can fix the problem, and posts only when it can't.
 
 !!! tip "Want to skip ahead?"

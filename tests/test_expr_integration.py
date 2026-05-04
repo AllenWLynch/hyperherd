@@ -120,6 +120,7 @@ class TestConfigValidation(unittest.TestCase):
                 "opt": {"type": "discrete", "abbrev": "opt", "values": ["adam", "sgd"]},
             },
             "conditions": [conditions],
+            "slurm": {"partition": "short"},
         }
 
     def test_valid_when_expr_accepted(self):
@@ -176,6 +177,7 @@ class TestConfigValidation(unittest.TestCase):
                     "type": "discrete", "abbrev": "ep", "values": ["b"],
                 },
             },
+            "slurm": {"partition": "short"},
         }
         with self.assertRaises(Exception) as ctx:
             Config.model_validate(cfg)

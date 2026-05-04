@@ -22,6 +22,7 @@ def _make_config(parameters=None, constraints=None, launcher=None, workspace=Non
         "parameters": parameters,
         "constraints": constraints,
         "launcher": launcher or "",
+        "slurm": {"partition": "short"},
     }
     if grid is not None:
         raw["grid"] = grid

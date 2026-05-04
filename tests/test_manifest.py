@@ -242,6 +242,7 @@ class TestDiscreteLabels(unittest.TestCase):
                 },
             },
             "grid": "all",
+            "slurm": {"partition": "short"},
         })
         self.assertEqual(cfg.labels, {"ckpt": {"/p/a": "a", "/p/b": "b"}})
 

@@ -165,7 +165,7 @@ class TestStats(unittest.TestCase):
 class TestParams(unittest.TestCase):
     def test_renders_against_real_workspace(self):
         # Use the mnist example which has a real hyperherd.yaml.
-        ws = Path("/n/data1/hms/dbmi/park/allen_l/hyperwhip/examples/mnist_training")
+        ws = Path(__file__).resolve().parent.parent / "examples" / "mnist_training"
         if not ws.is_dir():
             self.skipTest("mnist example not present")
         text = cmd_mod.cmd_params(ws)

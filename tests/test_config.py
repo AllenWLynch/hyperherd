@@ -14,6 +14,7 @@ def _minimal(**overrides):
             "lr": {"abbrev": "lr", "type": "discrete", "values": [0.1, 0.01]},
         },
         "grid": "all",
+        "slurm": {"partition": "short"},
     }
     raw.update(overrides)
     return Config.model_validate(raw)
@@ -62,6 +63,7 @@ class TestAbbrevSafety(unittest.TestCase):
             "launcher": "./launch.sh",
             "parameters": params,
             "grid": "all",
+            "slurm": {"partition": "short"},
         }
         raw.update(overrides)
         return Config.model_validate(raw)
@@ -107,6 +109,7 @@ class TestParamNameOverrideSafety(unittest.TestCase):
             "launcher": "./launch.sh",
             "parameters": params,
             "grid": "all",
+            "slurm": {"partition": "short"},
         }
         return Config.model_validate(raw)
 

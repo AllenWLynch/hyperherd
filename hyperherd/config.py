@@ -220,7 +220,10 @@ class Constraint(BaseModel):
 
 
 class SlurmConfig(BaseModel):
-    partition: str = "default"
+    # Required: there's no universal "default" partition — every cluster
+    # has its own naming. Forcing a value here means `herd run --dry-run`
+    # fails loudly on an un-edited template, which is what we want.
+    partition: str
     time: str = "01:00:00"
     mem: str = "8G"
     cpus_per_task: int = 1
