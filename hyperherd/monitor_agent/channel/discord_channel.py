@@ -203,6 +203,10 @@ class DiscordChannel(MessageChannel):
         # one self-editing message that takes the place of the user
         # repeatedly typing /status. Disabled with refresh_seconds=0.
         if self._dashboard_refresh > 0:
+            # Unpin any stale dashboards from prior daemon runs first —
+            # otherwise pinned messages accumulate one-per-restart and
+            # the user has to manually clean them up.
+            await self._unpin_stale_dashboards()
             self._dashboard_task = asyncio.create_task(
                 self._dashboard_loop(), name="discord-dashboard",
             )
@@ -236,6 +240,29 @@ class DiscordChannel(MessageChannel):
             log.warning("Failed to post to Discord: %s", e)
 
     # --- live dashboard --------------------------------------------------
+
+    async def _unpin_stale_dashboards(self) -> None:
+        """Sweep the channel's pinned messages, unpin any that look like
+        a leftover dashboard from a previous daemon run. Match by
+        author=self + content prefix `📊 ` so we don't touch unrelated
+        pins (user-pinned conversation, etc.). Best-effort."""
+        if self._channel is None or self._client is None:
+            return
+        try:
+            pins = await self._channel.pins()
+        except Exception as e:
+            log.debug("Couldn't fetch channel pins: %s", e)
+            return
+        for msg in pins:
+            try:
+                if msg.author.id != self._client.user.id:
+                    continue
+                if not (msg.content or "").startswith("📊"):
+                    continue
+                await msg.unpin(reason="HyperHerd: replacing stale dashboard")
+                log.info("Unpinned stale dashboard message %s", msg.id)
+            except Exception as e:
+                log.debug("Couldn't unpin %s: %s", getattr(msg, "id", "?"), e)
 
     async def _dashboard_loop(self) -> None:
         """Maintain a single self-editing 'live status' message in the
@@ -292,29 +319,105 @@ class DiscordChannel(MessageChannel):
                     log.warning("Dashboard repost also failed: %s", e2)
 
     def _build_dashboard_content(self) -> str:
-        """Assemble the dashboard body: status table + daemon metadata.
-        Reuses the same `commands.cmd_status` / `cmd_info` paths the
-        slash commands use, plus runtime stats from the daemon's
-        info_handler if registered."""
-        status_text = cmd_mod.cmd_status(self._workspace)
-        info_kwargs = self._on_info() if self._on_info is not None else {}
-        info_text = cmd_mod.cmd_info(self._workspace, **info_kwargs)
+        """Vertical-layout dashboard, optimized for Discord's pinned-
+        message side panel (skinny, can't render wide tables). Each
+        trial is one line with an emoji + index + experiment name.
 
+        Reads `.hyperherd/last-snapshot.json` directly rather than
+        going through `cmd_status` (which formats a wide table)."""
+        import json as _json
         from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-        header = f"📊 **{self._sweep_name}** · live dashboard · {now}"
 
-        body = f"{header}\n{_codeblock(info_text)}\n{_codeblock(status_text)}"
-        # Discord caps messages at 2000 chars. _codeblock truncates each
-        # block individually; if the combined body is still too long we
-        # trim the status block (info is more important — it's the
-        # 'is the daemon alive' digest).
-        MAX = 1990
-        if len(body) > MAX:
-            body = (
-                f"{header}\n{_codeblock(info_text)}\n"
-                f"_(status table omitted — {len(status_text)} chars)_"
-            )
+        snap_path = self._workspace / ".hyperherd" / "last-snapshot.json"
+        if not snap_path.is_file():
+            return f"📊 **{self._sweep_name}** · _no snapshot yet_"
+        try:
+            snap = _json.loads(snap_path.read_text())
+        except (OSError, _json.JSONDecodeError):
+            return f"📊 **{self._sweep_name}** · _snapshot unreadable_"
+
+        totals = snap.get("totals") or {}
+        trials = snap.get("trials") or []
+        info_kwargs = self._on_info() if self._on_info is not None else {}
+        ticks = info_kwargs.get("ticks", 0)
+        cost = info_kwargs.get("total_cost_usd", 0.0)
+        started_iso = info_kwargs.get("started_at_iso", "")
+
+        # Phase from the agent's plan, if any.
+        plan_path = self._workspace / ".hyperherd" / "MONITOR_PLAN.md"
+        phase = "?"
+        if plan_path.is_file():
+            try:
+                for line in plan_path.read_text().splitlines():
+                    s = line.strip().lstrip("-").strip()
+                    if s.lower().startswith("phase:"):
+                        phase = s.split(":", 1)[1].strip()
+                        break
+            except OSError:
+                pass
+
+        now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        order = ["ready", "submitted", "queued", "running",
+                 "completed", "failed", "pruned", "cancelled"]
+        emoji = {
+            "ready": "○", "submitted": "📤", "queued": "⏳",
+            "running": "▶️", "completed": "✅", "failed": "⚠️",
+            "pruned": "✂️", "cancelled": "🛑",
+        }
+        total = totals.get("total", len(trials))
+
+        lines = []
+        lines.append(f"📊 **{self._sweep_name}** · {now}")
+        lines.append("")
+        lines.append(f"**Status** ({total} trials)")
+        for k in order:
+            v = totals.get(k, 0)
+            if v:
+                lines.append(f"{emoji.get(k, '·')} {v} {k}")
+
+        lines.append("")
+        lines.append("**Daemon**")
+        lines.append(f"phase · `{phase}`")
+        lines.append(f"ticks · {ticks}")
+        lines.append(f"cost · ${cost:.4f}")
+        if started_iso:
+            try:
+                started_dt = datetime.fromisoformat(started_iso)
+                if started_dt.tzinfo is None:
+                    started_dt = started_dt.replace(tzinfo=timezone.utc)
+                up_secs = int(
+                    (datetime.now(timezone.utc) - started_dt).total_seconds()
+                )
+                lines.append(f"uptime · {_format_uptime(up_secs)}")
+            except Exception:
+                pass
+
+        if trials:
+            lines.append("")
+            lines.append("**Trials**")
+            CAP = 25  # keep room for the rest of the message body
+            for t in trials[:CAP]:
+                idx = t.get("index", "?")
+                status = t.get("status", "?")
+                ic = emoji.get(status, "·")
+                name = (t.get("experiment_name") or "?")[:24]
+                tail = ""
+                if status == "running":
+                    el = t.get("elapsed") or ""
+                    tail = f" · {el}" if el else ""
+                elif status == "completed":
+                    last = (t.get("last_log_line") or "").strip()[:24]
+                    tail = f" · {last}" if last else ""
+                elif status == "failed":
+                    last = (t.get("last_log_line") or "").strip()[:24]
+                    tail = f" · {last}" if last else ""
+                lines.append(f"{ic} #{idx} `{name}`{tail}")
+            if len(trials) > CAP:
+                lines.append(f"_… and {len(trials) - CAP} more (use `/status`)_")
+
+        body = "\n".join(lines)
+        if len(body) > 1990:
+            body = body[:1980] + "\n_(truncated)_"
         return body
 
     # --- inbound: only mentions/replies reach the agent ------------------
@@ -547,6 +650,44 @@ class DiscordChannel(MessageChannel):
             await interaction.followup.send(text)
 
         @self._tree.command(
+            name="prune",
+            description="Algorithmic kill — NOT resubmitted by `herd run`",
+            guild=guild,
+        )
+        @app_commands.describe(
+            index="Trial index to prune",
+            reason="Reason for pruning (optional, recorded in audit log)",
+        )
+        async def prune_cmd(
+            interaction: discord.Interaction,
+            index: int,
+            reason: str = "user-pruned via /prune",
+        ) -> None:
+            await interaction.response.defer(thinking=True)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, cmd_mod.cmd_prune, ws, index, reason,
+            )
+            await interaction.followup.send(text)
+
+        @self._tree.command(
+            name="metrics",
+            description="Cross-trial metric summary; optional smoothing window",
+            guild=guild,
+        )
+        @app_commands.describe(
+            smooth="If > 0, mean of last N points instead of last value",
+        )
+        async def metrics_cmd(
+            interaction: discord.Interaction,
+            smooth: int = 0,
+        ) -> None:
+            await interaction.response.defer(thinking=True)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, cmd_mod.cmd_metrics, ws, smooth,
+            )
+            await interaction.followup.send(_codeblock(text))
+
+        @self._tree.command(
             name="tail",
             description="Last N lines of a trial's stderr log",
             guild=guild,
@@ -654,3 +795,14 @@ def _codeblock(text: str) -> str:
 @contextlib.asynccontextmanager
 async def _noop_async_cm():
     yield
+
+
+def _format_uptime(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{m}m {s}s"
+    h, rem = divmod(seconds, 3600)
+    m, _ = divmod(rem, 60)
+    return f"{h}h {m}m"

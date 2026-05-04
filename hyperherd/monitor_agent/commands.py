@@ -105,6 +105,114 @@ def cmd_stop_all(workspace: Path) -> str:
     return f"Stopped all live trials.\n{out}"
 
 
+# --- /metrics -------------------------------------------------------------
+
+def cmd_metrics(workspace: Path, smooth: int = 0) -> str:
+    """Cross-trial metric summary: for each non-ready trial and each
+    logged metric, the most recent value (or mean of last `smooth`
+    points if smooth>0). Renders as a vertical list — Discord's
+    pinned-message side panel can't render wide tables."""
+    if smooth < 0 or smooth > 1000:
+        return f"`smooth` must be 0..1000 (got {smooth})."
+    try:
+        from hyperherd import manifest
+        from hyperherd.logging import list_metric_streams, load_metric_stream
+    except Exception as e:
+        return f"Couldn't import: {e}"
+
+    try:
+        trials = manifest.load_manifest(str(workspace))
+    except Exception as e:
+        return f"Couldn't load manifest: {e}"
+
+    rows = []
+    metric_names = set()
+    for trial in trials:
+        status = trial.get("status", "?")
+        if status == "ready":
+            continue
+        idx = trial["index"]
+        metrics_for_trial: dict = {}
+        for name in list_metric_streams(str(workspace), idx):
+            stream = load_metric_stream(str(workspace), idx, name)
+            numeric = [
+                p["value"] for p in stream
+                if isinstance(p.get("value"), (int, float))
+            ]
+            if not numeric:
+                continue
+            if smooth > 0 and len(numeric) > 1:
+                tail = numeric[-smooth:]
+                v = sum(tail) / len(tail)
+            else:
+                v = numeric[-1]
+            metrics_for_trial[name] = v
+            metric_names.add(name)
+        rows.append({
+            "idx": idx,
+            "status": status,
+            "name": trial.get("experiment_name", ""),
+            "metrics": metrics_for_trial,
+        })
+
+    if not rows:
+        return "No trials yet (or none have been submitted)."
+    if not metric_names:
+        return f"{len(rows)} trial(s); none have logged streamed metrics."
+
+    sorted_metrics = sorted(metric_names)
+    suffix = (
+        " (smoothed: mean of last "
+        f"{smooth} points)" if smooth > 0 else " (last logged value)"
+    )
+    out = [f"Metric summary{suffix}:", ""]
+    for r in rows:
+        idx, status = r["idx"], r["status"]
+        nm = r["name"][:32]
+        out.append(f"  #{idx} ({status}) {nm}")
+        if not r["metrics"]:
+            out.append(f"      (no streamed metrics)")
+            continue
+        for m in sorted_metrics:
+            v = r["metrics"].get(m)
+            if v is None:
+                continue
+            # Format scientifically for very small/large, fixed otherwise.
+            if abs(v) > 0 and (abs(v) < 1e-3 or abs(v) >= 1e6):
+                out.append(f"      {m}: {v:.4g}")
+            else:
+                out.append(f"      {m}: {v:.6g}")
+    return "\n".join(out)
+
+
+# --- /prune ---------------------------------------------------------------
+
+def cmd_prune(workspace: Path, index: int, reason: str = "user-pruned via /prune") -> str:
+    """Prune one trial: scancel via `herd stop` + stamp manifest as
+    `pruned`. Distinct from `/cancel` — pruned trials are NOT
+    resubmitted by future `herd run` calls."""
+    proc = subprocess.run(
+        _RUNNABLE + ["stop", "-i", str(index), str(workspace)],
+        capture_output=True, text=True,
+    )
+    # Don't fail if stop returned nonzero — the trial might already
+    # be terminal in SLURM, in which case the "pruned" stamp still
+    # accomplishes the goal (no resubmit on next `herd run`).
+    stop_out = (proc.stdout or "").strip()
+    try:
+        from hyperherd import manifest
+        manifest.update_trial_status(str(workspace), index, "pruned")
+    except Exception as e:
+        return (
+            f"Cancelled trial {index} via SLURM, but couldn't stamp "
+            f"manifest as pruned: {e}\n{stop_out}"
+        )
+    return (
+        f"Pruned trial {index}. Reason: {reason}\n"
+        f"(Won't be resubmitted by future `herd run` calls.)\n{stop_out}"
+    )
+
+
 # --- /run -----------------------------------------------------------------
 
 def cmd_run(workspace: Path, index: int) -> str:
@@ -385,13 +493,15 @@ def cmd_help() -> str:
         "`/status` — current sweep totals + per-trial table\n"
         "`/stats` — timing and memory stats per trial\n"
         "`/params` — sweep config: parameters, grid shape, all trial combos\n"
+        "`/metrics [smooth]` — cross-trial metric summary; optional smoothing window (mean of last N points)\n"
         "`/info` — daemon metadata: workspace, phase, uptime, ticks, cost\n"
         "`/plan` — show the agent's `MONITOR_PLAN.md`\n"
         "`/run <index>` — submit (or resubmit) one trial\n"
         "`/run_all` — submit every ready trial\n"
-        "`/cancel <index>` — cancel one trial\n"
+        "`/cancel <index>` — cancel one trial (will be resubmitted on next `herd run`)\n"
         "`/cancel_all` — cancel every live trial\n"
-        "`/tail <index> [lines]` — last N lines of a trial's stderr (default 20)\n"
+        "`/prune <index> [reason]` — algorithmic kill, NOT resubmitted on `herd run`\n"
+        "`/tail <index> [lines]` — last N lines of a trial's logs (default 20)\n"
         "`/stop` — stop the monitor daemon entirely\n"
         "`/help` — this list\n"
         "\n"

@@ -267,6 +267,58 @@ async def prune_index(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @tool(
+    "summarize_metrics",
+    "Summarize the optimization state in one call: for each non-ready "
+    "trial and each logged metric, the most recent value (or the mean "
+    "of the last `smooth` points if smooth>0). Useful when the user "
+    "asks 'how is the sweep doing?' or you need a cross-trial view. "
+    "Cheaper than calling list_metrics+compute_metric per trial. "
+    "Returns {smooth, metric_names: [...], trials: [{index, name, "
+    "status, metrics: {<metric>: <value>}}]}.",
+    {"smooth": int},
+)
+async def summarize_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
+    smooth = int(args.get("smooth") or 0)
+    workspace = str(_CTX["workspace"])
+    from hyperherd import manifest as _manifest
+    from hyperherd.logging import list_metric_streams, load_metric_stream
+
+    trials = _manifest.load_manifest(workspace)
+    out_trials = []
+    metric_names = set()
+    for trial in trials:
+        status = trial.get("status", "?")
+        if status == "ready":
+            continue
+        idx = trial["index"]
+        metrics_for_trial: Dict[str, float] = {}
+        for name in list_metric_streams(workspace, idx):
+            stream = load_metric_stream(workspace, idx, name)
+            numeric = [p["value"] for p in stream
+                       if isinstance(p.get("value"), (int, float))]
+            if not numeric:
+                continue
+            if smooth > 0 and len(numeric) > 1:
+                tail = numeric[-smooth:]
+                metrics_for_trial[name] = sum(tail) / len(tail)
+            else:
+                metrics_for_trial[name] = numeric[-1]
+            metric_names.add(name)
+        out_trials.append({
+            "index": idx,
+            "name": trial.get("experiment_name", ""),
+            "status": status,
+            "metrics": metrics_for_trial,
+        })
+
+    return _text_response({
+        "smooth": smooth,
+        "metric_names": sorted(metric_names),
+        "trials": out_trials,
+    })
+
+
+@tool(
     "list_metrics",
     "List every metric name recorded for a trial, with `n` (logged "
     "points), `step_first`, `step_last`, and `last` (most recent "
@@ -725,6 +777,7 @@ ALL = [
     bump_mem, bump_time,
     run_indices, stop_index, stop_all, prune_index,
     validate_config, tail_log, list_metrics, compute_metric,
+    summarize_metrics,
     msg, tick_summary, schedule_next, halt,
 ]
 """All in-process tools, in the order they're registered with the SDK's

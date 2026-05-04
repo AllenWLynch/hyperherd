@@ -4,6 +4,7 @@ These are pure functions over a workspace; we mock the `herd` subprocess
 calls and exercise output formatting directly.
 """
 
+import json
 import shutil
 import tempfile
 import unittest
@@ -259,8 +260,92 @@ class TestHelp(unittest.TestCase):
         text = cmd_mod.cmd_help()
         for keyword in ("/status", "/stats", "/params", "/info", "/plan",
                         "/run", "/run_all", "/cancel", "/cancel_all",
+                        "/prune", "/metrics",
                         "/tail", "/stop", "/help"):
             self.assertIn(keyword, text)
+
+
+class TestCmdMetrics(unittest.TestCase):
+    """`/metrics [smooth]` cross-trial summary."""
+
+    def setUp(self):
+        from hyperherd import manifest
+        self.tmp = tempfile.mkdtemp()
+        self.workspace = Path(self.tmp)
+        manifest.init_workspace(self.tmp)
+        # Hand-write a 3-trial manifest in mixed states.
+        manifest_path = self.workspace / ".hyperherd" / "manifest.json"
+        manifest_path.write_text(json.dumps([
+            {"index": 0, "status": "running", "params": {"lr": 0.001},
+             "experiment_name": "lr-0.001"},
+            {"index": 1, "status": "completed", "params": {"lr": 0.01},
+             "experiment_name": "lr-0.01"},
+            {"index": 2, "status": "ready", "params": {"lr": 0.1},
+             "experiment_name": "lr-0.1"},
+        ]))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _seed_stream(self, idx, name, values_with_steps):
+        d = self.workspace / ".hyperherd" / "results" / str(idx) / "stream"
+        d.mkdir(parents=True, exist_ok=True)
+        # Match the path scheme nested names use.
+        rel = name + ".jsonl"
+        p = d / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            for step, v in values_with_steps:
+                f.write(json.dumps({"step": step, "value": v, "ts": 0.0}) + "\n")
+
+    def test_renders_each_running_or_terminal_trial(self):
+        self._seed_stream(0, "val_loss", [(0, 0.9), (10, 0.7), (20, 0.5)])
+        self._seed_stream(1, "val_loss", [(0, 0.8), (10, 0.4)])
+        text = cmd_mod.cmd_metrics(self.workspace)
+        # Both running and completed trials show; ready ones don't.
+        self.assertIn("#0", text)
+        self.assertIn("#1", text)
+        self.assertNotIn("#2", text)
+        self.assertIn("val_loss", text)
+
+    def test_smoothing_uses_mean_of_last_n(self):
+        self._seed_stream(0, "val_loss", [(0, 1.0), (10, 0.5), (20, 0.0)])
+        # smooth=2 → mean of [0.5, 0.0] = 0.25
+        text = cmd_mod.cmd_metrics(self.workspace, smooth=2)
+        self.assertIn("0.25", text)
+        self.assertIn("smoothed", text)
+
+    def test_no_streams_returns_friendly_msg(self):
+        text = cmd_mod.cmd_metrics(self.workspace)
+        # No streams seeded — every non-ready trial has no metrics.
+        self.assertIn("none have logged streamed metrics", text)
+
+
+class TestCmdPrune(unittest.TestCase):
+    def setUp(self):
+        from hyperherd import manifest
+        self.tmp = tempfile.mkdtemp()
+        self.workspace = Path(self.tmp)
+        manifest.init_workspace(self.tmp)
+        (self.workspace / ".hyperherd" / "manifest.json").write_text(json.dumps([
+            {"index": 0, "status": "running", "params": {"lr": 0.001},
+             "experiment_name": "lr-0.001"},
+        ]))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_stamps_pruned_after_stop(self):
+        from hyperherd import manifest
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout="cancelled\n")):
+            text = cmd_mod.cmd_prune(self.workspace, index=0,
+                                     reason="bad initialization")
+        self.assertIn("Pruned trial 0", text)
+        self.assertIn("bad initialization", text)
+        # Manifest entry is now `pruned`.
+        trials = manifest.load_manifest(self.tmp)
+        self.assertEqual(trials[0]["status"], "pruned")
 
 
 if __name__ == "__main__":
