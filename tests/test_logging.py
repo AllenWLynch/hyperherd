@@ -87,6 +87,71 @@ class TestLogResult(unittest.TestCase):
         log_result("test_acc", 0.9)
         self.assertEqual(list_metric_streams(self.tmpdir, 3), [])
 
+    # --- slash-nested metric names ------------------------------------
+
+    def test_slash_metric_writes_nested_file(self):
+        """Lightning-style names like 'train/loss' are stored at the
+        matching nested path under stream/."""
+        log_result("train/loss", 0.5, step=0)
+
+        nested = os.path.join(
+            self.tmpdir, ".hyperherd", "results", "3",
+            "stream", "train", "loss.jsonl",
+        )
+        self.assertTrue(os.path.isfile(nested),
+                        f"expected nested stream at {nested}")
+
+    def test_slash_metric_round_trips_through_load(self):
+        log_result("train/loss", 0.5, step=0)
+        log_result("train/loss", 0.4, step=100)
+        log_result("val/loss", 0.6, step=0)
+
+        train = load_metric_stream(self.tmpdir, 3, "train/loss")
+        self.assertEqual(len(train), 2)
+        self.assertEqual(train[1]["value"], 0.4)
+
+        val = load_metric_stream(self.tmpdir, 3, "val/loss")
+        self.assertEqual(len(val), 1)
+
+    def test_list_metric_streams_recurses_with_slashes(self):
+        """Nested streams appear in the list with slashes preserved
+        (POSIX style regardless of host OS)."""
+        log_result("train/loss", 0.5, step=0)
+        log_result("train/acc", 0.9, step=0)
+        log_result("val/loss", 0.4, step=0)
+        log_result("flat_metric", 0.1, step=0)
+
+        names = list_metric_streams(self.tmpdir, 3)
+        self.assertEqual(
+            set(names),
+            {"train/loss", "train/acc", "val/loss", "flat_metric"},
+        )
+
+    def test_double_slash_paths_round_trip(self):
+        """Multi-level nesting (a/b/c) works too."""
+        log_result("system/gpu/memory", 1024, step=0)
+        stream = load_metric_stream(self.tmpdir, 3, "system/gpu/memory")
+        self.assertEqual(len(stream), 1)
+        self.assertEqual(stream[0]["value"], 1024)
+        self.assertIn("system/gpu/memory", list_metric_streams(self.tmpdir, 3))
+
+    def test_rejects_dotdot_traversal(self):
+        with self.assertRaises(ValueError):
+            log_result("../escape", 0.0, step=0)
+        with self.assertRaises(ValueError):
+            log_result("ok/../escape", 0.0, step=0)
+
+    def test_rejects_absolute_path(self):
+        with self.assertRaises(ValueError):
+            log_result("/etc/passwd", 0.0, step=0)
+
+    def test_rejects_dotdot_with_backslash_separator(self):
+        # Even though we use '/', a malicious user might try '..\foo' on a
+        # Windows-style host. The validator normalizes '\' → '/' before
+        # checking for '..' components.
+        with self.assertRaises(ValueError):
+            log_result("ok\\..\\escape", 0.0, step=0)
+
 
 class TestLoadAllResults(unittest.TestCase):
     def setUp(self):
