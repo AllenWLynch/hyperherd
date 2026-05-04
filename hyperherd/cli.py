@@ -530,6 +530,9 @@ def cmd_tail(args):
         print("No workspace found. Run 'hyperherd launch' first.", file=sys.stderr)
         return 1
 
+    if args.index is None:
+        print("Error: trial index required (e.g. `herd tail 3`).", file=sys.stderr)
+        return 1
     index = args.index
     lines = args.lines
     log_dir = manifest.logs_path(config.workspace)
@@ -654,7 +657,7 @@ def cmd_test(args):
 
     trials = manifest.load_manifest(config.workspace)
 
-    index = args.index
+    index = args.index if args.index is not None else 0
     if index < 0 or index >= len(trials):
         print(f"Trial index {index} out of range (0-{len(trials) - 1}).", file=sys.stderr)
         return 1
@@ -1496,7 +1499,9 @@ def main():
         help="Run a single trial locally via the launcher (no SLURM)",
     )
     p_test.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
-    p_test.add_argument("index", nargs="?", type=int, default=0, help="Trial index to run (default: 0)")
+    # Default is None (not 0) so the smart-positional fallback in
+    # main() can recognize an omitted index. cmd_test treats None as 0.
+    p_test.add_argument("index", nargs="?", type=int, default=None, help="Trial index to run (default: 0)")
     p_test.add_argument(
         "--cfg-job",
         action="store_true",
@@ -1510,7 +1515,10 @@ def main():
     # tail
     p_tail = subparsers.add_parser("tail", help="Print last N lines of a trial's log", parents=[json_parent])
     p_tail.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
-    p_tail.add_argument("index", type=int, help="Trial index to tail")
+    # Default is None (not required) so the smart-positional fallback in
+    # main() can move a bare `herd tail 5` from workspace→index. We
+    # check for None inside cmd_tail and error there if it's truly missing.
+    p_tail.add_argument("index", nargs="?", type=int, default=None, help="Trial index to tail")
     p_tail.add_argument("-n", "--lines", type=int, default=20, help="Number of lines to show (default: 20)")
     p_tail_streams = p_tail.add_mutually_exclusive_group()
     p_tail_streams.add_argument(
