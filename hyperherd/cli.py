@@ -157,6 +157,9 @@ def _filter_trials_by_pins(trials, pins):
 
 def cmd_launch(args):
     """Launch (or re-launch) a hyperparameter sweep as a SLURM job array."""
+    # Apply `.env` BEFORE load_config so any `${VAR}` interpolation in
+    # the YAML can resolve from values in the file.
+    _apply_workspace_env(args.workspace)
     config = load_config(args.workspace)
     json_mode = getattr(args, "json_output", False)
 
@@ -626,6 +629,9 @@ def cmd_test(args):
     """
     import subprocess
 
+    # Apply `.env` so the trainer sees the same secrets it would under
+    # `herd run` / `herd monitor` (WANDB_API_KEY, etc.).
+    _apply_workspace_env(args.workspace)
     config = load_config(args.workspace)
 
     try:
@@ -957,6 +963,25 @@ def _load_workspace_env(workspace: str) -> Dict[str, str]:
     return loaded
 
 
+def _apply_workspace_env(workspace: str) -> Dict[str, str]:
+    """Apply `<workspace>/.env` to os.environ and log what was loaded.
+
+    Shared by `herd run`, `herd test`, and `herd monitor` so the same
+    `.env` controls every entry point that touches the workspace
+    (trainer-side secrets like WANDB_API_KEY, daemon-side ones like
+    DISCORD_BOT_TOKEN). The log goes to stderr so it doesn't corrupt
+    `--json` stdout.
+    """
+    loaded = _load_workspace_env(workspace)
+    if loaded:
+        keys = ", ".join(sorted(loaded.keys()))
+        print(
+            f"Loaded {len(loaded)} env var(s) from {workspace}/.env: {keys}",
+            file=sys.stderr,
+        )
+    return loaded
+
+
 def _monitor_preflight(workspace: str) -> bool:
     """Print a startup checklist to stderr and hard-fail on
     configured-but-broken cases. Returns False if the daemon should not
@@ -1084,12 +1109,8 @@ def cmd_monitor(args):
     # Auto-load <workspace>/.env BEFORE the preflight so a token
     # configured in the file is visible to the preflight's check.
     # CLI-prefixed env vars (`FOO=bar herd monitor`) still win because
-    # `_load_workspace_env` only fills in keys not already set.
-    loaded = _load_workspace_env(workspace)
-    if loaded:
-        keys = ", ".join(sorted(loaded.keys()))
-        print(f"Loaded {len(loaded)} env var(s) from {workspace}/.env: "
-              f"{keys}", file=sys.stderr)
+    # the loader only fills in keys not already set.
+    _apply_workspace_env(workspace)
 
     # Live paths only — preflight the env so misconfigurations fail
     # before the daemon spends API tokens or sits silently with no
