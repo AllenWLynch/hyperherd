@@ -267,6 +267,43 @@ async def prune_index(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @tool(
+    "list_metrics",
+    "List every metric name recorded for a trial, with `n` (logged "
+    "points), `step_first`, `step_last`, and `last` (most recent "
+    "value). Returns `{index, metrics: [...]}`. Use this for discovery "
+    "— call once per sweep to learn what names the trainer is using "
+    "(`val/loss` vs `val_loss`, `train/acc` vs `train_acc`, etc.) "
+    "before reaching for `compute_metric`. Cache the result in the "
+    "plan (e.g. `Available metrics: [val/loss, train/loss, ...]`) so "
+    "future ticks don't re-discover.",
+    {"index": int},
+)
+async def list_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
+    from hyperherd.logging import list_metric_streams, load_metric_stream
+    index = int(args["index"])
+    workspace = str(_CTX["workspace"])
+    names = list_metric_streams(workspace, index)
+    if not names:
+        return _text_response({"index": index, "metrics": []})
+    out = []
+    for name in names:
+        stream = load_metric_stream(workspace, index, name)
+        if not stream:
+            out.append({"name": name, "n": 0})
+            continue
+        first = stream[0]
+        last = stream[-1]
+        out.append({
+            "name": name,
+            "n": len(stream),
+            "step_first": first.get("step"),
+            "step_last": last.get("step"),
+            "last": last.get("value"),
+        })
+    return _text_response({"index": index, "metrics": out})
+
+
+@tool(
     "validate_config",
     "Run `herd test --cfg-job <workspace> <index>` to preflight a "
     "trial's resolved config without spending SLURM time. Hydra-"
@@ -687,7 +724,7 @@ ALL = [
     read_state, read_plan, write_plan,
     bump_mem, bump_time,
     run_indices, stop_index, stop_all, prune_index,
-    validate_config, tail_log, compute_metric,
+    validate_config, tail_log, list_metrics, compute_metric,
     msg, tick_summary, schedule_next, halt,
 ]
 """All in-process tools, in the order they're registered with the SDK's

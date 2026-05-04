@@ -129,6 +129,58 @@ class TestComputeMetric(unittest.TestCase):
         self.assertIn("note", out)
 
 
+class TestListMetrics(unittest.TestCase):
+    """`list_metrics(idx)` discovers what the trainer is logging without
+    requiring the agent to know names in advance."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        manifest.init_workspace(self.tmp)
+        tools_mod.set_context(
+            workspace=Path(self.tmp),
+            sweep_name="t",
+            last_state_json="{}",
+        )
+        os.environ["HYPERHERD_WORKSPACE"] = self.tmp
+        os.environ["HYPERHERD_TRIAL_ID"] = "5"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+        os.environ.pop("HYPERHERD_WORKSPACE", None)
+        os.environ.pop("HYPERHERD_TRIAL_ID", None)
+
+    def _run(self, **args):
+        result = asyncio.run(tools_mod.list_metrics.handler(args))
+        return json.loads(result["content"][0]["text"])
+
+    def test_empty_when_nothing_logged(self):
+        out = self._run(index=99)
+        self.assertEqual(out, {"index": 99, "metrics": []})
+
+    def test_lists_each_metric_with_count_and_last(self):
+        log_result("val/loss", 0.9, step=0)
+        log_result("val/loss", 0.5, step=100)
+        log_result("val/loss", 0.3, step=200)
+        log_result("train/loss", 0.7, step=10)
+        log_result("test_acc", 0.88)  # final-summary mode, not streamed
+
+        out = self._run(index=5)
+        self.assertEqual(out["index"], 5)
+        names = {m["name"]: m for m in out["metrics"]}
+        # Final-summary metrics don't appear (no stream file).
+        self.assertEqual(set(names.keys()), {"val/loss", "train/loss"})
+
+        v = names["val/loss"]
+        self.assertEqual(v["n"], 3)
+        self.assertEqual(v["step_first"], 0)
+        self.assertEqual(v["step_last"], 200)
+        self.assertEqual(v["last"], 0.3)
+
+        t = names["train/loss"]
+        self.assertEqual(t["n"], 1)
+        self.assertEqual(t["step_first"], 10)
+
+
 class TestPrunedStatus(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

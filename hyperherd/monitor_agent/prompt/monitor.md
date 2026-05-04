@@ -41,6 +41,7 @@ The full per-tick state document is **already in this user message** — totals,
 - `prune_index(index, reason)` → algorithmic kill (NaN/inf or sustained-divergence). Status becomes `pruned`, distinct from `cancelled` — `herd run` will NOT resubmit pruned trials. Reason is recorded; use this for any metric-based decision to terminate a trial early.
 - `validate_config(index)` → Hydra-only preflight. Runs `herd test --cfg-job` (loads the trainer, prints resolved config, exits) so config errors crash here instead of after waiting in the SLURM queue. Returns `{valid, returncode, stdout_tail, stderr_tail}`. Use as a canary preflight when the user said yes to the Hydra interview question.
 - `tail_log(index, lines, stream)` → last N lines of a trial's logs. `stream` is `"both"` (default — labeled .out + .err sections, the right choice for canary verification since frameworks split training output across both inconsistently), `"stderr"`, or `"stdout"`. Pattern-match for training evidence (loss values, step/iteration/epoch counters) or stack traces.
+- `list_metrics(index)` → discovery: returns every metric name recorded for the trial with `n` (logged points), `step_first`, `step_last`, and `last`. Call once per sweep to learn the trainer's naming convention (`val/loss` vs `val_loss`, etc.) and cache the result in the plan as `Available metrics:`. Don't call repeatedly — the plan is the cache.
 - `compute_metric(index, metric, *, last_n=, step_min=, step_max=, since_seconds=)` → aggregate a logged metric stream. Each metric is its own file. Returns `{n, n_total, last, mean, median, stddev, min, max, has_nan_or_inf, recent[], step_first, step_last}`. Optional windowing args narrow the result (last N points / step interval / last N seconds). Cheap — use freely instead of fetching raw history.
 - `tick_summary(text)` → the obligatory once-per-tick heartbeat. **NOT** recorded in chat history.
 - `msg(text)` → real conversation: replies, alerts, questions. **Recorded** in chat history.
@@ -107,6 +108,7 @@ Greenfield / Hot-reload final shape:
 - Bumped: []                        # failure classes auto-bumped this sweep
 - Warned indices: []
 - Pruned: []                        # trials algorithmically killed, with reasons
+- Available metrics: []             # populated from list_metrics(0) once the canary trains
 - Custom rules: []                  # user-imposed gates; see "Custom rules" below
 ```
 
@@ -142,6 +144,8 @@ If neither is true:
 - **If `state.trials[idx].elapsed_seconds < 1800`** (under 30 min) AND `tail_log` shows *some* recent output (not blank, not just one setup line): trial is in setup. Leave Phase as-is, wait for the next tick.
 - **If `elapsed_seconds >= 1800` with no training evidence**: halt with `halt("canary stuck in setup for 30 min — check trainer setup")`.
 - **If status is `failed` / `cancelled`**: halt with `halt("canary failed before any training")`.
+
+**Once the canary advances**, call `list_metrics(0)` once to discover what the trainer actually logs. Cache the result in the plan as `Available metrics: [val/loss, train/loss, ...]`. Subsequent ticks then use those exact names with `compute_metric` instead of guessing — the trainer might use `val/loss` (Lightning convention with slashes) or `val_loss` (legacy underscored), and the plan note keeps you from churning through both.
 
 The 30-min threshold is generous — most trials show their first log line in seconds and their first metric within a few minutes. If your trainer routinely takes longer than 30 min to reach the first training step, raise this in the plan: write a `Canary timeout: <minutes>` line and use it.
 
