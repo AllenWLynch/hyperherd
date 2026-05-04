@@ -249,6 +249,11 @@ class DiscordConfig(BaseModel):
     """Override the sweep-derived channel name. Discord lowercases it
     automatically; non [a-z0-9-] chars get stripped."""
 
+    dashboard_refresh_seconds: int = 60
+    """How often the daemon edits the live-dashboard message. Set to 0
+    to disable the dashboard (you'll still have the periodic 🐾
+    heartbeat posts and the slash commands)."""
+
 
 class McpServerConfig(BaseModel):
     """One external MCP server, wired into the agent's tool surface.

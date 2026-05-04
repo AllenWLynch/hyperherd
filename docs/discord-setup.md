@@ -30,6 +30,7 @@ guild ID in each sweep's `hyperherd.yaml`.
     - Read Message History
     - Add Reactions  *(for the 👀 ack on inbound messages)*
     - Manage Channels  *(for auto-creating a channel per sweep)*
+    - Manage Messages  *(for pinning the live dashboard message — optional; without it the dashboard still updates in place, just isn't pinned to the top)*
 4. Copy the generated URL, paste it in your browser, pick the server, and
    authorize.
 
@@ -83,6 +84,12 @@ tick from the agent, and starts listening for your replies in that channel.
 ## What you'll see
 
 - A new text channel appears (e.g. `#mnist-sweep`) the first time you run.
+- A pinned 📊 **live dashboard** message appears at the top of the channel
+  and updates in place every minute with current totals, daemon
+  metadata, and the per-trial table — so you don't have to keep typing
+  `/status`. Disable with `discord.dashboard_refresh_seconds: 0` in
+  `hyperherd.yaml`. If the bot lacks `Manage Messages` permission, the
+  dashboard still updates in place, it just isn't pinned to the top.
 - Each tick, the agent posts a summary message. You can reply at any
   time — the bot adds a 👀 reaction to your message immediately so you
   know it was received, and the daemon wakes to run a `user_message`

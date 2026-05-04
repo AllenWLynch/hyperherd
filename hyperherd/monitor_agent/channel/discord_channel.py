@@ -111,6 +111,7 @@ class DiscordChannel(MessageChannel):
         workspace: Path,
         channel_id: Optional[int] = None,
         channel_name: Optional[str] = None,
+        dashboard_refresh_seconds: int = 60,
     ):
         self._token = token
         self._guild_id = guild_id
@@ -118,9 +119,12 @@ class DiscordChannel(MessageChannel):
         self._workspace = Path(workspace)
         self._explicit_channel_id = channel_id
         self._explicit_channel_name = channel_name
+        self._dashboard_refresh = int(dashboard_refresh_seconds)
         self._client = None  # type: ignore[assignment]
         self._tree = None
         self._client_task: Optional[asyncio.Task] = None
+        self._dashboard_task: Optional[asyncio.Task] = None
+        self._dashboard_msg = None
         self._channel = None
         self._on_inbound: Optional[InboundHandler] = None
         self._on_stop: Optional[StopHandler] = None
@@ -195,7 +199,22 @@ class DiscordChannel(MessageChannel):
                 f"Discord client exited before becoming ready: {exc}"
             )
 
+        # Channel is connected and ready. Start the live-dashboard task —
+        # one self-editing message that takes the place of the user
+        # repeatedly typing /status. Disabled with refresh_seconds=0.
+        if self._dashboard_refresh > 0:
+            self._dashboard_task = asyncio.create_task(
+                self._dashboard_loop(), name="discord-dashboard",
+            )
+
     async def stop(self) -> None:
+        if self._dashboard_task is not None:
+            self._dashboard_task.cancel()
+            try:
+                await self._dashboard_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._dashboard_task = None
         if self._client is not None and not self._client.is_closed():
             await self._client.close()
         if self._client_task is not None:
@@ -205,6 +224,7 @@ class DiscordChannel(MessageChannel):
                 log.debug("Discord client task ended: %s", e)
         self._client = None
         self._channel = None
+        self._dashboard_msg = None
 
     async def post(self, body: str) -> None:
         if self._channel is None:
@@ -214,6 +234,88 @@ class DiscordChannel(MessageChannel):
             await self._channel.send(body)
         except Exception as e:
             log.warning("Failed to post to Discord: %s", e)
+
+    # --- live dashboard --------------------------------------------------
+
+    async def _dashboard_loop(self) -> None:
+        """Maintain a single self-editing 'live status' message in the
+        channel so users don't have to keep typing `/status`. Best-effort
+        on every front: a single failure to edit / pin / build never
+        kills the loop, since the rest of the daemon is more important."""
+        # Initial post + best-effort pin.
+        try:
+            self._dashboard_msg = await self._channel.send(
+                "📊 _loading dashboard…_"
+            )
+        except Exception as e:
+            log.warning("Could not post initial dashboard: %s", e)
+            return
+        try:
+            await self._dashboard_msg.pin(reason="HyperHerd live dashboard")
+        except Exception as e:
+            # Most likely Forbidden — bot lacks Manage Messages. The
+            # dashboard still works unpinned; users can pin manually.
+            log.info(
+                "Couldn't pin the dashboard (%s); it'll still update in "
+                "place. Add the 'Manage Messages' permission to the bot "
+                "if you want it pinned automatically.",
+                type(e).__name__,
+            )
+
+        while True:
+            try:
+                await asyncio.sleep(self._dashboard_refresh)
+            except asyncio.CancelledError:
+                return
+            try:
+                content = self._build_dashboard_content()
+            except Exception as e:
+                log.warning("Dashboard content build failed: %s", e)
+                continue
+            try:
+                await self._dashboard_msg.edit(content=content)
+            except Exception as e:
+                # Could be NotFound (user deleted the message) or any
+                # other transient glitch. Try to recreate; if THAT
+                # fails, just keep going and try again next cycle.
+                log.info("Dashboard edit failed (%s); reposting.",
+                         type(e).__name__)
+                try:
+                    self._dashboard_msg = await self._channel.send(content)
+                    try:
+                        await self._dashboard_msg.pin(
+                            reason="HyperHerd live dashboard"
+                        )
+                    except Exception:
+                        pass
+                except Exception as e2:
+                    log.warning("Dashboard repost also failed: %s", e2)
+
+    def _build_dashboard_content(self) -> str:
+        """Assemble the dashboard body: status table + daemon metadata.
+        Reuses the same `commands.cmd_status` / `cmd_info` paths the
+        slash commands use, plus runtime stats from the daemon's
+        info_handler if registered."""
+        status_text = cmd_mod.cmd_status(self._workspace)
+        info_kwargs = self._on_info() if self._on_info is not None else {}
+        info_text = cmd_mod.cmd_info(self._workspace, **info_kwargs)
+
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        header = f"📊 **{self._sweep_name}** · live dashboard · {now}"
+
+        body = f"{header}\n{_codeblock(info_text)}\n{_codeblock(status_text)}"
+        # Discord caps messages at 2000 chars. _codeblock truncates each
+        # block individually; if the combined body is still too long we
+        # trim the status block (info is more important — it's the
+        # 'is the daemon alive' digest).
+        MAX = 1990
+        if len(body) > MAX:
+            body = (
+                f"{header}\n{_codeblock(info_text)}\n"
+                f"_(status table omitted — {len(status_text)} chars)_"
+            )
+        return body
 
     # --- inbound: only mentions/replies reach the agent ------------------
 

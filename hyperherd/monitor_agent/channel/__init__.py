@@ -175,4 +175,5 @@ def build_channel(
             int(discord_cfg.channel_id) if discord_cfg.channel_id else None
         ),
         channel_name=discord_cfg.channel_name,
+        dashboard_refresh_seconds=int(discord_cfg.dashboard_refresh_seconds),
     )
