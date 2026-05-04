@@ -711,6 +711,87 @@ def cmd_clean(args):
     return 0
 
 
+def _monitor_preflight(workspace: str) -> bool:
+    """Print a startup checklist to stderr and hard-fail on
+    configured-but-broken cases. Returns False if the daemon should not
+    start.
+
+    The intent is to bark loudly when the user has wired something up
+    in `hyperherd.yaml` but the matching env var or extras aren't in
+    place — silent fall-through to "no Discord, no chat surface" is
+    almost never what they wanted."""
+    try:
+        config = load_config(workspace)
+    except Exception as e:
+        print(f"Could not load config: {e}", file=sys.stderr)
+        return False
+
+    print("herd monitor — startup check:", file=sys.stderr)
+
+    # Auth: env-var or subscription OAuth — both work, just informational.
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        print("  [✓] ANTHROPIC_API_KEY set (API console billing)",
+              file=sys.stderr)
+    else:
+        print("  [·] ANTHROPIC_API_KEY unset — falling back to "
+              "claude /login subscription credentials",
+              file=sys.stderr)
+
+    # Discord: configured-but-broken is a hard fail.
+    fatal = []
+    if config.discord.guild_id:
+        if os.environ.get("DISCORD_BOT_TOKEN"):
+            print(f"  [✓] Discord channel configured "
+                  f"(guild_id={config.discord.guild_id})", file=sys.stderr)
+        else:
+            print(f"  [✗] Discord guild_id is set in hyperherd.yaml "
+                  f"but DISCORD_BOT_TOKEN is not in the environment.",
+                  file=sys.stderr)
+            print(f"      Either:", file=sys.stderr)
+            print(f"        export DISCORD_BOT_TOKEN=...   "
+                  f"(or `source .env`)", file=sys.stderr)
+            print(f"        OR remove the `discord:` block from "
+                  f"hyperherd.yaml.", file=sys.stderr)
+            fatal.append("missing DISCORD_BOT_TOKEN")
+    else:
+        print("  [·] No `discord:` block in hyperherd.yaml — daemon "
+              "will run with no chat surface.", file=sys.stderr)
+
+    # External MCP servers: list them; warn (not fatal) on env-var refs
+    # that don't resolve, since the agent can still get useful work
+    # done without one MCP among many.
+    if config.mcp_servers:
+        for server in config.mcp_servers:
+            unresolved = [
+                k for k, v in server.env.items()
+                if "${" in v and not _expand_env_check(v)
+            ]
+            if unresolved:
+                print(f"  [!] MCP server '{server.name}' references "
+                      f"unset env var(s): {', '.join(unresolved)}",
+                      file=sys.stderr)
+            else:
+                print(f"  [✓] MCP server: {server.name}", file=sys.stderr)
+
+    if fatal:
+        print(f"\nRefusing to start: {'; '.join(fatal)}.", file=sys.stderr)
+        return False
+
+    print("", file=sys.stderr)  # blank line before the loop's logs
+    return True
+
+
+def _expand_env_check(value: str) -> bool:
+    """Return True if every `${VAR}` reference in `value` resolves to a
+    non-empty env var. Used for the preflight check, not the actual
+    expansion path."""
+    import re
+    for match in re.finditer(r"\$\{([A-Z_][A-Z0-9_]*)\}", value):
+        if not os.environ.get(match.group(1)):
+            return False
+    return True
+
+
 def cmd_monitor(args):
     """Run the autonomous monitor daemon.
 
@@ -753,6 +834,12 @@ def cmd_monitor(args):
         print("=== User message (the per-tick turn) ===")
         print(result["user_message"])
         return 0
+
+    # Live paths only — preflight the env so misconfigurations fail
+    # before the daemon spends API tokens or sits silently with no
+    # chat surface.
+    if not _monitor_preflight(workspace):
+        return 1
 
     if args.once:
         from hyperherd.monitor_agent import tick as tick_mod
