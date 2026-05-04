@@ -40,6 +40,20 @@ discord:
   guild_id: "1234567890123456789"
 ```
 
+### Per-workspace `.env` (recommended)
+
+Drop a `.env` file in each workspace directory for tokens, experiment tags, and any other env vars the trial code or daemon needs. The daemon reads it on startup and applies any keys not already set in the shell:
+
+```bash
+# my_workspace/.env
+DISCORD_BOT_TOKEN=...
+ANTHROPIC_API_KEY=sk-ant-...
+WANDB_API_KEY=...
+EXPERIMENT=1b_production
+```
+
+Then just `herd monitor my_workspace` — no `source .env` step needed. CLI prefixes (`FOO=bar herd monitor ...`) still take precedence, so you can override per-launch when debugging. Add `.env` to `.gitignore` if your workspace is tracked.
+
 ## Run
 
 From your sweep workspace:

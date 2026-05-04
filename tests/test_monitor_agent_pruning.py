@@ -183,5 +183,58 @@ class TestMcpEnvExpansion(unittest.TestCase):
         self.assertEqual(out["X"], "")
 
 
+class TestWorkspaceEnvLoad(unittest.TestCase):
+    """`<workspace>/.env` auto-load. Per-workspace pattern for pinning
+    env vars without retyping or leaking into committed YAML."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        for k in ("HH_TEST_FOO", "HH_TEST_BAR", "HH_TEST_QUX"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+        for k in ("HH_TEST_FOO", "HH_TEST_BAR", "HH_TEST_QUX"):
+            os.environ.pop(k, None)
+
+    def _write_env(self, content):
+        with open(os.path.join(self.tmp, ".env"), "w") as f:
+            f.write(content)
+
+    def test_loads_simple_pairs(self):
+        from hyperherd.cli import _load_workspace_env
+        self._write_env("HH_TEST_FOO=foo\nHH_TEST_BAR=bar\n")
+        loaded = _load_workspace_env(self.tmp)
+        self.assertEqual(loaded, {"HH_TEST_FOO": "foo", "HH_TEST_BAR": "bar"})
+        self.assertEqual(os.environ["HH_TEST_FOO"], "foo")
+
+    def test_strips_export_prefix_and_quotes(self):
+        from hyperherd.cli import _load_workspace_env
+        self._write_env(
+            'export HH_TEST_FOO="value with spaces"\n'
+            "HH_TEST_BAR='single-quoted'\n"
+            "# comment line\n"
+            "\n"  # blank line
+        )
+        _load_workspace_env(self.tmp)
+        self.assertEqual(os.environ["HH_TEST_FOO"], "value with spaces")
+        self.assertEqual(os.environ["HH_TEST_BAR"], "single-quoted")
+
+    def test_existing_env_wins(self):
+        from hyperherd.cli import _load_workspace_env
+        os.environ["HH_TEST_FOO"] = "from-shell"
+        self._write_env("HH_TEST_FOO=from-file\nHH_TEST_BAR=only-in-file\n")
+        loaded = _load_workspace_env(self.tmp)
+        # FOO was preset → stays "from-shell"; only BAR loads.
+        self.assertEqual(os.environ["HH_TEST_FOO"], "from-shell")
+        self.assertEqual(os.environ["HH_TEST_BAR"], "only-in-file")
+        self.assertEqual(loaded, {"HH_TEST_BAR": "only-in-file"})
+
+    def test_no_file_returns_empty(self):
+        from hyperherd.cli import _load_workspace_env
+        loaded = _load_workspace_env(self.tmp)
+        self.assertEqual(loaded, {})
+
+
 if __name__ == "__main__":
     unittest.main()

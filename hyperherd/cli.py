@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+from typing import Dict
 
 from hyperherd import agent_output
 from hyperherd.config import ConfigError, load_config
@@ -711,6 +712,56 @@ def cmd_clean(args):
     return 0
 
 
+def _load_workspace_env(workspace: str) -> Dict[str, str]:
+    """If `<workspace>/.env` exists, read it and apply to `os.environ` —
+    but **only** for keys not already set (so `FOO=bar herd monitor`
+    still overrides a `FOO=baz` line in the file).
+
+    Per-workspace `.env` files are how users pin sweep-specific env
+    vars (DISCORD_BOT_TOKEN, ANTHROPIC_API_KEY, EXPERIMENT, WANDB_*,
+    cluster module settings, etc.) without retyping them on every
+    daemon launch and without leaking them into committed YAML.
+
+    Format:
+
+        # comments are skipped
+        FOO=bar
+        export QUX=quux        # leading `export ` stripped
+        TOKEN="value with spaces"   # matched quotes stripped
+
+    Returns the dict of keys actually applied (for the startup log).
+    Values are NOT echoed — they're often secrets.
+    """
+    path = os.path.join(workspace, ".env")
+    if not os.path.isfile(path):
+        return {}
+    loaded: Dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                k, sep, v = line.partition("=")
+                if not sep:
+                    continue  # malformed line; skip silently
+                k = k.strip()
+                v = v.strip()
+                if (
+                    (v.startswith('"') and v.endswith('"'))
+                    or (v.startswith("'") and v.endswith("'"))
+                ):
+                    v = v[1:-1]
+                if k and k not in os.environ:
+                    os.environ[k] = v
+                    loaded[k] = v
+    except OSError as e:
+        print(f"Warning: couldn't read {path}: {e}", file=sys.stderr)
+    return loaded
+
+
 def _monitor_preflight(workspace: str) -> bool:
     """Print a startup checklist to stderr and hard-fail on
     configured-but-broken cases. Returns False if the daemon should not
@@ -834,6 +885,16 @@ def cmd_monitor(args):
         print("=== User message (the per-tick turn) ===")
         print(result["user_message"])
         return 0
+
+    # Auto-load <workspace>/.env BEFORE the preflight so a token
+    # configured in the file is visible to the preflight's check.
+    # CLI-prefixed env vars (`FOO=bar herd monitor`) still win because
+    # `_load_workspace_env` only fills in keys not already set.
+    loaded = _load_workspace_env(workspace)
+    if loaded:
+        keys = ", ".join(sorted(loaded.keys()))
+        print(f"Loaded {len(loaded)} env var(s) from {workspace}/.env: "
+              f"{keys}", file=sys.stderr)
 
     # Live paths only — preflight the env so misconfigurations fail
     # before the daemon spends API tokens or sits silently with no

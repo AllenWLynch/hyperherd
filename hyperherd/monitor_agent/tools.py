@@ -267,6 +267,57 @@ async def prune_index(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @tool(
+    "validate_config",
+    "Run `herd test --cfg-job <workspace> <index>` to preflight a "
+    "trial's resolved config without spending SLURM time. Hydra-"
+    "specific: appends `--cfg job` to the override string so a Hydra "
+    "trainer prints the resolved config and exits. Catches missing "
+    "required fields, type mismatches, unknown parameter names, and "
+    "launcher-level errors (missing container, bad conda env). Use as "
+    "a canary preflight when the user said `yes` to the Hydra interview "
+    "question. Returns {valid, returncode, stdout_tail, stderr_tail}.",
+    {"index": int},
+)
+async def validate_config(args: Dict[str, Any]) -> Dict[str, Any]:
+    index = int(args["index"])
+    workspace = str(_CTX["workspace"])
+    proc = await asyncio.create_subprocess_exec(
+        "herd", "test", "--cfg-job", workspace, str(index),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    out = (stdout or b"").decode("utf-8", errors="replace")
+    err = (stderr or b"").decode("utf-8", errors="replace")
+    ok = proc.returncode == 0
+    _audit("validate_config", index=index, valid=ok, returncode=proc.returncode)
+    return _text_response({
+        "valid": ok,
+        "returncode": proc.returncode,
+        "stdout_tail": out[-2000:],
+        "stderr_tail": err[-2000:],
+    })
+
+
+@tool(
+    "tail_log",
+    "Read the last N lines of a trial's stderr log "
+    "(`.hyperherd/logs/<index>.err`). Returns plain text — pattern-match "
+    "for training evidence (loss values, step/iteration/epoch counters, "
+    "framework startup messages) when verifying a canary, or for stack "
+    "traces when triaging a failure. Default lines=40, max 1000.",
+    {"index": int, "lines": int},
+)
+async def tail_log(args: Dict[str, Any]) -> Dict[str, Any]:
+    from hyperherd.monitor_agent import commands as _cmd
+    index = int(args["index"])
+    lines = int(args.get("lines") or 40)
+    text = _cmd.cmd_tail(Path(_CTX["workspace"]), index, lines)
+    _audit("tail_log", index=index, lines=lines)
+    return _text_response(text)
+
+
+@tool(
     "compute_metric",
     "Aggregate a logged metric over a trial's stream. Reads "
     "`.hyperherd/results/<index>/stream/<metric>.jsonl` (written by "
@@ -631,7 +682,7 @@ ALL = [
     read_state, read_plan, write_plan,
     bump_mem, bump_time,
     run_indices, stop_index, stop_all, prune_index,
-    compute_metric,
+    validate_config, tail_log, compute_metric,
     msg, tick_summary, schedule_next, halt,
 ]
 """All in-process tools, in the order they're registered with the SDK's
