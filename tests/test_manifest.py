@@ -262,5 +262,65 @@ class TestWorkspaceExists(unittest.TestCase):
         self.assertTrue(manifest.workspace_exists(self.tmpdir))
 
 
+class TestAtomicWrites(unittest.TestCase):
+    """Hammer concurrent readers + writers to verify a reader never sees
+    an empty/partial manifest. Before the atomic-rename fix, the
+    `open("w")` truncate window would surface as `JSONDecodeError`
+    every few seconds in production."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        manifest.init_workspace(self.tmpdir)
+        # Seed with 50 trials so writes have nontrivial content.
+        big = [{"lr": 0.001 * i, "opt": "adam"} for i in range(50)]
+        manifest.create_manifest(self.tmpdir, big)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_concurrent_reads_never_see_partial_writes(self):
+        import threading
+
+        stop = threading.Event()
+        bad_reads = []
+
+        def writer():
+            i = 0
+            while not stop.is_set():
+                manifest.update_trial_status(self.tmpdir, i % 50, "running")
+                i += 1
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    trials = manifest.load_manifest(self.tmpdir)
+                    if len(trials) != 50:
+                        bad_reads.append(("len", len(trials)))
+                except json.JSONDecodeError as e:
+                    bad_reads.append(("json", str(e)))
+                except OSError as e:
+                    bad_reads.append(("os", str(e)))
+
+        threads = [
+            threading.Thread(target=writer),
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+        ]
+        for t in threads:
+            t.start()
+        # Run for a brief window — long enough to reproduce the
+        # truncate-then-write race that the old code hit reliably.
+        import time
+        time.sleep(0.5)
+        stop.set()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(
+            bad_reads, [],
+            f"saw {len(bad_reads)} partial reads: {bad_reads[:3]}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -240,8 +240,21 @@ def drop_trials(base: str, indices: List[int]) -> List[dict]:
 
 
 def _write_manifest(base: str, trials: List[dict]) -> None:
-    with open(manifest_path(base), "w") as f:
+    """Atomically write the manifest. The previous `open("w")` path
+    truncated the destination before any bytes were written, so any
+    concurrent reader (the SLURM poller's `herd snapshot`, the
+    dashboard's `cmd_status`, the agent's `state.compute`) saw an
+    empty file and crashed on `json.load`. Write to a sibling temp
+    file in the same directory and `os.replace` — the rename is
+    atomic on POSIX, so readers always see either the old contents
+    or the new contents, never an in-between."""
+    target = manifest_path(base)
+    tmp = target + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(trials, f, indent=2, default=_json_default)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, target)
 
 
 def _json_default(obj):
@@ -307,8 +320,13 @@ def _load_job_ids(base: str) -> List[dict]:
 
 
 def _write_job_ids(base: str, records: List[dict]) -> None:
-    with open(job_ids_path(base), "w") as f:
+    target = job_ids_path(base)
+    tmp = target + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(records, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, target)
 
 
 # --- Hydra override resolution ---
