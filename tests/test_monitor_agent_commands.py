@@ -59,6 +59,85 @@ class TestStatus(unittest.TestCase):
         self.assertIn("fresh", out)
         self.assertIn("no trials yet", out)
 
+    def test_active_first_sort(self):
+        # 4 trials in mixed status; running should appear before
+        # completed even though running has a higher index.
+        trials_json = (
+            '{"sweep_name": "s", "totals": {"total": 4}, '
+            '"trials": ['
+            '{"index": 0, "status": "completed", "experiment_name": "old-1"},'
+            '{"index": 1, "status": "completed", "experiment_name": "old-2"},'
+            '{"index": 2, "status": "failed", "experiment_name": "broken"},'
+            '{"index": 3, "status": "running", "experiment_name": "live"}'
+            ']}'
+        )
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout=trials_json)):
+            out = cmd_mod.cmd_status(Path("/tmp/anything"))
+        # Running rendered before failed, failed before completed.
+        self.assertLess(out.index("live"), out.index("broken"))
+        self.assertLess(out.index("broken"), out.index("old-1"))
+
+    def test_truncates_long_table_with_footer(self):
+        n = 60  # > _STATUS_TRIAL_CAP (35)
+        trials = [
+            f'{{"index": {i}, "status": "completed", '
+            f'"experiment_name": "trial-{i}"}}'
+            for i in range(n)
+        ]
+        snapshot_json = (
+            '{"sweep_name": "big", "totals": '
+            f'{{"total": {n}, "completed": {n}}}, '
+            '"trials": [' + ",".join(trials) + ']}'
+        )
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout=snapshot_json)):
+            out = cmd_mod.cmd_status(Path("/tmp/anything"))
+        # Footer mentions remainder.
+        self.assertIn(f"and {n - 35} more", out)
+        # Header (`big — ...`) still at the top.
+        self.assertTrue(out.startswith("big"))
+
+
+class TestRunning(unittest.TestCase):
+    def test_filters_to_active_only(self):
+        trials_json = (
+            '{"sweep_name": "s", '
+            '"totals": {"total": 4, "running": 1, "completed": 2, "failed": 1}, '
+            '"trials": ['
+            '{"index": 0, "status": "completed", "experiment_name": "done"},'
+            '{"index": 1, "status": "failed", "experiment_name": "broke"},'
+            '{"index": 2, "status": "running", "experiment_name": "live"},'
+            '{"index": 3, "status": "queued", "experiment_name": "soon"}'
+            ']}'
+        )
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout=trials_json)):
+            out = cmd_mod.cmd_running(Path("/tmp/anything"))
+        # Active trials present.
+        self.assertIn("live", out)
+        self.assertIn("soon", out)
+        # Inactive ones absent from the table body.
+        self.assertNotIn("done", out)
+        self.assertNotIn("broke", out)
+        # Header still includes totals so the user sees the bigger picture.
+        self.assertIn("running", out)
+        self.assertIn("4 total", out)
+
+    def test_no_active_returns_empty_message(self):
+        snapshot_json = (
+            '{"sweep_name": "s", '
+            '"totals": {"total": 2, "completed": 2}, '
+            '"trials": ['
+            '{"index": 0, "status": "completed", "experiment_name": "a"},'
+            '{"index": 1, "status": "completed", "experiment_name": "b"}'
+            ']}'
+        )
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout=snapshot_json)):
+            out = cmd_mod.cmd_running(Path("/tmp/anything"))
+        self.assertIn("No active trials", out)
+
 
 class TestStop(unittest.TestCase):
     def test_stop_one_returns_confirmation(self):

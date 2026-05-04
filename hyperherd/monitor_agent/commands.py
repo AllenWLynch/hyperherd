@@ -24,6 +24,34 @@ _RUNNABLE = [sys.executable, "-m", "hyperherd.cli"]
 
 # --- /status --------------------------------------------------------------
 
+# How interesting is each status, smaller = more important. Used to
+# sort the per-trial table so when Discord truncates a long status post
+# the user loses the boring tail (completeds, readys) instead of the
+# things they actually care about.
+_STATUS_PRIORITY = {
+    "running":   0,
+    "queued":    1,
+    "submitted": 2,
+    "failed":    3,
+    "pruned":    4,
+    "cancelled": 5,
+    "completed": 6,
+    "ready":     7,
+}
+
+# Statuses considered "active" by /running — i.e. work that hasn't
+# settled into a terminal state.
+_ACTIVE_STATUSES = ("running", "queued", "submitted")
+
+
+def trial_sort_key(trial: dict) -> tuple:
+    """Sort by status-priority then index — active trials first, then
+    problems, then completed, then never-ran. Index breaks ties so the
+    order is deterministic within each status bucket."""
+    status = (trial.get("status") or "").lower()
+    return (_STATUS_PRIORITY.get(status, 99), trial.get("index", 0))
+
+
 def cmd_status(workspace: Path) -> str:
     """Show sweep totals + per-trial table. Backed by `herd snapshot`."""
     try:
@@ -42,7 +70,33 @@ def cmd_status(workspace: Path) -> str:
     return _format_status(snap)
 
 
-def _format_status(snap: dict) -> str:
+def cmd_running(workspace: Path) -> str:
+    """Show only active trials (running + queued + submitted). Use
+    when /status is too long to fit in a Discord message."""
+    try:
+        proc = subprocess.run(
+            _RUNNABLE + ["snapshot", str(workspace)],
+            capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        return f"`herd snapshot` failed (exit {e.returncode}):\n{e.stderr or e.stdout}"
+
+    try:
+        snap = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return f"Unparseable snapshot output:\n{proc.stdout[:500]}"
+
+    return _format_status(snap, only_active=True)
+
+
+# Cap the trial table at this many rows so a sweep with hundreds of
+# completed trials doesn't overflow Discord's 2000-char message limit
+# (which would truncate the END of the message — exactly the spot
+# we'd otherwise rely on for the "everything is fine" footer).
+_STATUS_TRIAL_CAP = 35
+
+
+def _format_status(snap: dict, only_active: bool = False) -> str:
     name = snap.get("sweep_name", "?")
     totals = snap.get("totals") or {}
     trials = snap.get("trials") or []
@@ -54,8 +108,22 @@ def _format_status(snap: dict) -> str:
     ) or "(no trials yet)"
     counts += f" ({totals.get('total', len(trials))} total)"
 
+    title = f"{name} — {counts}"
+    if only_active:
+        trials = [t for t in trials if (t.get("status") or "").lower() in _ACTIVE_STATUSES]
+        title += "\n(showing active trials only — `/status` for the full table)"
+
     if not trials:
-        return f"{name} — {counts}"
+        if only_active:
+            return f"{title}\n\n_No active trials right now._"
+        return title
+
+    # Sort active-first so a Discord truncation loses the boring tail.
+    trials = sorted(trials, key=trial_sort_key)
+    truncated = 0
+    if not only_active and len(trials) > _STATUS_TRIAL_CAP:
+        truncated = len(trials) - _STATUS_TRIAL_CAP
+        trials = trials[:_STATUS_TRIAL_CAP]
 
     rows = [("idx", "status", "elapsed", "name")]
     for t in trials:
@@ -74,7 +142,14 @@ def _format_status(snap: dict) -> str:
     for r in rows[1:]:
         lines.append(" ".join(c.ljust(w) for c, w in zip(r, widths)))
 
-    return f"{name} — {counts}\n\n" + "\n".join(lines)
+    body = f"{title}\n\n" + "\n".join(lines)
+    if truncated:
+        body += (
+            f"\n... and {truncated} more (sorted active-first; "
+            f"use `/running` for active only or `herd status` "
+            f"on the cluster for the full list)"
+        )
+    return body
 
 
 # --- /stop ----------------------------------------------------------------
@@ -490,7 +565,8 @@ def cmd_help() -> str:
     """List of available slash commands."""
     return (
         "**HerdDog commands**\n"
-        "`/status` — current sweep totals + per-trial table\n"
+        "`/status` — current sweep totals + per-trial table (active-first; capped at 35)\n"
+        "`/running` — active trials only (running + queued + submitted)\n"
         "`/stats` — timing and memory stats per trial\n"
         "`/params` — sweep config: parameters, grid shape, all trial combos\n"
         "`/metrics [smooth]` — cross-trial metric summary; optional smoothing window (mean of last N points)\n"

@@ -469,8 +469,12 @@ class DiscordChannel(MessageChannel):
         if trials:
             lines.append("")
             lines.append("**Trials**")
+            # Active-first so the dashboard's CAP loses boring trials
+            # (completed/ready) when there are many, not the running
+            # ones the user is actually watching.
+            sorted_trials = sorted(trials, key=cmd_mod.trial_sort_key)
             CAP = 25  # keep room for the rest of the message body
-            for t in trials[:CAP]:
+            for t in sorted_trials[:CAP]:
                 idx = t.get("index", "?")
                 status = t.get("status", "?")
                 ic = emoji.get(status, "·")
@@ -486,8 +490,11 @@ class DiscordChannel(MessageChannel):
                     last = (t.get("last_log_line") or "").strip()[:24]
                     tail = f" · {last}" if last else ""
                 lines.append(f"{ic} #{idx} `{name}`{tail}")
-            if len(trials) > CAP:
-                lines.append(f"_… and {len(trials) - CAP} more (use `/status`)_")
+            if len(sorted_trials) > CAP:
+                lines.append(
+                    f"_… and {len(sorted_trials) - CAP} more "
+                    f"(use `/running` or `/status`)_"
+                )
 
         body = "\n".join(lines)
         if len(body) > 1990:
@@ -619,6 +626,18 @@ class DiscordChannel(MessageChannel):
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_status, ws,
+            )
+            await interaction.followup.send(_codeblock(text))
+
+        @self._tree.command(
+            name="running",
+            description="Active trials only (running, queued, submitted)",
+            guild=guild,
+        )
+        async def running_cmd(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(thinking=True)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, cmd_mod.cmd_running, ws,
             )
             await interaction.followup.send(_codeblock(text))
 
