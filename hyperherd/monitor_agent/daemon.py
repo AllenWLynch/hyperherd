@@ -202,6 +202,9 @@ async def run_daemon(
     trigger = "boot"
     halted = False
     halt_reason: Optional[str] = None
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 5
+    FAILURE_COOLDOWN_SECONDS = 60
 
     try:
         while not shutdown.is_set():
@@ -212,8 +215,51 @@ async def run_daemon(
                 channel.thinking() if channel is not None
                 else _noop_thinking_cm()
             )
-            async with thinking_cm:
-                result = await run_tick(workspace, trigger=trigger, channel=channel)
+            try:
+                async with thinking_cm:
+                    result = await run_tick(
+                        workspace, trigger=trigger, channel=channel,
+                    )
+                consecutive_failures = 0
+            except Exception as e:
+                # Tick blew up (SDK error, max_turns exceeded, network blip,
+                # etc.). Don't kill the daemon — log, alert the user,
+                # cooldown briefly, retry. Halt only after several
+                # consecutive failures, since that suggests a real problem
+                # we can't recover from automatically.
+                consecutive_failures += 1
+                log.exception(
+                    "Tick %d raised (consecutive failures: %d): %s",
+                    ticks + 1, consecutive_failures, e,
+                )
+                if channel is not None:
+                    try:
+                        await channel.post(
+                            f"⚠️ Tick failed: {type(e).__name__}: {e}. "
+                            f"Retrying in {FAILURE_COOLDOWN_SECONDS}s "
+                            f"(consecutive failures: {consecutive_failures}/"
+                            f"{MAX_CONSECUTIVE_FAILURES})."
+                        )
+                    except Exception:
+                        pass
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    halted = True
+                    halt_reason = (
+                        f"halting after {MAX_CONSECUTIVE_FAILURES} "
+                        f"consecutive tick failures — check daemon log"
+                    )
+                    break
+                # Cooldown — but interruptible by shutdown signal.
+                try:
+                    await asyncio.wait_for(
+                        shutdown.wait(),
+                        timeout=FAILURE_COOLDOWN_SECONDS,
+                    )
+                    break  # shutdown fired during cooldown
+                except asyncio.TimeoutError:
+                    pass
+                trigger = "scheduled"
+                continue
             ticks += 1
             total_cost += result.cost_usd
             runtime_stats["ticks"] = ticks

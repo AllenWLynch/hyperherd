@@ -71,7 +71,7 @@ def dry_run(workspace: Path, trigger: state_mod.TickTrigger = "scheduled") -> di
 async def run_tick(
     workspace: Path,
     trigger: state_mod.TickTrigger = "scheduled",
-    *, max_turns: int = 8,
+    *, max_turns: int = 16,
     channel=None,
 ) -> TickResult:
     """Live tick: assemble → configure SDK → run → return.
