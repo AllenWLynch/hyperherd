@@ -13,6 +13,7 @@ registration UI (slash command tree, etc.) and call into these handlers.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,11 @@ from typing import Optional
 
 
 _RUNNABLE = [sys.executable, "-m", "hyperherd.cli"]
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mK]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 # --- /status --------------------------------------------------------------
@@ -162,8 +168,8 @@ def cmd_stop(workspace: Path, index: int) -> str:
             capture_output=True, text=True, check=True,
         )
     except subprocess.CalledProcessError as e:
-        return f"`herd stop -i {index}` failed: {e.stderr or e.stdout}"
-    out = (proc.stdout or "").strip() or "(no output)"
+        return f"`herd stop -i {index}` failed: {_strip_ansi(e.stderr or e.stdout)}"
+    out = _strip_ansi(proc.stdout or "").strip() or "(no output)"
     return f"Stopped trial {index}.\n{out}"
 
 
@@ -175,8 +181,8 @@ def cmd_stop_all(workspace: Path) -> str:
             capture_output=True, text=True, check=True,
         )
     except subprocess.CalledProcessError as e:
-        return f"`herd stop --all` failed: {e.stderr or e.stdout}"
-    out = (proc.stdout or "").strip() or "(no output)"
+        return f"`herd stop --all` failed: {_strip_ansi(e.stderr or e.stdout)}"
+    out = _strip_ansi(proc.stdout or "").strip() or "(no output)"
     return f"Stopped all live trials.\n{out}"
 
 
@@ -273,7 +279,7 @@ def cmd_prune(workspace: Path, index: int, reason: str = "user-pruned via /prune
     # Don't fail if stop returned nonzero — the trial might already
     # be terminal in SLURM, in which case the "pruned" stamp still
     # accomplishes the goal (no resubmit on next `herd run`).
-    stop_out = (proc.stdout or "").strip()
+    stop_out = _strip_ansi(proc.stdout or "").strip()
     try:
         from hyperherd import manifest
         manifest.update_trial_status(str(workspace), index, "pruned")
@@ -297,8 +303,8 @@ def cmd_run(workspace: Path, index: int) -> str:
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        return f"`herd run -i {index}` failed: {proc.stderr or proc.stdout}"
-    out = (proc.stdout or "").strip() or "(no output)"
+        return f"`herd run -i {index}` failed: {_strip_ansi(proc.stderr or proc.stdout)}"
+    out = _strip_ansi(proc.stdout or "").strip() or "(no output)"
     return f"Submitted trial {index}.\n{out}"
 
 
@@ -309,8 +315,8 @@ def cmd_run_all(workspace: Path) -> str:
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        return f"`herd run` failed: {proc.stderr or proc.stdout}"
-    out = (proc.stdout or "").strip() or "(no output)"
+        return f"`herd run` failed: {_strip_ansi(proc.stderr or proc.stdout)}"
+    out = _strip_ansi(proc.stdout or "").strip() or "(no output)"
     return f"Submitted all ready trials.\n{out}"
 
 
@@ -481,10 +487,7 @@ def cmd_stats(workspace: Path) -> str:
     )
     if proc.returncode != 0:
         return f"`herd stats` failed: {proc.stderr or proc.stdout}"
-    # Strip ANSI color codes from terminal output — Discord doesn't render them.
-    import re as _re
-    cleaned = _re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout)
-    return cleaned.rstrip() or "(no stats yet)"
+    return _strip_ansi(proc.stdout).rstrip() or "(no stats yet)"
 
 
 # --- /params --------------------------------------------------------------
