@@ -322,8 +322,22 @@ def _parse_array_range(spec: str) -> List[int]:
     return indices
 
 
+def query_squeue_live(job_ids: List[str]) -> Dict[Tuple[str, int], str]:
+    """Return the set of array tasks currently in the SLURM queue.
+
+    Calls `squeue -j <job_ids>` and returns a dict of
+    (job_id, array_index) → SLURM state string (e.g. 'PENDING', 'RUNNING').
+    Jobs that have left the queue (completed, failed, cancelled) are absent
+    from the result. Returns {} if squeue is unavailable or times out."""
+    return _query_squeue(job_ids)
+
+
 def _query_squeue(job_ids: List[str]) -> Dict[Tuple[str, int], str]:
-    """Fallback: query squeue for running/pending jobs."""
+    """Internal: query squeue for running/pending jobs.
+
+    Raises `FileNotFoundError` if squeue is not on PATH (no SLURM).
+    Returns {} on timeout or non-zero exit (squeue available but no
+    matching jobs or other transient error)."""
     job_spec = ",".join(job_ids)
     statuses: Dict[Tuple[str, int], str] = {}
     try:
@@ -340,6 +354,7 @@ def _query_squeue(job_ids: List[str]) -> Dict[Tuple[str, int], str]:
         )
     except subprocess.TimeoutExpired:
         return statuses
+    # FileNotFoundError (squeue not on PATH) propagates to caller.
 
     if result.returncode != 0:
         return statuses

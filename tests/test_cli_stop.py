@@ -186,32 +186,80 @@ class TestSyncStickyCancelled(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
 
-    def test_cancelled_status_resists_pending_sacct_row(self):
+    def _sync(self, sacct_states, squeue_live=None):
+        """Helper: run _sync_slurm_status with mocked sacct and squeue."""
         from hyperherd.cli import _sync_slurm_status
-        # Post-cancel: idx 0 was cancelled, sacct still reports the
-        # array as PENDING (scancel issued but accounting lagging).
-        manifest.bulk_update_status(self.tmpdir, {0: "cancelled", 1: "queued"})
-        with mock.patch(
-            "hyperherd.cli.slurm.query_job_status",
-            return_value={("12345", 0): "PENDING", ("12345", 1): "PENDING"},
+        # squeue_live=None → squeue unavailable (FileNotFoundError);
+        # squeue_live={} → squeue available but no matching jobs.
+        squeue_side = (
+            FileNotFoundError if squeue_live is None
+            else lambda _ids: squeue_live
+        )
+        with (
+            mock.patch(
+                "hyperherd.cli.slurm.query_job_status",
+                return_value=sacct_states,
+            ),
+            mock.patch(
+                "hyperherd.cli.slurm.query_squeue_live",
+                side_effect=squeue_side,
+            ),
         ):
             _sync_slurm_status(self.tmpdir)
+
+    def test_cancelled_status_resists_pending_sacct_row(self):
+        # Post-cancel: idx 0 was cancelled, sacct still reports the
+        # array as PENDING (scancel issued but accounting lagging).
+        # squeue still shows idx 1 as live.
+        manifest.bulk_update_status(self.tmpdir, {0: "cancelled", 1: "queued"})
+        self._sync(
+            sacct_states={("12345", 0): "PENDING", ("12345", 1): "PENDING"},
+            squeue_live={("12345", 1): "PENDING"},
+        )
         trials = manifest.load_manifest(self.tmpdir)
         by_idx = {t["index"]: t["status"] for t in trials}
-        self.assertEqual(by_idx[0], "cancelled")  # protected
+        self.assertEqual(by_idx[0], "cancelled")  # protected by sticky set
         self.assertEqual(by_idx[1], "queued")     # normal sync
 
     def test_cancelled_index_still_resubmittable(self):
         # End-to-end shape of the user's bug: cancel + sync (with sacct
         # lag) must leave idx 0 in `get_pending_indices`.
-        from hyperherd.cli import _sync_slurm_status
         manifest.bulk_update_status(self.tmpdir, {0: "cancelled", 1: "running"})
-        with mock.patch(
-            "hyperherd.cli.slurm.query_job_status",
-            return_value={("12345", 0): "PENDING", ("12345", 1): "RUNNING"},
-        ):
-            _sync_slurm_status(self.tmpdir)
+        self._sync(
+            sacct_states={("12345", 0): "PENDING", ("12345", 1): "RUNNING"},
+            squeue_live={("12345", 1): "RUNNING"},
+        )
         self.assertIn(0, manifest.get_pending_indices(self.tmpdir))
+
+    def test_manual_scancel_of_pending_job_becomes_cancelled(self):
+        # User runs `scancel <jid>_0` directly. squeue immediately removes
+        # the job; sacct still shows PENDING (lag). The cross-check must
+        # detect the absence from squeue and flip to "cancelled" so
+        # `herd run` can resubmit it.
+        manifest.bulk_update_status(self.tmpdir, {0: "queued", 1: "running"})
+        self._sync(
+            sacct_states={("12345", 0): "PENDING", ("12345", 1): "RUNNING"},
+            # idx 0 absent from squeue — scancel already processed
+            squeue_live={("12345", 1): "RUNNING"},
+        )
+        trials = manifest.load_manifest(self.tmpdir)
+        by_idx = {t["index"]: t["status"] for t in trials}
+        self.assertEqual(by_idx[0], "cancelled")
+        self.assertIn(0, manifest.get_pending_indices(self.tmpdir))
+
+    def test_squeue_unavailable_skips_cross_check(self):
+        # On machines without SLURM, squeue raises FileNotFoundError.
+        # The cross-check must be skipped — we can't mark jobs cancelled
+        # just because squeue is missing.
+        manifest.bulk_update_status(self.tmpdir, {0: "queued", 1: "queued"})
+        self._sync(
+            sacct_states={("12345", 0): "PENDING", ("12345", 1): "PENDING"},
+            squeue_live=None,  # squeue not on PATH
+        )
+        trials = manifest.load_manifest(self.tmpdir)
+        by_idx = {t["index"]: t["status"] for t in trials}
+        self.assertEqual(by_idx[0], "queued")   # unchanged — no cross-check
+        self.assertEqual(by_idx[1], "queued")
 
 
 if __name__ == "__main__":

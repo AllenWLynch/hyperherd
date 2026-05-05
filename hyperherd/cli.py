@@ -1411,6 +1411,46 @@ def _sync_slurm_status(workspace: str):
         our_status = state_map.get(slurm_state, slurm_state.lower())
         updates[array_idx] = our_status
 
+    # Cross-check with squeue: sacct has a lag after `scancel` — a job
+    # cancelled while PENDING disappears from squeue immediately, but sacct
+    # still shows PENDING for a while. Without this check, a manually
+    # cancelled trial stays "queued" in the manifest and can't be
+    # resubmitted until sacct eventually catches up.
+    #
+    # Rule: if a "submitted"/"queued" trial's latest job is absent from
+    # squeue AND sacct would leave it as "queued" (stale PENDING) or has
+    # no entry at all, the job has ended. Marking it "cancelled" lets
+    # `get_pending_indices` return it so `herd run` can resubmit it.
+    #
+    # We only apply this to trials that were never RUNNING (status
+    # "submitted"/"queued"), because a RUNNING job that got cancelled would
+    # already be transitioning in sacct (RUNNING → CANCELLED is faster).
+    try:
+        squeue_live = slurm.query_squeue_live(job_ids)
+    except FileNotFoundError:
+        squeue_live = None  # squeue not on PATH — skip cross-check
+    except Exception:
+        squeue_live = None
+
+    if squeue_live is not None:
+        for t in trials:
+            idx = t["index"]
+            if t.get("status") not in ("submitted", "queued"):
+                continue
+            if idx in sticky:
+                continue
+            jid = _latest_job_id_for(job_records, idx)
+            if jid is None:
+                continue
+            if (jid, idx) in squeue_live:
+                continue  # still live in squeue — trust sacct
+            # Job has left the queue. If sacct update would keep this
+            # trial "queued" (stale PENDING) or sacct has no entry, the
+            # job was cancelled before starting. Override to "cancelled".
+            effective = updates.get(idx, t.get("status"))
+            if effective in ("queued", "submitted"):
+                updates[idx] = "cancelled"
+
     manifest.bulk_update_status(workspace, updates)
 
 
