@@ -206,6 +206,8 @@ This is a multi-step walkthrough — fetch `https://allenwlynch.github.io/hyperh
 5. Copy the bot token → `DISCORD_BOT_TOKEN` env var
 6. Right-click the server → Copy Server ID → `discord.guild_id` in `hyperherd.yaml`
 
+If the user plans to run multiple sweeps in parallel, create one bot per workspace — Discord allows only one gateway connection per token, so two daemons sharing a token will kick each other off. The daemon's startup preflight detects this via a per-channel heartbeat marker and refuses to start. The marker is cleared on clean shutdown so a normal restart isn't blocked; pass `--force-discord` if a previous daemon was killed uncleanly and the stale heartbeat hasn't aged out yet (~18 min).
+
 ### Anthropic credentials
 
 Either:

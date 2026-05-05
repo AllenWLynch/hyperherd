@@ -1149,6 +1149,7 @@ def cmd_monitor(args):
                 workspace,
                 max_ticks=args.max_ticks,
                 agent_enabled=not args.no_agent,
+                force_token_conflict=args.force_discord,
             )
         )
     except RuntimeError as e:
@@ -1573,6 +1574,15 @@ def main():
             "alive but skip the agent loop entirely (no model calls, no "
             "token spend). Useful for very long sweeps where the daemon's "
             "transport surface is enough."
+        ),
+    )
+    p_monitor.add_argument(
+        "--force-discord", action="store_true",
+        help=(
+            "Bypass the same-token preflight that detects another daemon "
+            "running with the same DISCORD_BOT_TOKEN. Use this when a "
+            "previous daemon was killed uncleanly (kill -9, OOM) and its "
+            "stale heartbeat hasn't aged out yet."
         ),
     )
 

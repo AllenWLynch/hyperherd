@@ -86,6 +86,163 @@ class TestSweepToChannelName(unittest.TestCase):
         self.assertEqual(sweep_to_channel_name("!!!"), "hyperherd")
 
 
+class TestHeartbeatTopic(unittest.TestCase):
+    """Channel-topic heartbeat parser/stripper. Pure functions over
+    strings — easy to verify in isolation."""
+
+    def test_parse_returns_none_on_empty(self):
+        from hyperherd.monitor_agent.channel.discord_channel import (
+            _parse_heartbeat_topic,
+        )
+        self.assertIsNone(_parse_heartbeat_topic(""))
+        self.assertIsNone(_parse_heartbeat_topic(None or ""))
+        self.assertIsNone(_parse_heartbeat_topic("just a description"))
+
+    def test_parse_returns_datetime(self):
+        from hyperherd.monitor_agent.channel.discord_channel import (
+            _parse_heartbeat_topic,
+        )
+        topic = "Sweep foo [hyperherd-heartbeat: 2026-05-05T12:34:56Z]"
+        dt = _parse_heartbeat_topic(topic)
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2026)
+        self.assertEqual(dt.month, 5)
+        self.assertIsNotNone(dt.tzinfo)
+
+    def test_parse_tolerates_naive_iso(self):
+        from datetime import timezone
+        from hyperherd.monitor_agent.channel.discord_channel import (
+            _parse_heartbeat_topic,
+        )
+        dt = _parse_heartbeat_topic("[hyperherd-heartbeat: 2026-05-05T12:34:56]")
+        self.assertEqual(dt.tzinfo, timezone.utc)
+
+    def test_parse_returns_none_on_garbage(self):
+        from hyperherd.monitor_agent.channel.discord_channel import (
+            _parse_heartbeat_topic,
+        )
+        self.assertIsNone(_parse_heartbeat_topic("[hyperherd-heartbeat: nope]"))
+
+    def test_strip_leaves_user_text(self):
+        from hyperherd.monitor_agent.channel.discord_channel import (
+            _strip_heartbeat_marker,
+        )
+        out = _strip_heartbeat_marker(
+            "Sweep foo [hyperherd-heartbeat: 2026-05-05T12:34:56Z]"
+        )
+        self.assertEqual(out, "Sweep foo")
+
+    def test_strip_idempotent(self):
+        from hyperherd.monitor_agent.channel.discord_channel import (
+            _strip_heartbeat_marker,
+        )
+        s = "Sweep foo"
+        self.assertEqual(_strip_heartbeat_marker(s), s)
+
+
+class TestTokenConflictDetection(unittest.TestCase):
+    """Same-token preflight: refuse to start if any *other* channel in
+    the guild carries a fresh HyperHerd heartbeat marker in its topic.
+    Discord allows only one gateway connection per token."""
+
+    def _build(self, force=False):
+        from hyperherd.monitor_agent.channel.discord_channel import (
+            DiscordChannel,
+        )
+        return DiscordChannel(
+            token="x", guild_id=1, sweep_name="s",
+            workspace=Path("/tmp"),
+            dashboard_refresh_seconds=60,
+            force_token_conflict=force,
+        )
+
+    def _wire(self, ch, *, our_channel_id, channels):
+        """Attach fake client/channel/guild objects to a DiscordChannel."""
+        class _Ch:
+            def __init__(self, cid, name, topic):
+                self.id = cid
+                self.name = name
+                self.topic = topic
+
+        class _U:
+            id = 100  # our bot user id
+        class _Cl:
+            user = _U()
+        ch._client = _Cl()
+
+        text_channels = []
+        our_ch = None
+        for spec in channels:
+            cobj = _Ch(spec["id"], spec.get("name", f"c{spec['id']}"),
+                       spec.get("topic"))
+            text_channels.append(cobj)
+            if cobj.id == our_channel_id:
+                our_ch = cobj
+
+        class _G:
+            pass
+        guild = _G()
+        guild.text_channels = text_channels
+        our_ch.guild = guild  # type: ignore[attr-defined]
+        ch._channel = our_ch
+
+    def _fresh_marker(self, offset_seconds=-30):
+        from datetime import datetime, timedelta, timezone
+        ts = (datetime.now(timezone.utc)
+              + timedelta(seconds=offset_seconds)).strftime(
+                  "%Y-%m-%dT%H:%M:%SZ")
+        return f"[hyperherd-heartbeat: {ts}]"
+
+    def test_no_topics_no_conflict(self):
+        ch = self._build()
+        self._wire(ch, our_channel_id=1, channels=[
+            {"id": 1, "name": "ours", "topic": None},
+            {"id": 2, "name": "theirs", "topic": "just a description"},
+        ])
+        asyncio.run(ch._check_for_token_conflicts())  # must not raise
+
+    def test_recent_heartbeat_in_other_channel_raises(self):
+        ch = self._build()
+        topic = f"Their sweep {self._fresh_marker(-30)}"
+        self._wire(ch, our_channel_id=1, channels=[
+            {"id": 1, "name": "ours", "topic": None},
+            {"id": 2, "name": "theirs", "topic": topic},
+        ])
+        with self.assertRaises(RuntimeError) as cx:
+            asyncio.run(ch._check_for_token_conflicts())
+        self.assertIn("DISCORD_BOT_TOKEN", str(cx.exception))
+        self.assertIn("theirs", str(cx.exception))
+        self.assertIn("--force-discord", str(cx.exception))
+
+    def test_stale_heartbeat_does_not_raise(self):
+        ch = self._build()
+        # Heartbeat from 2 hours ago — well past 3× interval.
+        old_marker = self._fresh_marker(-7200)
+        self._wire(ch, our_channel_id=1, channels=[
+            {"id": 1, "name": "ours", "topic": None},
+            {"id": 2, "name": "theirs", "topic": f"old {old_marker}"},
+        ])
+        asyncio.run(ch._check_for_token_conflicts())  # too old, no raise
+
+    def test_heartbeat_in_our_channel_ignored(self):
+        ch = self._build()
+        marker = self._fresh_marker(-10)
+        self._wire(ch, our_channel_id=1, channels=[
+            {"id": 1, "name": "ours", "topic": f"ours {marker}"},
+            {"id": 2, "name": "theirs", "topic": None},
+        ])
+        asyncio.run(ch._check_for_token_conflicts())  # our own, no raise
+
+    def test_force_flag_bypasses_conflict(self):
+        ch = self._build(force=True)
+        topic = f"Their sweep {self._fresh_marker(-30)}"
+        self._wire(ch, our_channel_id=1, channels=[
+            {"id": 1, "name": "ours", "topic": None},
+            {"id": 2, "name": "theirs", "topic": topic},
+        ])
+        asyncio.run(ch._check_for_token_conflicts())  # force=True, no raise
+
+
 class TestInboxWriter(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

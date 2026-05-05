@@ -29,6 +29,17 @@ Setup steps the user does once per Discord server:
 
 Restart the daemon. It registers slash commands per-guild on first
 connect (instant; global sync would take an hour to propagate).
+
+One bot token per daemon: Discord enforces a single gateway connection
+per token, so two daemons sharing a token will keep kicking each other
+off. If you're running multiple sweeps in parallel, create one bot per
+sweep workspace and put each token in its own `.env`. The startup
+preflight (`_check_for_token_conflicts`) detects the same-token case
+by reading per-channel heartbeat markers (written by `_heartbeat_loop`
+into the channel's topic field) and refuses to start with an actionable
+error. On clean shutdown the marker is cleared so a quick restart
+isn't blocked. `--force-discord` bypasses the check after an unclean
+kill.
 """
 
 from __future__ import annotations
@@ -37,6 +48,7 @@ import asyncio
 import contextlib
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import AsyncContextManager, Optional
 
@@ -46,6 +58,49 @@ from hyperherd.monitor_agent.channel import (
 )
 
 log = logging.getLogger(__name__)
+
+# A single-token-per-bot signal stored in the channel's `topic` field.
+# Each running daemon refreshes the timestamp inside its own channel's
+# topic at HEARTBEAT_INTERVAL. Other daemons starting up later read
+# every text channel's topic in the guild — if any *other* channel has
+# a fresh heartbeat from this same bot identity, that's a same-token
+# conflict and we refuse to start.
+#
+# Discord rate-limits channel.edit() at 2 changes per 10 minutes, so
+# the heartbeat interval has to be ≥ 5 min. We use 6 min to leave
+# margin for retries.
+_HEARTBEAT_PREFIX = "[hyperherd-heartbeat: "
+_HEARTBEAT_SUFFIX = "]"
+_HEARTBEAT_INTERVAL = 360  # seconds — must satisfy Discord topic rate limit
+_HEARTBEAT_RE = re.compile(
+    re.escape(_HEARTBEAT_PREFIX) + r"([^\]]+)" + re.escape(_HEARTBEAT_SUFFIX)
+)
+
+
+def _parse_heartbeat_topic(topic: str) -> Optional[datetime]:
+    """Return the embedded heartbeat datetime if the topic carries a
+    parseable HyperHerd marker, else None. Tolerates surrounding text
+    so users can keep a human-readable channel description alongside."""
+    if not topic:
+        return None
+    m = _HEARTBEAT_RE.search(topic)
+    if not m:
+        return None
+    try:
+        dt = datetime.fromisoformat(m.group(1).strip())
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _strip_heartbeat_marker(topic: str) -> str:
+    """Remove any HyperHerd heartbeat marker from a topic string,
+    leaving the user-facing description intact."""
+    if not topic:
+        return ""
+    return _HEARTBEAT_RE.sub("", topic).rstrip()
 
 
 def sweep_to_channel_name(sweep_name: str) -> str:
@@ -112,6 +167,7 @@ class DiscordChannel(MessageChannel):
         channel_id: Optional[int] = None,
         channel_name: Optional[str] = None,
         dashboard_refresh_seconds: int = 60,
+        force_token_conflict: bool = False,
     ):
         self._token = token
         self._guild_id = guild_id
@@ -120,16 +176,19 @@ class DiscordChannel(MessageChannel):
         self._explicit_channel_id = channel_id
         self._explicit_channel_name = channel_name
         self._dashboard_refresh = int(dashboard_refresh_seconds)
+        self._force_token_conflict = bool(force_token_conflict)
         self._client = None  # type: ignore[assignment]
         self._tree = None
         self._client_task: Optional[asyncio.Task] = None
         self._dashboard_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self._dashboard_msg = None
         self._channel = None
         self._on_inbound: Optional[InboundHandler] = None
         self._on_stop: Optional[StopHandler] = None
         self._on_info: Optional[InfoHandler] = None
         self._ready = asyncio.Event()
+        self._setup_error: Optional[BaseException] = None
 
     def set_inbound_handler(self, handler: InboundHandler) -> None:
         self._on_inbound = handler
@@ -172,12 +231,16 @@ class DiscordChannel(MessageChannel):
             log.info("Discord connected as %s", self._client.user)
             try:
                 await self._resolve_or_create_channel()
+                await self._check_for_token_conflicts()
                 # Per-guild sync is instant; global sync takes ~1h.
                 await self._tree.sync(guild=discord.Object(id=self._guild_id))
                 log.info("Slash commands synced to guild %s", self._guild_id)
                 self._ready.set()
             except Exception as e:
                 log.error("Discord setup failed: %s", e)
+                # Stash so start() can surface the real cause to the
+                # daemon supervisor, instead of just "client exited".
+                self._setup_error = e
                 await self._client.close()
 
         @self._client.event
@@ -194,6 +257,8 @@ class DiscordChannel(MessageChannel):
         )
         if ready_task not in done:
             ready_task.cancel()
+            if self._setup_error is not None:
+                raise self._setup_error
             exc = self._client_task.exception() if self._client_task.done() else None
             raise RuntimeError(
                 f"Discord client exited before becoming ready: {exc}"
@@ -211,7 +276,25 @@ class DiscordChannel(MessageChannel):
                 self._dashboard_loop(), name="discord-dashboard",
             )
 
+        # Heartbeat marker in our channel's topic — read by other
+        # daemons' `_check_for_token_conflicts` to detect a same-token
+        # conflict on their startup.
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name="discord-heartbeat",
+        )
+
     async def stop(self) -> None:
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._heartbeat_task = None
+        # Best-effort: erase our heartbeat marker so a quick restart
+        # (or another daemon under the same token) doesn't trip the
+        # conflict check on a freshly-stopped daemon.
+        await self._clear_heartbeat_topic()
         if self._dashboard_task is not None:
             self._dashboard_task.cancel()
             try:
@@ -229,6 +312,24 @@ class DiscordChannel(MessageChannel):
         self._client = None
         self._channel = None
         self._dashboard_msg = None
+
+    async def _clear_heartbeat_topic(self) -> None:
+        """Strip the heartbeat marker from our channel's topic on
+        clean shutdown. Best-effort — failures degrade to "user must
+        wait out the heartbeat staleness window before restarting"."""
+        if self._channel is None:
+            return
+        try:
+            current = getattr(self._channel, "topic", None) or ""
+            stripped = _strip_heartbeat_marker(current)
+            if stripped == current:
+                return
+            await self._channel.edit(
+                topic=stripped or None,
+                reason="HyperHerd heartbeat clear (clean shutdown)",
+            )
+        except Exception as e:
+            log.debug("Couldn't clear heartbeat topic on shutdown: %s", e)
 
     async def post(self, body: str) -> None:
         if self._channel is None:
@@ -928,6 +1029,108 @@ class DiscordChannel(MessageChannel):
                 f"Failed to create channel #{target_name}. The bot likely "
                 f"lacks 'Manage Channels' permission. ({e})"
             )
+
+    async def _check_for_token_conflicts(self) -> None:
+        """Refuse to start if another daemon is already running with the
+        same DISCORD_BOT_TOKEN.
+
+        Discord allows only one gateway connection per bot token, so two
+        daemons sharing a token boot each other off in a flap loop.
+        Detect the case by reading every text channel's `topic` field
+        and looking for a HyperHerd heartbeat marker (set by
+        `_heartbeat_loop`) in any channel *other* than ours that's
+        within `_HEARTBEAT_INTERVAL × 3` of now. Topic is already
+        cached on the channel object — no extra API call.
+        """
+        if self._client is None or self._channel is None:
+            return
+        guild = self._channel.guild
+        if guild is None:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=_HEARTBEAT_INTERVAL * 3
+        )
+
+        conflicts: list[str] = []
+        for ch in guild.text_channels:
+            if ch.id == self._channel.id:
+                continue
+            ts = _parse_heartbeat_topic(getattr(ch, "topic", None) or "")
+            if ts is None or ts < cutoff:
+                continue
+            conflicts.append(f"#{ch.name}")
+
+        if not conflicts:
+            return
+        others = ", ".join(conflicts)
+        if self._force_token_conflict:
+            log.warning(
+                "Skipping same-token conflict check (--force-discord set): "
+                "fresh heartbeat present in %s. If the other daemon is still "
+                "running, both will keep kicking each other off the gateway.",
+                others,
+            )
+            return
+        raise RuntimeError(
+            f"Another HyperHerd daemon appears to be running with this "
+            f"DISCORD_BOT_TOKEN — fresh heartbeat found in {others}. "
+            f"Discord allows only one gateway connection per bot "
+            f"token, so two daemons sharing a token will keep "
+            f"kicking each other off.\n"
+            f"\n"
+            f"If you just stopped that daemon, either:\n"
+            f"  1. Wait ~{(_HEARTBEAT_INTERVAL * 3) // 60} minutes for "
+            f"the stale heartbeat to time out, or\n"
+            f"  2. Pass `--force-discord` to bypass this check now.\n"
+            f"\n"
+            f"For the long-term fix, create a second bot in the Discord "
+            f"Developer Portal "
+            f"(https://discord.com/developers/applications), invite it "
+            f"to your guild, and set DISCORD_BOT_TOKEN=<new_token> in "
+            f"this workspace's .env."
+        )
+
+    async def _heartbeat_loop(self) -> None:
+        """Refresh this daemon's heartbeat marker in our channel's
+        topic on a fixed cadence so other daemons starting later can
+        detect a same-token conflict via `_check_for_token_conflicts`.
+
+        Best-effort: failures (rate-limit, missing Manage Channels,
+        transient errors) are logged but never crash the daemon —
+        losing the heartbeat just degrades gracefully to no protection
+        for the next restart, which is no worse than not having the
+        feature at all."""
+        # Fire once immediately so a same-token daemon starting a few
+        # seconds after us still sees a marker on its conflict scan.
+        try:
+            await self._update_heartbeat_topic()
+        except Exception as e:
+            log.debug("Initial heartbeat write failed: %s", e)
+        while True:
+            try:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL)
+            except asyncio.CancelledError:
+                return
+            try:
+                await self._update_heartbeat_topic()
+            except Exception as e:
+                log.debug("Heartbeat write failed: %s", e)
+
+    async def _update_heartbeat_topic(self) -> None:
+        """Stamp the current UTC timestamp into our channel's topic,
+        preserving any user-facing description."""
+        if self._channel is None:
+            return
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        marker = f"{_HEARTBEAT_PREFIX}{now_iso}{_HEARTBEAT_SUFFIX}"
+        current = getattr(self._channel, "topic", None) or ""
+        base = _strip_heartbeat_marker(current)
+        if not base:
+            base = f"HyperHerd sweep: {self._sweep_name}"
+        new_topic = f"{base} {marker}"
+        if new_topic == current:
+            return
+        await self._channel.edit(topic=new_topic, reason="HyperHerd heartbeat")
 
 
 def _codeblock(text: str) -> str:

@@ -111,6 +111,7 @@ async def run_daemon(
     post_final: bool = True,
     agent_enabled: bool = True,
     passive_refresh_seconds: int = 60,
+    force_token_conflict: bool = False,
 ) -> DaemonResult:
     """Run ticks in a loop until the agent halts or a signal arrives.
 
@@ -133,7 +134,9 @@ async def run_daemon(
     # Build the chat channel from workspace config if the caller didn't
     # inject one. None = no channel; the daemon runs without inbox/post.
     if channel is None:
-        channel = _build_channel_from_config(workspace)
+        channel = _build_channel_from_config(
+            workspace, force_token_conflict=force_token_conflict,
+        )
 
     shutdown = asyncio.Event()
     event_q: asyncio.Queue = asyncio.Queue()
@@ -484,13 +487,20 @@ async def _wait_next_event(
     return "timeout"
 
 
-def _build_channel_from_config(workspace: Path) -> Optional[MessageChannel]:
+def _build_channel_from_config(
+    workspace: Path,
+    *,
+    force_token_conflict: bool = False,
+) -> Optional[MessageChannel]:
     """Load the workspace config and ask the channel factory whether one
     can be built. Returns None on any error so the daemon still runs."""
     try:
         from hyperherd.config import load_config
         config = load_config(str(workspace))
-        return build_channel(config, sweep_name=config.name, workspace=workspace)
+        return build_channel(
+            config, sweep_name=config.name, workspace=workspace,
+            force_token_conflict=force_token_conflict,
+        )
     except Exception as e:
         log.warning("Could not build channel from config: %s", e)
         return None

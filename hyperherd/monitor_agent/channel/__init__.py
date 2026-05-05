@@ -142,6 +142,8 @@ def build_channel(
     workspace_config,
     sweep_name: str,
     workspace: Path,
+    *,
+    force_token_conflict: bool = False,
 ) -> Optional[MessageChannel]:
     """Inspect the workspace config and return a configured channel, or
     None if no channel is set up (in which case the daemon falls back to
@@ -150,6 +152,10 @@ def build_channel(
     Discord requires `DISCORD_BOT_TOKEN` in the environment plus a
     `discord:` section in `hyperherd.yaml` with `guild_id`. If the env var
     is missing we treat it as 'not configured' and log a hint.
+
+    `force_token_conflict=True` bypasses the same-token preflight — use
+    when a previous daemon was killed uncleanly and its stale heartbeat
+    hasn't aged out yet.
     """
     discord_cfg = getattr(workspace_config, "discord", None)
     if discord_cfg is None or getattr(discord_cfg, "guild_id", None) is None:
@@ -176,4 +182,5 @@ def build_channel(
         ),
         channel_name=discord_cfg.channel_name,
         dashboard_refresh_seconds=int(discord_cfg.dashboard_refresh_seconds),
+        force_token_conflict=force_token_conflict,
     )
