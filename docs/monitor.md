@@ -148,6 +148,8 @@ Each agent tick posts one summary message, even on quiet ticks — silence means
 🐕 bumped slurm.time 1h→1h30m after 1 TIMEOUT (idx 3); resubmitting. Next tick in 5 min.
 ```
 
+![Discord channel showing the live dashboard embed, agent tick messages, and a user conversation where the agent confirms the val_acc metric](discord-demo.png)
+
 ## Failure triage
 
 | SLURM cause | Cause type | If `remediate` | If `notify` |
