@@ -561,6 +561,64 @@ class TestDashboardEmbed(unittest.TestCase):
         self.assertEqual(embed.kwargs.get("color"), 0xe74c3c)
 
 
+class TestPickAutoPlotMetric(unittest.TestCase):
+    """pick_auto_plot_metric reads the success metric from MONITOR_PLAN.md
+    and matches it against the trial's logged streams."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.ws = Path(self.tmp)
+        (self.ws / ".hyperherd").mkdir()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp)
+
+    def _write_plan(self, line):
+        (self.ws / ".hyperherd" / "MONITOR_PLAN.md").write_text(line + "\n")
+
+    def _pick(self, streams):
+        from unittest.mock import patch
+        from hyperherd.monitor_agent.plots import pick_auto_plot_metric
+        with patch(
+            "hyperherd.logging.list_metric_streams",
+            return_value=streams,
+        ):
+            return pick_auto_plot_metric(self.ws, trial_index=0)
+
+    def test_uses_plan_metric_when_present(self):
+        self._write_plan("- Success metric: val/loss, min")
+        result = self._pick(["train/loss", "val/loss", "lr"])
+        self.assertEqual(result, "val/loss")
+
+    def test_plan_metric_with_maximize(self):
+        self._write_plan("- Success metric: val_accuracy, max")
+        result = self._pick(["val_accuracy", "train_loss"])
+        self.assertEqual(result, "val_accuracy")
+
+    def test_plan_metric_not_in_streams_falls_back_alphabetically(self):
+        """If the plan names a metric the trial never logged, don't crash —
+        fall back to sorted(streams)[0]."""
+        self._write_plan("- Success metric: val/loss, min")
+        result = self._pick(["train_loss", "lr"])
+        self.assertEqual(result, "lr")
+
+    def test_plan_metric_none_falls_back_alphabetically(self):
+        self._write_plan("- Success metric: none")
+        result = self._pick(["train/loss", "val/loss"])
+        self.assertEqual(result, "train/loss")
+
+    def test_no_plan_file_falls_back_alphabetically(self):
+        result = self._pick(["zz_metric", "aa_metric"])
+        self.assertEqual(result, "aa_metric")
+
+    def test_no_streams_returns_none(self):
+        self._write_plan("- Success metric: val/loss, min")
+        result = self._pick([])
+        self.assertIsNone(result)
+
+
 class TestAutoPlot(unittest.IsolatedAsyncioTestCase):
     """SlurmPoll._auto_plot: best-effort plot-and-post on completion/failure."""
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import tempfile
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -25,31 +25,49 @@ class PlotUnavailable(RuntimeError):
     """matplotlib not installed, or a metric has no points to plot."""
 
 
-# Loss-y metric names we'd auto-plot when a trial transitions. Priority
-# order — the first match in this list wins. The intent is "the curve a
-# user would most want to see at a glance"; loss beats accuracy because
-# loss curves diagnose more failure modes.
-_AUTO_PLOT_METRIC_PRIORITY: Tuple[str, ...] = (
-    "train/loss", "val/loss", "loss",
-    "train_loss", "val_loss",
-)
+def _read_plan_metric(workspace: Path) -> Optional[str]:
+    """Return the success metric name from MONITOR_PLAN.md, or None.
+
+    The setup interview writes a line like:
+        - Success metric: val/loss, min
+    or:
+        - Success metric: none
+    We extract the name part and return it, or None if unset/none."""
+    plan_path = workspace / ".hyperherd" / "MONITOR_PLAN.md"
+    if not plan_path.is_file():
+        return None
+    try:
+        for line in plan_path.read_text().splitlines():
+            s = line.strip().lstrip("-").strip()
+            if s.lower().startswith("success metric:"):
+                value = s.split(":", 1)[1].strip()
+                if not value or value.lower() == "none":
+                    return None
+                # Strip optional direction suffix: "val/loss, min" → "val/loss"
+                name = value.split(",")[0].strip()
+                return name or None
+    except OSError:
+        pass
+    return None
 
 
 def pick_auto_plot_metric(
     workspace: Path, trial_index: int,
 ) -> Optional[str]:
-    """Choose the best metric to auto-plot for one trial. Returns None
-    if the trial has no streamed metrics."""
+    """Choose the best metric to auto-plot for one trial.
+
+    Priority:
+    1. The success metric from MONITOR_PLAN.md (set during setup interview).
+    2. First alphabetically from whatever the trial actually logged.
+
+    Returns None if the trial has no streamed metrics at all."""
     from hyperherd.logging import list_metric_streams
     streams = list_metric_streams(str(workspace), trial_index)
     if not streams:
         return None
-    stream_set = set(streams)
-    for candidate in _AUTO_PLOT_METRIC_PRIORITY:
-        if candidate in stream_set:
-            return candidate
-    # Fall back to whichever stream the trial logged first (deterministic
-    # across reruns since list_metric_streams sorts).
+    plan_metric = _read_plan_metric(workspace)
+    if plan_metric and plan_metric in set(streams):
+        return plan_metric
     return sorted(streams)[0]
 
 
