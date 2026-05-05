@@ -609,6 +609,29 @@ class DiscordChannel(MessageChannel):
 
     # --- slash commands --------------------------------------------------
 
+    async def _in_bound_channel(self, interaction) -> bool:
+        """True if the interaction was triggered in this daemon's
+        sweep channel. On False, sends an ephemeral redirect message —
+        caller should early-return without doing more work.
+
+        Slash commands are guild-scoped (Discord doesn't support
+        channel scoping), so without this gate `/status` typed in any
+        channel of the guild would respond there but report data from
+        whichever sweep this daemon happens to monitor — confusing
+        when the user has multiple sweeps or just types in the wrong
+        channel by accident.
+        """
+        if self._channel is None:
+            return True  # not yet connected; let it through
+        if interaction.channel_id == self._channel.id:
+            return True
+        await interaction.response.send_message(
+            f"This command is bound to {self._channel.mention} "
+            f"(sweep `{self._sweep_name}`) — please run it there.",
+            ephemeral=True,
+        )
+        return False
+
     def _register_slash_commands(self, app_commands) -> None:
         """Wire `commands.py` handlers into Discord's CommandTree. The
         decorators run synchronously here at start(); the actual handlers
@@ -616,6 +639,7 @@ class DiscordChannel(MessageChannel):
         import discord
         guild = discord.Object(id=self._guild_id)
         ws = self._workspace
+        in_bound_channel = self._in_bound_channel  # capture for closures
 
         @self._tree.command(
             name="status",
@@ -623,6 +647,8 @@ class DiscordChannel(MessageChannel):
             guild=guild,
         )
         async def status_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_status, ws,
@@ -635,6 +661,8 @@ class DiscordChannel(MessageChannel):
             guild=guild,
         )
         async def running_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_running, ws,
@@ -647,6 +675,8 @@ class DiscordChannel(MessageChannel):
             guild=guild,
         )
         async def stats_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_stats, ws,
@@ -659,6 +689,8 @@ class DiscordChannel(MessageChannel):
             guild=guild,
         )
         async def params_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_params, ws,
@@ -672,6 +704,8 @@ class DiscordChannel(MessageChannel):
         async def run_cmd(
             interaction: discord.Interaction, index: int,
         ) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_run, ws, index,
@@ -684,6 +718,8 @@ class DiscordChannel(MessageChannel):
             guild=guild,
         )
         async def run_all_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_run_all, ws,
@@ -696,6 +732,8 @@ class DiscordChannel(MessageChannel):
             guild=guild,
         )
         async def plan_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_plan, ws,
@@ -708,6 +746,8 @@ class DiscordChannel(MessageChannel):
             guild=guild,
         )
         async def info_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             stats = self._on_info() if self._on_info is not None else {}
 
@@ -724,6 +764,8 @@ class DiscordChannel(MessageChannel):
         async def cancel_cmd(
             interaction: discord.Interaction, index: int,
         ) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_stop, ws, index,
@@ -736,6 +778,8 @@ class DiscordChannel(MessageChannel):
             guild=guild,
         )
         async def cancel_all_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_stop_all, ws,
@@ -756,6 +800,8 @@ class DiscordChannel(MessageChannel):
             index: int,
             reason: str = "user-pruned via /prune",
         ) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_prune, ws, index, reason,
@@ -774,6 +820,8 @@ class DiscordChannel(MessageChannel):
             interaction: discord.Interaction,
             smooth: int = 0,
         ) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_metrics, ws, smooth,
@@ -794,6 +842,8 @@ class DiscordChannel(MessageChannel):
             index: int,
             lines: int = 20,
         ) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_tail, ws, index, lines,
@@ -806,6 +856,8 @@ class DiscordChannel(MessageChannel):
             guild=guild,
         )
         async def stop_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
             if self._on_stop is None:
                 await interaction.response.send_message(
                     "Not connected to a daemon — nothing to stop.",
@@ -823,6 +875,8 @@ class DiscordChannel(MessageChannel):
             name="help", description="List of HerdDog commands", guild=guild,
         )
         async def help_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
             await interaction.response.send_message(cmd_mod.cmd_help())
 
     # --- channel resolution ----------------------------------------------
