@@ -243,6 +243,80 @@ class TestTokenConflictDetection(unittest.TestCase):
         asyncio.run(ch._check_for_token_conflicts())  # force=True, no raise
 
 
+class TestRefreshButtonCooldown(unittest.TestCase):
+    """The dashboard's refresh button must trigger a real SLURM re-poll
+    (not just a re-render of the cached snapshot) — but rate-limited
+    so a user spamming clicks can't hammer sacct."""
+
+    def _build(self):
+        from hyperherd.monitor_agent.channel.discord_channel import (
+            DiscordChannel,
+        )
+        return DiscordChannel(
+            token="x", guild_id=1, sweep_name="s",
+            workspace=Path("/tmp"),
+            dashboard_refresh_seconds=60,
+        )
+
+    def _fake_interaction(self):
+        """Minimal stand-in for discord.Interaction."""
+        from unittest.mock import AsyncMock, MagicMock
+        inter = MagicMock()
+        inter.response = MagicMock()
+        inter.response.defer = AsyncMock()
+        inter.followup = MagicMock()
+        inter.followup.send = AsyncMock()
+        inter.edit_original_response = AsyncMock()
+        return inter
+
+    def test_first_click_triggers_snapshot_refresh(self):
+        from unittest.mock import patch
+        ch = self._build()
+        ch._build_dashboard_content = lambda: "📊 ok"
+        inter = self._fake_interaction()
+        with patch(
+            "hyperherd.monitor_agent.state.refresh_snapshot",
+        ) as refresh:
+            asyncio.run(ch._handle_refresh_click(inter, view=object()))
+        refresh.assert_called_once_with(Path("/tmp"))
+        inter.edit_original_response.assert_awaited_once()
+        # No cooldown notice on the first click.
+        inter.followup.send.assert_not_called()
+
+    def test_second_click_within_cooldown_skips_sacct(self):
+        from unittest.mock import patch
+        ch = self._build()
+        ch._build_dashboard_content = lambda: "📊 ok"
+        inter1 = self._fake_interaction()
+        inter2 = self._fake_interaction()
+        with patch(
+            "hyperherd.monitor_agent.state.refresh_snapshot",
+        ) as refresh:
+            asyncio.run(ch._handle_refresh_click(inter1, view=object()))
+            asyncio.run(ch._handle_refresh_click(inter2, view=object()))
+        # First click polled; second was within 20s, no second poll.
+        self.assertEqual(refresh.call_count, 1)
+        # Second click still re-renders so the user sees the latest.
+        inter2.edit_original_response.assert_awaited_once()
+        # And gets an ephemeral cooldown notice.
+        inter2.followup.send.assert_awaited_once()
+
+    def test_failed_refresh_falls_back_to_cached_snapshot(self):
+        from unittest.mock import patch
+        ch = self._build()
+        ch._build_dashboard_content = lambda: "📊 cached"
+        inter = self._fake_interaction()
+        with patch(
+            "hyperherd.monitor_agent.state.refresh_snapshot",
+            side_effect=RuntimeError("sacct timeout"),
+        ):
+            asyncio.run(ch._handle_refresh_click(inter, view=object()))
+        # Refresh failed, but we still showed the cached dashboard.
+        inter.edit_original_response.assert_awaited_once()
+        # Cooldown is NOT updated on failure, so the next click can retry.
+        self.assertEqual(ch._last_manual_refresh, 0.0)
+
+
 class TestInboxWriter(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

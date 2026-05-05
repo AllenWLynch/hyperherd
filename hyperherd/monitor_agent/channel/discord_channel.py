@@ -76,6 +76,11 @@ _HEARTBEAT_RE = re.compile(
     re.escape(_HEARTBEAT_PREFIX) + r"([^\]]+)" + re.escape(_HEARTBEAT_SUFFIX)
 )
 
+# Cooldown between manual dashboard-refresh-button presses. Too fast and
+# we'd be hammering sacct; too slow and the button feels broken. 20s
+# matches the typical sacct cache window.
+_MANUAL_REFRESH_COOLDOWN_S = 20
+
 
 def _parse_heartbeat_topic(topic: str) -> Optional[datetime]:
     """Return the embedded heartbeat datetime if the topic carries a
@@ -184,6 +189,10 @@ class DiscordChannel(MessageChannel):
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._dashboard_msg = None
         self._channel = None
+        # Monotonic timestamp of the last manual dashboard refresh, used
+        # to rate-limit the Refresh button so a user spamming it can't
+        # turn into a sacct-pounding loop.
+        self._last_manual_refresh: float = 0.0
         self._on_inbound: Optional[InboundHandler] = None
         self._on_stop: Optional[StopHandler] = None
         self._on_info: Optional[InfoHandler] = None
@@ -389,19 +398,62 @@ class DiscordChannel(MessageChannel):
                 interaction: "discord.Interaction",
                 button: "discord.ui.Button",
             ) -> None:
-                try:
-                    content = self_v._channel._build_dashboard_content()
-                except Exception as e:
-                    await interaction.response.send_message(
-                        f"⚠️ Refresh failed: {type(e).__name__}: {e}",
-                        ephemeral=True,
-                    )
-                    return
-                await interaction.response.edit_message(
-                    content=content, view=self_v
+                await self_v._channel._handle_refresh_click(
+                    interaction, self_v
                 )
 
         return _DashboardView(self)
+
+    async def _handle_refresh_click(self, interaction, view) -> None:
+        """Refresh-button click: re-poll SLURM (sacct/squeue) for a
+        fresh snapshot, then re-render the dashboard against it.
+
+        Rate-limited by `_MANUAL_REFRESH_COOLDOWN_S` — within the
+        cooldown window we just re-render the existing snapshot
+        (cheap) and tell the user how long to wait. Without the
+        cooldown a user spamming the button could turn into a tight
+        sacct loop on the controller.
+
+        Defers the interaction first because `refresh_snapshot()`
+        shells out to `herd snapshot`, which can take 1–2s — past
+        Discord's 3s response deadline if sacct is slow.
+        """
+        import time
+        from hyperherd.monitor_agent import state as state_mod
+
+        now = time.monotonic()
+        elapsed = now - self._last_manual_refresh
+        cooled = elapsed >= _MANUAL_REFRESH_COOLDOWN_S
+        await interaction.response.defer()
+        if cooled:
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, state_mod.refresh_snapshot, self._workspace,
+                )
+            except Exception as e:
+                # Refresh failed — fall back to whatever's on disk so
+                # the user still gets a working dashboard.
+                log.warning("Manual snapshot refresh failed: %s", e)
+            else:
+                self._last_manual_refresh = now
+        try:
+            content = self._build_dashboard_content()
+        except Exception as e:
+            await interaction.followup.send(
+                f"⚠️ Refresh failed: {type(e).__name__}: {e}",
+                ephemeral=True,
+            )
+            return
+        await interaction.edit_original_response(
+            content=content, view=view,
+        )
+        if not cooled:
+            wait = max(1, int(_MANUAL_REFRESH_COOLDOWN_S - elapsed))
+            await interaction.followup.send(
+                f"⏳ Re-polling SLURM is on cooldown — try again in "
+                f"{wait}s. (Showing the cached snapshot.)",
+                ephemeral=True,
+            )
 
     async def _dashboard_loop(self) -> None:
         """Maintain a single self-editing 'live status' message in the

@@ -168,5 +168,51 @@ class TestCmdStop(unittest.TestCase):
         self.assertEqual(trials[0]["status"], "cancelled")
 
 
+class TestSyncStickyCancelled(unittest.TestCase):
+    """Regression: a trial cancelled while queued must stay 'cancelled'
+    even if sacct still reports PENDING for it (sacct lag). Without the
+    sticky guard, `herd run` would resync to 'queued', and that's
+    excluded from `get_pending_indices` — the trial would never be
+    resubmitted."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        manifest.init_workspace(self.tmpdir)
+        manifest.create_manifest(
+            self.tmpdir, [{"lr": 0.1}, {"lr": 0.01}], abbrevs={"lr": "lr"},
+        )
+        manifest.record_job_submission(self.tmpdir, "12345", [0, 1])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_cancelled_status_resists_pending_sacct_row(self):
+        from hyperherd.cli import _sync_slurm_status
+        # Post-cancel: idx 0 was cancelled, sacct still reports the
+        # array as PENDING (scancel issued but accounting lagging).
+        manifest.bulk_update_status(self.tmpdir, {0: "cancelled", 1: "queued"})
+        with mock.patch(
+            "hyperherd.cli.slurm.query_job_status",
+            return_value={("12345", 0): "PENDING", ("12345", 1): "PENDING"},
+        ):
+            _sync_slurm_status(self.tmpdir)
+        trials = manifest.load_manifest(self.tmpdir)
+        by_idx = {t["index"]: t["status"] for t in trials}
+        self.assertEqual(by_idx[0], "cancelled")  # protected
+        self.assertEqual(by_idx[1], "queued")     # normal sync
+
+    def test_cancelled_index_still_resubmittable(self):
+        # End-to-end shape of the user's bug: cancel + sync (with sacct
+        # lag) must leave idx 0 in `get_pending_indices`.
+        from hyperherd.cli import _sync_slurm_status
+        manifest.bulk_update_status(self.tmpdir, {0: "cancelled", 1: "running"})
+        with mock.patch(
+            "hyperherd.cli.slurm.query_job_status",
+            return_value={("12345", 0): "PENDING", ("12345", 1): "RUNNING"},
+        ):
+            _sync_slurm_status(self.tmpdir)
+        self.assertIn(0, manifest.get_pending_indices(self.tmpdir))
+
+
 if __name__ == "__main__":
     unittest.main()

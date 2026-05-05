@@ -1388,17 +1388,25 @@ def _sync_slurm_status(workspace: str):
         "OUT_OF_MEMORY": "failed",
     }
 
-    # Trials marked `pruned` are algorithmic decisions made by the
-    # autonomous monitor; they're typically also CANCELLED in SLURM
-    # (because the agent calls `scancel`), but we must not let SLURM's
-    # status sync flip them back to `cancelled`. The `pruned` label is
-    # the source of truth for those trials.
+    # `pruned` and `cancelled` are user/agent decisions that the manifest
+    # owns — sacct lag (or sacct still reporting an old PENDING/RUNNING
+    # row before scancel propagates) must not flip them back to a live
+    # state. Without this guard, `herd stop 3` followed by `herd run`
+    # would resync to "queued" before `get_pending_indices` runs, and
+    # the trial would never be resubmitted.
+    #
+    # When the user *does* want to resubmit a cancelled trial, `herd
+    # run` calls `bulk_update_status({i: "submitted" ...})` AFTER the
+    # sync, so that path still works — sync just doesn't fight us.
     trials = manifest.load_manifest(workspace)
-    pruned_set = {t["index"] for t in trials if t.get("status") == "pruned"}
+    sticky = {
+        t["index"] for t in trials
+        if t.get("status") in ("pruned", "cancelled")
+    }
 
     updates = {}
     for (_, array_idx), slurm_state in statuses.items():
-        if array_idx in pruned_set:
+        if array_idx in sticky:
             continue
         our_status = state_map.get(slurm_state, slurm_state.lower())
         updates[array_idx] = our_status
