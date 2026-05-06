@@ -261,6 +261,23 @@ class TestSyncStickyCancelled(unittest.TestCase):
         self.assertEqual(by_idx[0], "queued")   # unchanged — no cross-check
         self.assertEqual(by_idx[1], "queued")
 
+    def test_pending_jobs_not_falsely_cancelled(self):
+        # Regression: querying squeue with historical (old) job IDs made
+        # squeue return non-zero → empty dict → all "queued" trials were
+        # falsely marked "cancelled". The fix: query only current job IDs.
+        # Simulate by having squeue return the live jobs correctly.
+        manifest.bulk_update_status(self.tmpdir, {0: "queued", 1: "queued"})
+        # Both trials are PENDING in both sacct and squeue — neither should
+        # be marked cancelled.
+        self._sync(
+            sacct_states={("12345", 0): "PENDING", ("12345", 1): "PENDING"},
+            squeue_live={("12345", 0): "PENDING", ("12345", 1): "PENDING"},
+        )
+        trials = manifest.load_manifest(self.tmpdir)
+        by_idx = {t["index"]: t["status"] for t in trials}
+        self.assertEqual(by_idx[0], "queued")
+        self.assertEqual(by_idx[1], "queued")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1417,39 +1417,44 @@ def _sync_slurm_status(workspace: str):
     # cancelled trial stays "queued" in the manifest and can't be
     # resubmitted until sacct eventually catches up.
     #
-    # Rule: if a "submitted"/"queued" trial's latest job is absent from
-    # squeue AND sacct would leave it as "queued" (stale PENDING) or has
-    # no entry at all, the job has ended. Marking it "cancelled" lets
-    # `get_pending_indices` return it so `herd run` can resubmit it.
-    #
-    # We only apply this to trials that were never RUNNING (status
-    # "submitted"/"queued"), because a RUNNING job that got cancelled would
-    # already be transitioning in sacct (RUNNING → CANCELLED is faster).
-    try:
-        squeue_live = slurm.query_squeue_live(job_ids)
-    except FileNotFoundError:
-        squeue_live = None  # squeue not on PATH — skip cross-check
-    except Exception:
-        squeue_live = None
+    # We query squeue only with the *current* job IDs (one per live trial),
+    # not all historical IDs. Old completed job IDs cause `squeue -j` to
+    # return non-zero on many clusters, which would make the result look
+    # empty and incorrectly flip all live trials to "cancelled".
+    live_jids: dict = {}  # trial index → latest job_id, for "submitted"/"queued" only
+    for t in trials:
+        idx = t["index"]
+        if t.get("status") not in ("submitted", "queued"):
+            continue
+        if idx in sticky:
+            continue
+        jid = _latest_job_id_for(job_records, idx)
+        if jid is not None:
+            live_jids[idx] = jid
 
-    if squeue_live is not None:
-        for t in trials:
-            idx = t["index"]
-            if t.get("status") not in ("submitted", "queued"):
-                continue
-            if idx in sticky:
-                continue
-            jid = _latest_job_id_for(job_records, idx)
-            if jid is None:
-                continue
-            if (jid, idx) in squeue_live:
-                continue  # still live in squeue — trust sacct
-            # Job has left the queue. If sacct update would keep this
-            # trial "queued" (stale PENDING) or sacct has no entry, the
-            # job was cancelled before starting. Override to "cancelled".
-            effective = updates.get(idx, t.get("status"))
-            if effective in ("queued", "submitted"):
-                updates[idx] = "cancelled"
+    if live_jids:
+        current_jids = list(set(live_jids.values()))
+        try:
+            squeue_live = slurm.query_squeue_live(current_jids)
+        except FileNotFoundError:
+            squeue_live = None  # squeue not on PATH — skip cross-check
+        except Exception:
+            squeue_live = None
+
+        if squeue_live is not None:
+            for idx, jid in live_jids.items():
+                if (jid, idx) in squeue_live:
+                    continue  # still live in squeue — trust sacct
+                # Job absent from squeue. If sacct would leave this trial
+                # as "queued"/"submitted" (stale PENDING or no entry), the
+                # job was cancelled before starting. Override to "cancelled".
+                t_status = next(
+                    (t.get("status") for t in trials if t["index"] == idx),
+                    None,
+                )
+                effective = updates.get(idx, t_status)
+                if effective in ("queued", "submitted"):
+                    updates[idx] = "cancelled"
 
     manifest.bulk_update_status(workspace, updates)
 
