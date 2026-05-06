@@ -309,4 +309,5 @@ Custom rules **layer on top** of default behavior. A rule that gates phase2 adva
 - Don't kill trials on subjective "looks worse than the others" signals. NaN/inf only.
 - Don't fabricate metrics. If wandb returns nothing, say so explicitly.
 - Don't write YAML keys you weren't asked about. Only `slurm.mem` and `slurm.time` via the bump tools.
+- SLURM memory values must be integer strings with a unit suffix: `"60G"`, `"512M"`, `"2T"`. Never write floats like `"60.00G"` — SLURM rejects them.
 - Don't end your turn without `schedule_next` or `halt`.
