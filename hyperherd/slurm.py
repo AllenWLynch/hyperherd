@@ -377,12 +377,22 @@ def _query_squeue(job_ids: List[str]) -> Dict[Tuple[str, int], str]:
             continue
         job_id_str = parts[0]
         state_code = parts[1]
+        state = state_map.get(state_code, state_code)
 
-        match = re.match(r"(\d+)_(\d+)", job_id_str)
+        # Individual task: "38853328_7"
+        match = re.match(r"(\d+)_(\d+)$", job_id_str)
+        if match:
+            statuses[(match.group(1), int(match.group(2)))] = state
+            continue
+
+        # Compact pending form: "38853328_[0-9]" or "38853328_[0-3,5]".
+        # squeue uses this for arrays that haven't been individually
+        # scheduled yet — common for freshly submitted jobs.
+        match = re.match(r"(\d+)_\[(.+)\]$", job_id_str)
         if match:
             jid = match.group(1)
-            array_idx = int(match.group(2))
-            statuses[(jid, array_idx)] = state_map.get(state_code, state_code)
+            for idx in _parse_array_range(match.group(2)):
+                statuses[(jid, idx)] = state
 
     return statuses
 

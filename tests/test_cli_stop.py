@@ -278,6 +278,25 @@ class TestSyncStickyCancelled(unittest.TestCase):
         self.assertEqual(by_idx[0], "queued")
         self.assertEqual(by_idx[1], "queued")
 
+    def test_compact_squeue_form_not_falsely_cancelled(self):
+        # Regression: squeue returns "38853328_[0-1] PD" (compact form) for
+        # freshly submitted arrays. _query_squeue only matched individual rows
+        # ("38853328_0"), so the compact form produced squeue_live={} and all
+        # submitted trials were falsely marked "cancelled".
+        from hyperherd.slurm import _query_squeue
+        from unittest.mock import patch, MagicMock
+
+        compact_output = "12345_[0-1] PD\n"
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = compact_output
+
+        with patch("subprocess.run", return_value=proc):
+            live = _query_squeue(["12345"])
+
+        self.assertIn(("12345", 0), live)
+        self.assertIn(("12345", 1), live)
+
 
 if __name__ == "__main__":
     unittest.main()
