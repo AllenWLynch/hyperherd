@@ -1096,21 +1096,24 @@ class DiscordChannel(MessageChannel):
 
         @self._tree.command(
             name="metrics",
-            description="Cross-trial metric summary; optional smoothing window",
+            description="List logged metric names, or show one metric's value per trial",
             guild=guild,
         )
         @app_commands.describe(
+            metric="Metric name to look up (omit to list all available metrics)",
             smooth="If > 0, mean of last N points instead of last value",
         )
         async def metrics_cmd(
             interaction: discord.Interaction,
+            metric: str = "",
             smooth: int = 0,
         ) -> None:
             if not await in_bound_channel(interaction):
                 return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
-                None, cmd_mod.cmd_metrics, ws, smooth,
+                None, cmd_mod.cmd_metrics, ws,
+                metric or None, smooth,
             )
             await interaction.followup.send(_codeblock(text))
 

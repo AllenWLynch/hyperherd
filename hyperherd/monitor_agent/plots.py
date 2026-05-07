@@ -13,12 +13,32 @@ and callers degrade gracefully by skipping the plot.
 
 from __future__ import annotations
 
+import colorsys
 import logging
 import tempfile
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
+
+# Tufte-ish ink colors (kept inline so we don't depend on the
+# tufte-plots skill — that's a personal-tooling repo, not a runtime dep).
+_PRIMARY_INK = "#222222"
+_SECONDARY_INK = "#bbbbbb"
+
+
+def _husl_palette(n: int) -> List[Tuple[float, float, float]]:
+    """n perceptually-spaced colors via even hue rotation in HLS.
+
+    Approximates seaborn's `color_palette('husl', n)` without the
+    seaborn dep — even hue spacing at fixed lightness/saturation gives
+    a CVD-passable wheel of distinguishable hues for many trials."""
+    if n <= 0:
+        return []
+    return [
+        colorsys.hls_to_rgb(i / n, 0.55, 0.65)
+        for i in range(n)
+    ]
 
 
 class PlotUnavailable(RuntimeError):
@@ -58,7 +78,9 @@ def pick_auto_plot_metric(
 
     Priority:
     1. The success metric from MONITOR_PLAN.md (set during setup interview).
-    2. First alphabetically from whatever the trial actually logged.
+    2. Heuristic ranking over the names the trial actually logged (see
+       `_rank_metric_name`).
+    3. Alphabetical fallback.
 
     Returns None if the trial has no streamed metrics at all."""
     from hyperherd.logging import list_metric_streams
@@ -68,7 +90,42 @@ def pick_auto_plot_metric(
     plan_metric = _read_plan_metric(workspace)
     if plan_metric and plan_metric in set(streams):
         return plan_metric
-    return sorted(streams)[0]
+    return min(streams, key=lambda n: (_rank_metric_name(n), n))
+
+
+# Lower rank = more preferred. Tuple ordering: split → kind → "main".
+# The key reads as a search tree: pick on split first, then loss-vs-score,
+# then promote anything with "main" in the name.
+_SPLIT_RANK = {"test": 0, "val": 1, "train": 3}  # nothing/other = 2
+_KIND_RANK = {"loss": 0, "score": 1}             # nothing/other = 2
+
+
+def _rank_metric_name(name: str) -> tuple:
+    """Score a metric name lower = better-to-plot.
+
+    Heuristic: prefer test > val > (uncategorized) > train; within that,
+    prefer 'loss' > 'score' > other; then promote names containing
+    'main' (e.g. `main_metric`, `val/main_loss`)."""
+    lc = name.lower()
+
+    if "test" in lc:
+        split = _SPLIT_RANK["test"]
+    elif "val" in lc:
+        split = _SPLIT_RANK["val"]
+    elif "train" in lc:
+        split = _SPLIT_RANK["train"]
+    else:
+        split = 2
+
+    if "loss" in lc:
+        kind = _KIND_RANK["loss"]
+    elif "score" in lc:
+        kind = _KIND_RANK["score"]
+    else:
+        kind = 2
+
+    main_bonus = 0 if "main" in lc else 1
+    return (split, kind, main_bonus)
 
 
 def render_metric_plot(
@@ -132,18 +189,63 @@ def render_metric_plot(
             f"No trial has points for metric `{metric}`."
         )
 
-    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=110)
-    for idx, name, xs, ys in series:
-        ax.plot(xs, ys, label=f"#{idx} {name}", linewidth=1.4)
-    ax.set_xlabel("step")
-    ax.set_ylabel(metric)
-    ax.grid(True, alpha=0.25)
-    title = metric
-    if smooth > 1:
-        title = f"{metric} (smoothed, window={smooth})"
-    ax.set_title(title)
-    if len(series) <= 12:
-        ax.legend(fontsize=8, loc="best")
+    n = len(series)
+    palette = _husl_palette(n)
+    # Many trials → thinner, more transparent lines so overlap stays
+    # readable; few trials → opaque and slightly thicker.
+    if n <= 6:
+        lw, alpha = 1.2, 0.95
+    elif n <= 16:
+        lw, alpha = 1.0, 0.85
+    else:
+        lw, alpha = 0.8, 0.7
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.0), dpi=140)
+    for (idx, name, xs, ys), color in zip(series, palette):
+        ax.plot(xs, ys, label=f"#{idx} {name}",
+                linewidth=lw, alpha=alpha, color=color,
+                solid_capstyle="round")
+
+    # Tufte: minimum non-data ink. No grid, no top/right spines, no
+    # axis title — the metric name lives on the y-axis label.
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(_PRIMARY_INK)
+    ax.spines["bottom"].set_color(_PRIMARY_INK)
+    ax.spines["left"].set_linewidth(0.6)
+    ax.spines["bottom"].set_linewidth(0.6)
+    ax.tick_params(axis="both", colors=_PRIMARY_INK, width=0.6,
+                   labelsize=8, length=3)
+    ax.set_xlabel("step", fontsize=9, color=_PRIMARY_INK)
+    ylabel = metric if smooth <= 1 else f"{metric} (smoothed, w={smooth})"
+    ax.set_ylabel(ylabel, fontsize=9, color=_PRIMARY_INK)
+
+    # Range frame: bound spines to the data extent and use only
+    # min/mid/max ticks. Defensively skip when the extent collapses.
+    all_xs = [x for _, _, xs, _ in series for x in xs]
+    all_ys = [y for _, _, _, ys in series for y in ys]
+    if all_xs and all_ys:
+        xmin, xmax = min(all_xs), max(all_xs)
+        ymin, ymax = min(all_ys), max(all_ys)
+        if xmax > xmin:
+            ax.spines["bottom"].set_bounds(xmin, xmax)
+            ax.set_xticks([xmin, (xmin + xmax) / 2, xmax])
+        if ymax > ymin:
+            ax.spines["left"].set_bounds(ymin, ymax)
+            ax.set_yticks([ymin, (ymin + ymax) / 2, ymax])
+
+    # Legend: off-plot only when it'll fit. Past ~16 trials, drop it
+    # entirely — the eye can't disambiguate that many lines from a
+    # legend anyway and the husl wheel + line shape carries the
+    # comparison.
+    if n <= 16:
+        long_labels = any(len(line.get_label()) > 14 for line in ax.get_lines())
+        if long_labels:
+            ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+                      ncol=1, frameon=False, fontsize=7)
+        else:
+            ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18),
+                      ncol=min(n, 4), frameon=False, fontsize=7)
     fig.tight_layout()
 
     if out_path is None:
@@ -152,7 +254,7 @@ def render_metric_plot(
         )
         tmp.close()
         out_path = Path(tmp.name)
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return out_path
 

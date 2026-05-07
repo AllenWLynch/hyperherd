@@ -39,8 +39,9 @@ class TestStatus(unittest.TestCase):
         self.assertIn("1 running", out)
         self.assertIn("2 completed", out)
         self.assertIn("3 total", out)
-        self.assertIn("idx", out)
+        # Per-trial line: name + status, one value of info per trial.
         self.assertIn("lr-0.001_opt-adam", out)
+        self.assertIn("running", out)
 
     def test_handles_subprocess_failure(self):
         err = cmd_mod.subprocess.CalledProcessError(
@@ -377,27 +378,43 @@ class TestCmdMetrics(unittest.TestCase):
             for step, v in values_with_steps:
                 f.write(json.dumps({"step": step, "value": v, "ts": 0.0}) + "\n")
 
-    def test_renders_each_running_or_terminal_trial(self):
+    def test_no_metric_lists_available_names(self):
         self._seed_stream(0, "val_loss", [(0, 0.9), (10, 0.7), (20, 0.5)])
         self._seed_stream(1, "val_loss", [(0, 0.8), (10, 0.4)])
+        self._seed_stream(1, "train_acc", [(0, 0.5), (10, 0.7)])
         text = cmd_mod.cmd_metrics(self.workspace)
-        # Both running and completed trials show; ready ones don't.
+        self.assertIn("Available metrics", text)
+        self.assertIn("val_loss", text)
+        self.assertIn("train_acc", text)
+        # Listing mode shouldn't print per-trial values.
+        self.assertNotIn("#0", text)
+
+    def test_named_metric_prints_one_line_per_trial(self):
+        self._seed_stream(0, "val_loss", [(0, 0.9), (10, 0.7), (20, 0.5)])
+        self._seed_stream(1, "val_loss", [(0, 0.8), (10, 0.4)])
+        text = cmd_mod.cmd_metrics(self.workspace, metric="val_loss")
         self.assertIn("#0", text)
         self.assertIn("#1", text)
-        self.assertNotIn("#2", text)
-        self.assertIn("val_loss", text)
+        self.assertNotIn("#2", text)  # ready trial excluded
+        self.assertIn("0.5", text)
+        self.assertIn("0.4", text)
 
     def test_smoothing_uses_mean_of_last_n(self):
         self._seed_stream(0, "val_loss", [(0, 1.0), (10, 0.5), (20, 0.0)])
         # smooth=2 → mean of [0.5, 0.0] = 0.25
-        text = cmd_mod.cmd_metrics(self.workspace, smooth=2)
+        text = cmd_mod.cmd_metrics(self.workspace, metric="val_loss", smooth=2)
         self.assertIn("0.25", text)
         self.assertIn("smoothed", text)
 
     def test_no_streams_returns_friendly_msg(self):
         text = cmd_mod.cmd_metrics(self.workspace)
-        # No streams seeded — every non-ready trial has no metrics.
-        self.assertIn("none have logged streamed metrics", text)
+        self.assertIn("No metrics logged", text)
+
+    def test_unknown_metric_returns_friendly_msg(self):
+        self._seed_stream(0, "val_loss", [(0, 0.9)])
+        text = cmd_mod.cmd_metrics(self.workspace, metric="bogus")
+        self.assertIn("No trial has logged", text)
+        self.assertIn("bogus", text)
 
 
 class TestCmdPrune(unittest.TestCase):

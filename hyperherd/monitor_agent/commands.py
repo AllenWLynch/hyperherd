@@ -103,6 +103,12 @@ _STATUS_TRIAL_CAP = 35
 
 
 def _format_status(snap: dict, only_active: bool = False) -> str:
+    """Mobile-friendly status: totals header + per-trial `name: status`.
+
+    Each line is just the experiment name plus its current state — the
+    one piece of info a user reading on a phone needs from /status.
+    Wider details (elapsed time, params, etc.) live behind /stats and
+    the live dashboard."""
     name = snap.get("sweep_name", "?")
     totals = snap.get("totals") or {}
     trials = snap.get("trials") or []
@@ -117,43 +123,31 @@ def _format_status(snap: dict, only_active: bool = False) -> str:
     title = f"{name} — {counts}"
     if only_active:
         trials = [t for t in trials if (t.get("status") or "").lower() in _ACTIVE_STATUSES]
-        title += "\n(showing active trials only — `/status` for the full table)"
+        title += "\n(active trials only — `/status` for the full list)"
 
     if not trials:
         if only_active:
             return f"{title}\n\n_No active trials right now._"
         return title
 
-    # Sort active-first so a Discord truncation loses the boring tail.
     trials = sorted(trials, key=trial_sort_key)
     truncated = 0
     if not only_active and len(trials) > _STATUS_TRIAL_CAP:
         truncated = len(trials) - _STATUS_TRIAL_CAP
         trials = trials[:_STATUS_TRIAL_CAP]
 
-    rows = [("idx", "status", "elapsed", "name")]
+    lines = []
     for t in trials:
-        rows.append((
-            str(t.get("index", "?")),
-            (t.get("status") or "?")[:10],
-            (t.get("elapsed") or "-")[:10],
-            (t.get("experiment_name") or "-")[:40],
-        ))
-
-    widths = [max(len(r[i]) for r in rows) for i in range(4)]
-    lines = [
-        " ".join(c.ljust(w) for c, w in zip(rows[0], widths)),
-        " ".join("-" * w for w in widths),
-    ]
-    for r in rows[1:]:
-        lines.append(" ".join(c.ljust(w) for c, w in zip(r, widths)))
+        idx = t.get("index", "?")
+        status = (t.get("status") or "?")
+        nm = (t.get("experiment_name") or "-")[:48]
+        lines.append(f"  #{idx} {nm}: {status}")
 
     body = f"{title}\n\n" + "\n".join(lines)
     if truncated:
         body += (
-            f"\n... and {truncated} more (sorted active-first; "
-            f"use `/running` for active only or `herd status` "
-            f"on the cluster for the full list)"
+            f"\n... and {truncated} more "
+            f"(use `/running` or `herd status` for the full list)"
         )
     return body
 
@@ -188,11 +182,23 @@ def cmd_stop_all(workspace: Path) -> str:
 
 # --- /metrics -------------------------------------------------------------
 
-def cmd_metrics(workspace: Path, smooth: int = 0) -> str:
-    """Cross-trial metric summary: for each non-ready trial and each
-    logged metric, the most recent value (or mean of last `smooth`
-    points if smooth>0). Renders as a vertical list — Discord's
-    pinned-message side panel can't render wide tables."""
+def _format_metric_value(v: float) -> str:
+    if abs(v) > 0 and (abs(v) < 1e-3 or abs(v) >= 1e6):
+        return f"{v:.4g}"
+    return f"{v:.6g}"
+
+
+def cmd_metrics(
+    workspace: Path,
+    metric: Optional[str] = None,
+    smooth: int = 0,
+) -> str:
+    """Per-trial value of one metric, one line per trial.
+
+    With no `metric`: list the available metric names so the user can
+    pick one. With a metric: print `#<idx> <name>: <value>` for every
+    non-ready trial that logged it. Optional `smooth` averages the
+    last N points instead of taking the most recent."""
     if smooth < 0 or smooth > 1000:
         return f"`smooth` must be 0..1000 (got {smooth})."
     try:
@@ -206,63 +212,55 @@ def cmd_metrics(workspace: Path, smooth: int = 0) -> str:
     except Exception as e:
         return f"Couldn't load manifest: {e}"
 
+    non_ready = [t for t in trials if t.get("status") != "ready"]
+
+    if metric is None or not metric.strip():
+        names: set = set()
+        for t in non_ready:
+            for n in list_metric_streams(str(workspace), t["index"]):
+                names.add(n)
+        if not names:
+            return "No metrics logged yet."
+        listing = "\n".join(f"  • `{n}`" for n in sorted(names))
+        return (
+            f"Available metrics ({len(names)}):\n{listing}\n\n"
+            f"Use `/metrics <name>` to see each trial's value."
+        )
+
+    metric = metric.strip()
     rows = []
-    metric_names = set()
-    for trial in trials:
-        status = trial.get("status", "?")
-        if status == "ready":
-            continue
+    for trial in non_ready:
         idx = trial["index"]
-        metrics_for_trial: dict = {}
-        for name in list_metric_streams(str(workspace), idx):
-            stream = load_metric_stream(str(workspace), idx, name)
-            numeric = [
-                p["value"] for p in stream
-                if isinstance(p.get("value"), (int, float))
-            ]
-            if not numeric:
-                continue
-            if smooth > 0 and len(numeric) > 1:
-                tail = numeric[-smooth:]
-                v = sum(tail) / len(tail)
-            else:
-                v = numeric[-1]
-            metrics_for_trial[name] = v
-            metric_names.add(name)
-        rows.append({
-            "idx": idx,
-            "status": status,
-            "name": trial.get("experiment_name", ""),
-            "metrics": metrics_for_trial,
-        })
+        if metric not in list_metric_streams(str(workspace), idx):
+            continue
+        stream = load_metric_stream(str(workspace), idx, metric)
+        numeric = [
+            p["value"] for p in stream
+            if isinstance(p.get("value"), (int, float))
+        ]
+        if not numeric:
+            continue
+        if smooth > 0 and len(numeric) > 1:
+            tail = numeric[-smooth:]
+            v = sum(tail) / len(tail)
+        else:
+            v = numeric[-1]
+        rows.append((
+            idx,
+            (trial.get("experiment_name") or "")[:48],
+            float(v),
+        ))
 
     if not rows:
-        return "No trials yet (or none have been submitted)."
-    if not metric_names:
-        return f"{len(rows)} trial(s); none have logged streamed metrics."
+        return f"No trial has logged `{metric}` yet."
 
-    sorted_metrics = sorted(metric_names)
     suffix = (
-        " (smoothed: mean of last "
-        f"{smooth} points)" if smooth > 0 else " (last logged value)"
+        f" (smoothed: mean of last {smooth} points)"
+        if smooth > 0 else ""
     )
-    out = [f"Metric summary{suffix}:", ""]
-    for r in rows:
-        idx, status = r["idx"], r["status"]
-        nm = r["name"][:32]
-        out.append(f"  #{idx} ({status}) {nm}")
-        if not r["metrics"]:
-            out.append(f"      (no streamed metrics)")
-            continue
-        for m in sorted_metrics:
-            v = r["metrics"].get(m)
-            if v is None:
-                continue
-            # Format scientifically for very small/large, fixed otherwise.
-            if abs(v) > 0 and (abs(v) < 1e-3 or abs(v) >= 1e6):
-                out.append(f"      {m}: {v:.4g}")
-            else:
-                out.append(f"      {m}: {v:.6g}")
+    out = [f"`{metric}`{suffix}:", ""]
+    for idx, nm, v in rows:
+        out.append(f"  #{idx} {nm}: {_format_metric_value(v)}")
     return "\n".join(out)
 
 
@@ -572,7 +570,7 @@ def cmd_help() -> str:
         "`/running` — active trials only (running + queued + submitted)\n"
         "`/stats` — timing and memory stats per trial\n"
         "`/params` — sweep config: parameters, grid shape, all trial combos\n"
-        "`/metrics [smooth]` — cross-trial metric summary; optional smoothing window (mean of last N points)\n"
+        "`/metrics` — list logged metric names; `/metrics <name>` shows each trial's value\n"
         "`/plot <metric> [trials] [smooth]` — PNG plot of a metric across trials (e.g. `/plot train/loss 0-3`)\n"
         "`/info` — daemon metadata: workspace, phase, uptime, ticks, cost\n"
         "`/plan` — show the agent's `MONITOR_PLAN.md`\n"

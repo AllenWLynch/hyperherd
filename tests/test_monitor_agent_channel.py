@@ -597,19 +597,34 @@ class TestPickAutoPlotMetric(unittest.TestCase):
         result = self._pick(["val_accuracy", "train_loss"])
         self.assertEqual(result, "val_accuracy")
 
-    def test_plan_metric_not_in_streams_falls_back_alphabetically(self):
+    def test_plan_metric_not_in_streams_falls_back_to_heuristic(self):
         """If the plan names a metric the trial never logged, don't crash —
-        fall back to sorted(streams)[0]."""
+        fall back to the heuristic ranking. Among `train_loss` and `lr`,
+        uncategorized (`lr`) beats train."""
         self._write_plan("- Success metric: val/loss, min")
         result = self._pick(["train_loss", "lr"])
         self.assertEqual(result, "lr")
 
-    def test_plan_metric_none_falls_back_alphabetically(self):
+    def test_plan_metric_none_falls_back_to_heuristic(self):
+        """val beats train under the heuristic."""
         self._write_plan("- Success metric: none")
         result = self._pick(["train/loss", "val/loss"])
-        self.assertEqual(result, "train/loss")
+        self.assertEqual(result, "val/loss")
+
+    def test_heuristic_prefers_test_over_val(self):
+        result = self._pick(["val/loss", "test/loss", "train/loss"])
+        self.assertEqual(result, "test/loss")
+
+    def test_heuristic_prefers_loss_over_score(self):
+        result = self._pick(["val/score", "val/loss"])
+        self.assertEqual(result, "val/loss")
+
+    def test_heuristic_promotes_main(self):
+        result = self._pick(["val/loss", "val/main_loss"])
+        self.assertEqual(result, "val/main_loss")
 
     def test_no_plan_file_falls_back_alphabetically(self):
+        # Same rank → tiebreak alphabetical.
         result = self._pick(["zz_metric", "aa_metric"])
         self.assertEqual(result, "aa_metric")
 
