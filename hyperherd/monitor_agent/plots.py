@@ -181,7 +181,8 @@ def render_metric_plot(
         if smooth > 1 and len(ys) > smooth:
             ys = _rolling_mean(ys, smooth)
             xs = xs[len(xs) - len(ys):]
-        name = (t.get("experiment_name") or f"trial-{idx}")[:30]
+        raw = t.get("experiment_name") or f"trial-{idx}"
+        name = raw.replace("_", " / ")[:40]
         series.append((idx, name, xs, ys))
 
     if not series:

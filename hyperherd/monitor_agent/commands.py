@@ -136,12 +136,14 @@ def _format_status(snap: dict, only_active: bool = False) -> str:
         truncated = len(trials) - _STATUS_TRIAL_CAP
         trials = trials[:_STATUS_TRIAL_CAP]
 
+    idx_w = max((len(str(t.get("index", 0))) for t in trials), default=1) + 1
+    aligned = _align_names([t.get("experiment_name") or "-" for t in trials])
+
     lines = []
-    for t in trials:
-        idx = t.get("index", "?")
+    for t, nm_col in zip(trials, aligned):
+        idx_col = f"#{t.get('index', '?')}".ljust(idx_w)
         status = (t.get("status") or "?")
-        nm = (t.get("experiment_name") or "-")[:48]
-        lines.append(f"  #{idx} {nm}: {status}")
+        lines.append(f"  {idx_col}  {nm_col}  {status}")
 
     body = f"{title}\n\n" + "\n".join(lines)
     if truncated:
@@ -186,6 +188,26 @@ def _format_metric_value(v: float) -> str:
     if abs(v) > 0 and (abs(v) < 1e-3 or abs(v) >= 1e6):
         return f"{v:.4g}"
     return f"{v:.6g}"
+
+
+def _align_names(names: list) -> list:
+    """Split each underscore-separated experiment name into segments and
+    return versions where every segment position is padded to the maximum
+    width seen across all names. Segments are joined with two spaces so
+    they read as distinct columns in a monospace font.
+
+    Trailing spaces on each row are stripped so the last column stays
+    flush with the next field (status, value, etc.)."""
+    rows = [n.split("_") for n in names]
+    if not rows:
+        return []
+    n_cols = max(len(r) for r in rows)
+    padded = [r + [""] * (n_cols - len(r)) for r in rows]
+    widths = [max(len(r[i]) for r in padded) for i in range(n_cols)]
+    return [
+        "  ".join(seg.ljust(widths[i]) for i, seg in enumerate(row)).rstrip()
+        for row in padded
+    ]
 
 
 def cmd_metrics(
@@ -247,20 +269,31 @@ def cmd_metrics(
             v = numeric[-1]
         rows.append((
             idx,
-            (trial.get("experiment_name") or "")[:48],
+            (trial.get("experiment_name") or ""),
             float(v),
         ))
 
     if not rows:
         return f"No trial has logged `{metric}` yet."
 
-    suffix = (
-        f" (smoothed: mean of last {smooth} points)"
-        if smooth > 0 else ""
-    )
-    out = [f"`{metric}`{suffix}:", ""]
-    for idx, nm, v in rows:
-        out.append(f"  #{idx} {nm}: {_format_metric_value(v)}")
+    # Sort: loss-like metrics ascending (low = good), others descending.
+    lc = metric.lower()
+    reverse = "loss" not in lc and "error" not in lc
+    rows.sort(key=lambda r: r[2], reverse=reverse)
+    direction = "low → high" if not reverse else "high → low"
+
+    idx_w = max(len(str(r[0])) for r in rows) + 1  # +1 for '#'
+    val_w = max(len(_format_metric_value(r[2])) for r in rows)
+    aligned = _align_names([r[1] for r in rows])
+
+    suffix = f"  (mean of last {smooth})" if smooth > 0 else ""
+    n = len(rows)
+    header = f"{metric} — {n} trial{'s' if n != 1 else ''}, {direction}{suffix}"
+    out = [header]
+    for (idx, _, v), nm_col in zip(rows, aligned):
+        idx_col = f"#{idx}".ljust(idx_w)
+        val_col = _format_metric_value(v).rjust(val_w)
+        out.append(f"  {idx_col}  {val_col}  {nm_col}")
     return "\n".join(out)
 
 
@@ -566,7 +599,7 @@ def cmd_help() -> str:
     """List of available slash commands."""
     return (
         "**HerdDog commands**\n"
-        "`/status` — current sweep totals + per-trial table (active-first; capped at 35)\n"
+        "`/status` — refresh and move the live dashboard embed to the bottom of the chat\n"
         "`/running` — active trials only (running + queued + submitted)\n"
         "`/stats` — timing and memory stats per trial\n"
         "`/params` — sweep config: parameters, grid shape, all trial combos\n"

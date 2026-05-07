@@ -929,17 +929,47 @@ class DiscordChannel(MessageChannel):
 
         @self._tree.command(
             name="status",
-            description="Sweep totals + per-trial table",
+            description="Refresh and move the live dashboard embed to the bottom of the chat",
             guild=guild,
         )
         async def status_cmd(interaction: discord.Interaction) -> None:
             if not await in_bound_channel(interaction):
                 return
-            await interaction.response.defer(thinking=True)
-            text = await asyncio.get_running_loop().run_in_executor(
-                None, cmd_mod.cmd_status, ws,
-            )
-            await interaction.followup.send(_codeblock(text))
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            from hyperherd.monitor_agent import state as state_mod
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, state_mod.refresh_snapshot, ws,
+                )
+            except Exception as e:
+                log.warning("/status snapshot refresh failed: %s", e)
+            try:
+                embed = self._build_dashboard_embed()
+            except Exception as e:
+                await interaction.followup.send(
+                    f"⚠️ Dashboard build failed: {e}", ephemeral=True,
+                )
+                return
+            old_msg = self._dashboard_msg
+            if old_msg is not None:
+                try:
+                    await old_msg.delete()
+                except Exception:
+                    pass
+            view = self._build_dashboard_view()
+            try:
+                new_msg = await self._channel.send(embed=embed, view=view)
+                self._dashboard_msg = new_msg
+                try:
+                    await new_msg.pin(reason="HyperHerd live dashboard")
+                except Exception:
+                    pass
+            except Exception as e:
+                await interaction.followup.send(
+                    f"⚠️ Failed to repost dashboard: {e}", ephemeral=True,
+                )
+                return
+            await interaction.followup.send("✅ Dashboard moved to bottom.", ephemeral=True)
 
         @self._tree.command(
             name="running",
