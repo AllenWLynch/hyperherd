@@ -114,6 +114,10 @@ class TestHyperHerdLoggerEnabled(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         manifest.init_workspace(self.tmp)
+        with open(os.path.join(
+            self.tmp, manifest.WORKSPACE_DIR, manifest.MANIFEST_FILE,
+        ), "w") as f:
+            f.write("{}")
         os.environ["HYPERHERD_WORKSPACE"] = self.tmp
         os.environ["HYPERHERD_TRIAL_ID"] = "5"
 

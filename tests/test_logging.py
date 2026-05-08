@@ -23,6 +23,12 @@ class TestLogResult(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         manifest.init_workspace(self.tmpdir)
+        # `log_result(strict=True)` requires the manifest to exist so the
+        # bind-mount check passes. Drop a stub.
+        with open(os.path.join(
+            self.tmpdir, manifest.WORKSPACE_DIR, manifest.MANIFEST_FILE,
+        ), "w") as f:
+            f.write("{}")
         # Set env vars as mush would
         os.environ["HYPERHERD_WORKSPACE"] = self.tmpdir
         os.environ["HYPERHERD_TRIAL_ID"] = "3"
@@ -157,6 +163,10 @@ class TestLoadAllResults(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         manifest.init_workspace(self.tmpdir)
+        with open(os.path.join(
+            self.tmpdir, manifest.WORKSPACE_DIR, manifest.MANIFEST_FILE,
+        ), "w") as f:
+            f.write("{}")
         os.environ["HYPERHERD_WORKSPACE"] = self.tmpdir
 
     def tearDown(self):

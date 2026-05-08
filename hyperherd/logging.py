@@ -20,9 +20,66 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
-from hyperherd.manifest import WORKSPACE_DIR
+from hyperherd.manifest import MANIFEST_FILE, WORKSPACE_DIR
 
 RESULTS_DIR = "results"
+
+
+def assert_writable() -> None:
+    """Verify the trainer is running in a usable HyperHerd trial context.
+
+    Raises RuntimeError if `HYPERHERD_WORKSPACE` / `HYPERHERD_TRIAL_ID`
+    are unset, the workspace directory isn't visible to this process
+    (typical container bind-mount failure), or the workspace's manifest
+    is missing. Call once at trainer startup to fail-fast instead of
+    discovering empty result files at the end of a long run.
+
+    This is the same check `log_result(strict=True)` runs per call,
+    exposed so trainers can do it once up-front.
+    """
+    _check_writable()
+
+
+def _check_writable() -> None:
+    """Raise RuntimeError if the current process can't actually write a
+    metric to the host's workspace.
+
+    Catches the silent-failure mode where a container starts with
+    `HYPERHERD_WORKSPACE` set but the workspace path isn't bind-mounted
+    in: `os.makedirs(exist_ok=True)` then creates the directory inside
+    the container's ephemeral filesystem and writes succeed but land
+    nowhere durable. We detect this by requiring `.hyperherd/manifest.json`
+    to be visible — the host writes that file before launch, so its
+    presence proves the mount made it through.
+    """
+    workspace = os.environ.get("HYPERHERD_WORKSPACE")
+    if not workspace:
+        raise RuntimeError(
+            "HYPERHERD_WORKSPACE is not set. log_result(strict=True) must "
+            "be called from within a HyperHerd trial."
+        )
+    if os.environ.get("HYPERHERD_TRIAL_ID") is None:
+        raise RuntimeError(
+            "HYPERHERD_TRIAL_ID is not set. log_result(strict=True) must "
+            "be called from within a HyperHerd trial."
+        )
+    if not os.path.isdir(workspace):
+        raise RuntimeError(
+            f"HYPERHERD_WORKSPACE={workspace!r} is set but the directory is "
+            f"not visible to this process. If you're running inside a "
+            f"container, the workspace path is likely not bind-mounted "
+            f"(apptainer: add `--bind {workspace}:{workspace}`)."
+        )
+    manifest_path = os.path.join(workspace, WORKSPACE_DIR, MANIFEST_FILE)
+    if not os.path.isfile(manifest_path):
+        raise RuntimeError(
+            f"Workspace {workspace!r} is visible but {WORKSPACE_DIR}/{MANIFEST_FILE} "
+            f"is missing. If you're running inside a container, only part of "
+            f"the workspace tree is mounted — bind the whole workspace, not "
+            f"just a subdirectory. Otherwise this trial was launched without "
+            f"a populated manifest, which shouldn't happen via `herd run` / "
+            f"`herd test`."
+        )
 
 
 def _results_dir() -> str:
@@ -46,7 +103,13 @@ def _results_path() -> str:
     return os.path.join(_results_dir(), f"{trial_id}.json")
 
 
-def log_result(name: str, value, step: Optional[int] = None) -> None:
+def log_result(
+    name: str,
+    value,
+    step: Optional[int] = None,
+    *,
+    strict: bool = True,
+) -> None:
     """Log a named metric for the current trial.
 
     Two modes:
@@ -69,7 +132,16 @@ def log_result(name: str, value, step: Optional[int] = None) -> None:
         name: Metric name (e.g. "val_loss", "test_accuracy").
         value: Metric value (must be JSON-serializable).
         step: Optional step counter. If given, switches to streaming mode.
+        strict: Default True. Verifies the host workspace is actually
+            visible to this process before writing — catches the case
+            where a container sets HYPERHERD_WORKSPACE but the path
+            isn't bind-mounted (the write would otherwise succeed
+            silently into the container's ephemeral FS). Set to False
+            only if you have a specific reason to skip the mount check
+            (e.g. an isolated test that genuinely runs outside a trial).
     """
+    if strict:
+        _check_writable()
     if step is None:
         _log_result_final(name, value)
     else:
