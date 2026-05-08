@@ -153,6 +153,8 @@ async def run_tick(
             "mcp__hyperherd__read_state",
             "mcp__hyperherd__read_plan",
             "mcp__hyperherd__write_plan",
+            "mcp__hyperherd__read_user_prompt",
+            "mcp__hyperherd__mark_user_prompt_read",
             "mcp__hyperherd__bump_mem",
             "mcp__hyperherd__bump_time",
             "mcp__hyperherd__run_indices",
