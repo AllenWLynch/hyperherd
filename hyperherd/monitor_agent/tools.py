@@ -65,6 +65,8 @@ def set_context(
     _CTX["audit_log_path"] = Path(workspace) / ".hyperherd" / "agent_log.jsonl"
     _CTX["next_tick_path"] = Path(workspace) / ".hyperherd" / "next-tick.json"
     _CTX["plan_path"] = Path(workspace) / ".hyperherd" / "MONITOR_PLAN.md"
+    _CTX["user_prompt_path"] = Path(workspace) / "PROMPT.md"
+    _CTX["user_prompt_ack_path"] = Path(workspace) / ".hyperherd" / "user-prompt.sha256"
     _CTX["channel"] = channel
 
 
@@ -139,6 +141,47 @@ async def read_plan(args: Dict[str, Any]) -> Dict[str, Any]:
         return _text_response(path.read_text())
     except OSError as e:
         return _text_response(f"failed to read plan: {e}", is_error=True)
+
+
+@tool(
+    "read_user_prompt",
+    "Return the workspace-root PROMPT.md contents and its sha256. Use this when "
+    "the per-tick state says PROMPT.md is `new` or `changed` and you need to "
+    "fold its instructions into MONITOR_PLAN.md. Skip when status is `unchanged` "
+    "— the file hasn't moved since you last acknowledged it. Returns "
+    "{exists, sha256, text}.",
+    {},
+)
+async def read_user_prompt(args: Dict[str, Any]) -> Dict[str, Any]:
+    import hashlib
+    path = _CTX.get("user_prompt_path")
+    if path is None or not path.is_file():
+        return _text_response({"exists": False, "sha256": None, "text": None})
+    try:
+        text = path.read_text()
+    except OSError as e:
+        return _text_response(f"failed to read PROMPT.md: {e}", is_error=True)
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return _text_response({"exists": True, "sha256": sha, "text": text})
+
+
+@tool(
+    "mark_user_prompt_read",
+    "Record that you have read PROMPT.md at the given sha256 and folded its "
+    "instructions into MONITOR_PLAN.md. Future ticks will then see "
+    "user_prompt.status=`unchanged` until the file is edited again. Pass the "
+    "sha256 from `read_user_prompt` (or from state.user_prompt.sha256).",
+    {"sha256": str},
+)
+async def mark_user_prompt_read(args: Dict[str, Any]) -> Dict[str, Any]:
+    sha = (args.get("sha256") or "").strip()
+    if not sha:
+        return _text_response("sha256 is required", is_error=True)
+    path = _CTX["user_prompt_ack_path"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(sha + "\n")
+    _audit("mark_user_prompt_read", sha256=sha)
+    return _text_response({"acknowledged_sha256": sha, "path": str(path)})
 
 
 @tool(
@@ -888,6 +931,7 @@ def _scale_time(value: str, percent: int) -> str:
 
 ALL = [
     read_state, read_plan, write_plan,
+    read_user_prompt, mark_user_prompt_read,
     bump_mem, bump_time,
     run_indices, stop_index, stop_all, prune_index,
     validate_config, tail_log, list_metrics, compute_metric,

@@ -24,6 +24,7 @@ PREV_SNAPSHOT_FILE = "last-snapshot.prev.json"
 INBOX_FILE = "inbox.jsonl"
 PLAN_FILE = "MONITOR_PLAN.md"
 OUTBOUND_FILE = "last-outbound.jsonl"
+USER_PROMPT_FILE = "PROMPT.md"   # workspace-root, user-authored standing instructions
 
 
 TickTrigger = Literal["scheduled", "failure", "completion", "user_message", "boot"]
@@ -61,6 +62,21 @@ class ChatEntry:
 
 
 @dataclass
+class UserPromptView:
+    """The workspace-level PROMPT.md, surfaced to the agent only when it
+    differs from the last hash the agent acknowledged via
+    `mark_user_prompt_read(hash)`. `status` is one of:
+
+      - "new":       agent has never acknowledged a hash
+      - "changed":   on-disk hash differs from the last acknowledged one
+      - "unchanged": hashes match (in this case `text` is omitted to save tokens)
+    """
+    status: Literal["new", "changed", "unchanged"]
+    sha256: str
+    text: Optional[str]   # populated when status != "unchanged"
+
+
+@dataclass
 class TickState:
     """The single document the agent reads at the start of every tick."""
     sweep_name: str
@@ -74,6 +90,7 @@ class TickState:
     newly_pruned: List[int]
     inbox: List[InboundMessage]
     chat_history: List[ChatEntry]   # rolling buffer of recent real messages
+    user_prompt: Optional["UserPromptView"] = None   # PROMPT.md state (None if file absent)
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-serializable form — what `read_state()` hands the agent."""
@@ -89,6 +106,7 @@ class TickState:
             "newly_pruned": self.newly_pruned,
             "inbox": [asdict(m) for m in self.inbox],
             "chat_history": [asdict(m) for m in self.chat_history],
+            "user_prompt": asdict(self.user_prompt) if self.user_prompt else None,
         }
 
 
@@ -191,6 +209,44 @@ def _read_plan(workspace: Path) -> str:
         return path.read_text()
     except OSError:
         return ""
+
+
+def _read_user_prompt(workspace: Path) -> Optional[UserPromptView]:
+    """Load PROMPT.md from the workspace root and compare its hash to the
+    last one the agent acknowledged via `mark_user_prompt_read`. Returns
+    None if the file is absent.
+
+    The acknowledged hash lives at `.hyperherd/user-prompt.sha256` (a
+    single hex digest). When it matches the current file hash, we return
+    a status="unchanged" view with `text=None` so the agent sees that
+    nothing has changed without re-paying for the file's tokens every
+    tick.
+    """
+    import hashlib
+
+    path = workspace / USER_PROMPT_FILE
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    ack_path = _hyperherd_dir(workspace) / "user-prompt.sha256"
+    last_sha: Optional[str] = None
+    if ack_path.is_file():
+        try:
+            last_sha = ack_path.read_text().strip() or None
+        except OSError:
+            last_sha = None
+
+    if last_sha is None:
+        return UserPromptView(status="new", sha256=sha, text=text)
+    if last_sha != sha:
+        return UserPromptView(status="changed", sha256=sha, text=text)
+    return UserPromptView(status="unchanged", sha256=sha, text=None)
 
 
 def _drain_inbox(workspace: Path) -> List[InboundMessage]:
@@ -332,4 +388,5 @@ def compute(workspace: Path, trigger: TickTrigger = "scheduled") -> TickState:
         newly_pruned=_diff_pruned(prev, cur),
         inbox=_drain_inbox(workspace),
         chat_history=_read_chat_history(workspace),
+        user_prompt=_read_user_prompt(workspace),
     )

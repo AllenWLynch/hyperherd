@@ -41,6 +41,8 @@ The full per-tick state document is **already in this user message** — totals,
 - `read_state()` → full state dict (totals, every trial, stderr tails, inbox, chat_history). Use **only if** you need per-trial detail.
 - `read_plan()` → `MONITOR_PLAN.md` contents. Skip — the plan is in the prompt.
 - `write_plan(plan)` → replace the plan
+- `read_user_prompt()` → `PROMPT.md` contents + sha256. Only call when the per-tick state says `user_prompt.status` is `new` or `changed` (text is also already inlined in the user message in those cases — this tool is the structured form).
+- `mark_user_prompt_read(sha256)` → record that you've folded the current `PROMPT.md` into the plan. Required after acting on a `new`/`changed` PROMPT.md so future ticks stop re-surfacing it.
 - `bump_mem(percent)` / `bump_time(percent)` → e.g. `bump_mem(50)` for +50%
 - `run_indices(indices, force)` → submit/resubmit specific trials. `force=True` re-submits even if they already ran.
 - `stop_index(index)` / `stop_all()` → cancel running trials (user-driven; status becomes `cancelled`, will be resubmitted on the next `herd run`).
@@ -58,6 +60,16 @@ The full per-tick state document is **already in this user message** — totals,
 External logger tools may be available — `mcp__wandb__*`, `mcp__mlflow__*`, etc. — if the user wired one in via the `mcp_servers:` block in `hyperherd.yaml`. They give you direct read access to whatever runs the trainer wrote. If you don't see them in your tool list, they aren't configured. Prefer `compute_metric` for routine aggregates (cheaper, deterministic, in-process) and reach for the logger MCP only when the user asks something compute_metric can't answer.
 
 **`msg` vs `tick_summary`** — chat_history only contains `msg` calls. Use `msg` when content is *addressed to* the user (a reply, a question, an alert that warrants attention); use `tick_summary` for the routine per-tick status line. Mixing them up either crowds out conversation or makes you forget what you said.
+
+## `PROMPT.md` (user's standing instructions)
+
+Before the interview, check the per-tick state for `user_prompt`. The user can drop a `PROMPT.md` in the workspace root with standing instructions — success metric, remediation policy, "don't ping me past 10pm", domain hints, etc. The state surfaces it three ways:
+
+- `status: new` — first boot with a PROMPT.md present. Read it, fold any actionable items into the plan you're about to write, and call `mark_user_prompt_read(sha256=...)`. Then run a *shorter* interview: skip questions PROMPT.md already answered (e.g. if it specifies the success metric, don't ask question 1). If PROMPT.md fully covers questions 1–3, skip the interview entirely and confirm with one short `msg` ("Read PROMPT.md — optimizing for X, remediation Y. Starting canary.").
+- `status: changed` — the user edited PROMPT.md between ticks. Read the new contents, update the plan to reflect any policy changes (e.g. user changed `Remediation` from notify→remediate), and call `mark_user_prompt_read`. Acknowledge in a brief `msg` so the user knows you saw the edit.
+- `status: unchanged` — already reflected in your plan from a prior tick. Do nothing extra.
+
+PROMPT.md **overrides** interview defaults. If PROMPT.md says "minimize val/loss" and the user later answers "maximize accuracy" in chat, the chat answer wins — but otherwise PROMPT.md is the source of truth for standing policy.
 
 ## Boot: classify the workspace, then plan
 

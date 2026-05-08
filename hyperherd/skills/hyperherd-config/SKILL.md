@@ -7,7 +7,7 @@ description: Author or edit a HyperHerd sweep configuration (hyperherd.yaml) and
 HyperHerd runs SLURM hyperparameter sweeps from two files in a workspace directory:
 
 - `hyperherd.yaml` — declarative sweep config (parameters, grid mode, SLURM resources, conditions, static overrides, optional Discord channel for the autonomous monitor)
-- `launch.sh` — bash script that receives a `name=value` override string as `$1` and runs the training command. The string format is whatever the launcher chooses to do with it — Hydra trainers consume it natively; non-Hydra trainers can `parse_overrides()` it (see `from hyperherd import parse_overrides`).
+- `launch.sh` — bash script that receives a `name=value` override string as **the first positional argument (`$1`)**. HyperHerd does not edit, template, or string-substitute into this file; it just invokes `bash launch.sh "<override-string>"` per trial. The script must read `$1` (typically `OVERRIDES="$1"`) and forward those tokens to its training command — there is no magic placeholder to splice into the file. The string format is whatever the launcher chooses to do with it — Hydra trainers consume it natively; non-Hydra trainers can `parse_overrides()` it (see `from hyperherd import parse_overrides`).
 
 The full reference lives at `docs/configuration.md` in this repo. **Read it before writing a non-trivial config** — this skill is a checklist and a set of patterns, not a substitute for the doc.
 
@@ -114,6 +114,22 @@ static_overrides:
 These are **not** swept and **not** validated against the parameter list — they're free-form `name=value` tokens passed verbatim to the launcher (which forwards them as-is to the trainer). Hydra trainers consume them as overrides; non-Hydra trainers can `parse_overrides()` them. Use this for fixed paths, seeds, dataset roots, logger config, etc. that differ from your trainer's defaults but don't change across the sweep.
 
 If the value should depend on a swept parameter, use a condition with `set:` instead.
+
+## Pre-written instructions to the monitor (`PROMPT.md`)
+
+Drop a `PROMPT.md` file in the workspace root (next to `hyperherd.yaml`) to give `herd monitor` standing instructions for the sweep. The file is read fresh on every tick and rendered into the agent's user-message context, so edits take effect on the next wake-up — no daemon restart.
+
+Use it for things you'd otherwise have to repeat in chat:
+
+- The success metric and direction (`maximize val/acc`, `minimize val/loss`) — saves the interview round-trip on greenfield boots.
+- Domain hints the agent can't infer from logs alone ("loss below 0.5 by step 1000 is the threshold for 'looks promising'").
+- Remediation policy ("don't bump time past 12h", "prune anything diverging past step 5000").
+- Pointers to dashboards or external tooling the agent should mention to the user.
+- "Quiet hours" or cadence preferences ("don't ping me between 10pm-8am unless something fails").
+
+Keep it short — it's read every tick and counts toward the prompt budget. A dozen lines is plenty.
+
+`PROMPT.md` is **complementary** to `MONITOR_PLAN.md`: PROMPT.md is the user's stable preamble, MONITOR_PLAN.md is the agent's evolving working memory (it rewrites it each tick). Don't duplicate state into PROMPT.md.
 
 ## Discord block (autonomous monitor)
 
@@ -284,6 +300,8 @@ conditions:
 ```
 
 ### Launcher (Apptainer)
+
+`$1` is the override string HyperHerd passes in. `$OVERRIDES` is then expanded (unquoted, on purpose) into space-separated tokens for the training command — `python train.py lr=0.001 opt=adam`. Don't search for or modify any placeholder inside this file; HyperHerd never reads it.
 
 ```bash
 #!/bin/bash

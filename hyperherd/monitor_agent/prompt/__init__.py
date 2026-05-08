@@ -75,6 +75,25 @@ def render_state(state: TickState) -> str:
         lines.append("")
 
     lines.append("---")
+    if state.user_prompt is not None:
+        up = state.user_prompt
+        if up.status == "unchanged":
+            lines.append(f"PROMPT.md (workspace standing instructions): "
+                         f"unchanged since you last acknowledged "
+                         f"(sha256 {up.sha256[:12]}…). Already reflected in your plan.")
+        else:
+            label = "new — first time you've seen it" if up.status == "new" else "changed since last acknowledged"
+            lines.append(f"**PROMPT.md ({label}, sha256 {up.sha256[:12]}…):**")
+            lines.append("")
+            lines.append((up.text or "").rstrip())
+            lines.append("")
+            lines.append("Action: read these instructions, fold anything actionable "
+                         "into MONITOR_PLAN.md (success metric, remediation policy, "
+                         "cadence preferences, etc.), then call "
+                         "`mark_user_prompt_read(sha256=...)` so future ticks don't "
+                         "re-pay for it. Treat PROMPT.md as the user's standing "
+                         "preamble — it overrides defaults from the interview.")
+        lines.append("")
     if state.plan:
         lines.append("Plan (from MONITOR_PLAN.md):")
         lines.append("")
