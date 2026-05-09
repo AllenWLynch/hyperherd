@@ -593,6 +593,95 @@ def cmd_params(workspace: Path) -> str:
     return "\n".join(lines)
 
 
+# --- /results -------------------------------------------------------------
+
+def build_results_table(workspace: Path) -> Optional[dict]:
+    """Build the `herd res` summary as both a column-aligned text table and
+    a TSV blob, plus the bare list of (header, rows) for callers that want
+    to do their own formatting.
+
+    Returns None when the workspace has no trials. Otherwise:
+        {
+          "header": [str, ...],
+          "rows":   [[str, ...], ...],
+          "table_text": "...",   # column-aligned, suitable for code block
+          "tsv":        "...",   # tab-separated, suitable for file upload
+          "n_trials":  int,
+          "n_metrics": int,
+        }
+    """
+    from hyperherd.logging import load_all_results
+    from hyperherd import manifest as manifest_mod
+
+    trials = manifest_mod.load_manifest(str(workspace))
+    if not trials:
+        return None
+    results = load_all_results(str(workspace))
+
+    # Derive parameter column order from the first trial's `params` dict
+    # (insertion order matches the YAML's declaration order — that's how
+    # the manifest is written), then accumulate any extra keys later trials
+    # introduce. We avoid going through `load_config` so this still works
+    # if the YAML develops a transient validation error mid-sweep.
+    param_names: list = []
+    seen_params: set = set()
+    for trial in trials:
+        for p in (trial.get("params") or {}):
+            if p not in seen_params:
+                param_names.append(p)
+                seen_params.add(p)
+
+    metric_names: list = []
+    seen: set = set()
+    for trial_results in results.values():
+        for k in trial_results:
+            if k not in seen:
+                metric_names.append(k)
+                seen.add(k)
+
+    header = ["idx", "experiment_name"] + param_names + metric_names
+
+    def _fmt(v):
+        if v == "" or v is None:
+            return ""
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        return str(v)
+
+    rows: list = []
+    for trial in trials:
+        idx = trial["index"]
+        params = trial.get("params", {})
+        trial_results = results.get(idx, {})
+        row = [str(idx), trial.get("experiment_name") or ""]
+        for p in param_names:
+            row.append(_fmt(params.get(p, "")))
+        for m in metric_names:
+            row.append(_fmt(trial_results.get(m, "")))
+        rows.append(row)
+
+    widths = [len(h) for h in header]
+    for row in rows:
+        for i, cell in enumerate(row):
+            if len(cell) > widths[i]:
+                widths[i] = len(cell)
+
+    def _line(cells):
+        return "  ".join(c.ljust(widths[i]) for i, c in enumerate(cells)).rstrip()
+
+    table_text = "\n".join([_line(header)] + [_line(r) for r in rows])
+    tsv = "\n".join(["\t".join(header)] + ["\t".join(r) for r in rows]) + "\n"
+
+    return {
+        "header": header,
+        "rows": rows,
+        "table_text": table_text,
+        "tsv": tsv,
+        "n_trials": len(trials),
+        "n_metrics": len(metric_names),
+    }
+
+
 # --- /help ----------------------------------------------------------------
 
 def cmd_help() -> str:
@@ -605,6 +694,7 @@ def cmd_help() -> str:
         "`/params` — sweep config: parameters, grid shape, all trial combos\n"
         "`/metrics` — list logged metric names; `/metrics <name>` shows each trial's value\n"
         "`/plot <metric> [trials] [smooth]` — PNG plot of a metric across trials (e.g. `/plot train/loss 0-3`)\n"
+        "`/results` — upload the per-trial parameters + final metrics table as a TSV file\n"
         "`/info` — daemon metadata: workspace, phase, uptime, ticks, cost\n"
         "`/plan` — show the agent's `MONITOR_PLAN.md`\n"
         "`/run <index>` — submit (or resubmit) one trial\n"

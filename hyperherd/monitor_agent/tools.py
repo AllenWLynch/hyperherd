@@ -698,13 +698,13 @@ async def post_plot(args: Dict[str, Any]) -> Dict[str, Any]:
 
 @tool(
     "post_results_table",
-    "Post a column-aligned summary of trial parameters and logged metrics "
-    "(the same data `herd res` shows) to the chat channel. Use this at "
-    "sweep end — call it before `halt('sweep complete')` so the user gets "
-    "the final table without having to shell into the host. Posts inline "
-    "as a code block when small; uploads as a TSV file when the table "
-    "would exceed Discord's per-message limit. If `caption` is set, it's "
-    "posted alongside as a chat message.",
+    "Upload trial parameters + logged metrics (the same data `herd res` "
+    "shows) to the chat channel as a TSV file, so the user can download "
+    "it for plotting or analysis. When the rendered table is small "
+    "enough, an inline code-block preview is included in the message "
+    "body alongside the file. Use this at sweep end — call it before "
+    "`halt('sweep complete')`. Optional `caption` is posted as the "
+    "message body above the file.",
     {"caption": Optional[str]},
 )
 async def post_results_table(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -719,14 +719,8 @@ async def post_results_table(args: Dict[str, Any]) -> Dict[str, Any]:
 
     workspace = _CTX["workspace"]
     try:
-        from hyperherd.config import load_config
-        from hyperherd.logging import load_all_results
-        from hyperherd import manifest as manifest_mod
-
-        config = load_config(str(workspace))
-        trials = manifest_mod.load_manifest(config.workspace)
-        results = load_all_results(config.workspace)
-        param_names = list(config.param_names)
+        from hyperherd.monitor_agent.commands import build_results_table
+        built = build_results_table(workspace)
     except Exception as e:
         _audit("post_results_table_failed_load", error=str(e))
         return _text_response(
@@ -734,91 +728,35 @@ async def post_results_table(args: Dict[str, Any]) -> Dict[str, Any]:
             is_error=True,
         )
 
-    if not trials:
+    if built is None:
         return _text_response(
             {"posted": False, "reason": "no trials in manifest"},
             is_error=True,
         )
 
-    metric_names: list = []
-    seen: set = set()
-    for trial_results in results.values():
-        for k in trial_results:
-            if k not in seen:
-                metric_names.append(k)
-                seen.add(k)
-
-    header = ["idx", "experiment_name"] + param_names + metric_names
-
-    def _fmt(v: Any) -> str:
-        if v == "" or v is None:
-            return ""
-        if isinstance(v, float):
-            return f"{v:.6g}"
-        return str(v)
-
-    body_rows: list = []
-    for trial in trials:
-        idx = trial["index"]
-        params = trial.get("params", {})
-        trial_results = results.get(idx, {})
-        row = [str(idx), trial.get("experiment_name") or ""]
-        for p in param_names:
-            row.append(_fmt(params.get(p, "")))
-        for m in metric_names:
-            row.append(_fmt(trial_results.get(m, "")))
-        body_rows.append(row)
-
-    widths = [len(h) for h in header]
-    for row in body_rows:
-        for i, cell in enumerate(row):
-            if len(cell) > widths[i]:
-                widths[i] = len(cell)
-
-    def _line(cells: list) -> str:
-        return "  ".join(c.ljust(widths[i]) for i, c in enumerate(cells)).rstrip()
-
-    table_lines = [_line(header)] + [_line(r) for r in body_rows]
-    table_text = "\n".join(table_lines)
-
-    body_prefix = _agent_prefix(caption) + "\n" if caption else None
-    code_block = f"```\n{table_text}\n```"
-
-    # Discord caps a single message at 2000 chars. Leave headroom for the
-    # agent prefix + caption + code-fence overhead; if we'd exceed it,
-    # upload as a TSV file instead so nothing is truncated.
-    inline = (body_prefix or "") + code_block
+    # Always upload the TSV — users want a downloadable file for plotting
+    # / analysis, not just an inline table that's a pain to copy out of
+    # Discord. When the rendered code-block table also fits in the
+    # message body, include it inline as a preview alongside the upload.
+    body_prefix = (_agent_prefix(caption) + "\n") if caption else ""
+    code_block = f"```\n{built['table_text']}\n```"
+    inline = body_prefix + code_block
     INLINE_LIMIT = 1900
-
-    if len(inline) <= INLINE_LIMIT:
-        try:
-            await channel.post(inline)
-            _audit("post_results_table",
-                   trials=len(trials), metrics=len(metric_names), mode="inline")
-            return _text_response({
-                "posted": True, "mode": "inline",
-                "trials": len(trials), "metrics": len(metric_names),
-            })
-        except Exception as e:
-            _audit("post_results_table_failed_post", error=str(e))
-            return _text_response(
-                {"posted": False, "error": str(e)}, is_error=True,
-            )
+    body = inline if len(inline) <= INLINE_LIMIT else (body_prefix.rstrip() or None)
 
     import tempfile
     tsv_path = Path(tempfile.mkstemp(suffix=".tsv", prefix="results-")[1])
     try:
-        with tsv_path.open("w") as f:
-            f.write("\t".join(header) + "\n")
-            for r in body_rows:
-                f.write("\t".join(r) + "\n")
+        tsv_path.write_text(built["tsv"])
         try:
-            await channel.post_file(tsv_path, body=body_prefix.rstrip() if body_prefix else None)
+            await channel.post_file(tsv_path, body=body)
             _audit("post_results_table",
-                   trials=len(trials), metrics=len(metric_names), mode="file")
+                   trials=built["n_trials"], metrics=built["n_metrics"],
+                   inline_preview=(body == inline))
             return _text_response({
-                "posted": True, "mode": "file",
-                "trials": len(trials), "metrics": len(metric_names),
+                "posted": True,
+                "trials": built["n_trials"], "metrics": built["n_metrics"],
+                "inline_preview": (body == inline),
             })
         except Exception as e:
             _audit("post_results_table_failed_upload", error=str(e))

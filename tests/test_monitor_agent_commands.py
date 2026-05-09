@@ -444,5 +444,51 @@ class TestCmdPrune(unittest.TestCase):
         self.assertEqual(trials[0]["status"], "pruned")
 
 
+class TestBuildResultsTable(unittest.TestCase):
+    def setUp(self):
+        from hyperherd import manifest
+        self.tmp = tempfile.mkdtemp()
+        self.workspace = Path(self.tmp)
+        manifest.init_workspace(self.tmp)
+        (self.workspace / ".hyperherd" / "manifest.json").write_text(json.dumps([
+            {"index": 0, "experiment_name": "lr-0.01_opt-adam",
+             "params": {"lr": 0.01, "opt": "adam"}, "status": "completed"},
+            {"index": 1, "experiment_name": "lr-0.001_opt-sgd",
+             "params": {"lr": 0.001, "opt": "sgd"}, "status": "completed"},
+        ]))
+        results_dir = self.workspace / ".hyperherd" / "results"
+        results_dir.mkdir(exist_ok=True)
+        (results_dir / "0.json").write_text(json.dumps({"val_loss": 0.42, "acc": 0.91}))
+        (results_dir / "1.json").write_text(json.dumps({"val_loss": 0.55, "acc": 0.87}))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_returns_table_text_and_tsv(self):
+        built = cmd_mod.build_results_table(self.workspace)
+        self.assertIsNotNone(built)
+        self.assertEqual(built["n_trials"], 2)
+        self.assertEqual(built["n_metrics"], 2)
+        self.assertEqual(built["header"][:4], ["idx", "experiment_name", "lr", "opt"])
+        self.assertIn("val_loss", built["header"])
+        self.assertIn("acc", built["header"])
+        # Column-aligned table is monospace-friendly.
+        lines = built["table_text"].splitlines()
+        self.assertEqual(len(lines), 3)  # header + 2 trials
+        # TSV is tab-separated and ends with a newline.
+        self.assertTrue(built["tsv"].endswith("\n"))
+        self.assertIn("\t", built["tsv"])
+
+    def test_returns_none_when_no_trials(self):
+        empty = tempfile.mkdtemp()
+        try:
+            from hyperherd import manifest
+            manifest.init_workspace(empty)
+            (Path(empty) / ".hyperherd" / "manifest.json").write_text("[]")
+            self.assertIsNone(cmd_mod.build_results_table(Path(empty)))
+        finally:
+            shutil.rmtree(empty)
+
+
 if __name__ == "__main__":
     unittest.main()

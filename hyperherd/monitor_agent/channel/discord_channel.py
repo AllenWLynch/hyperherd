@@ -1179,6 +1179,53 @@ class DiscordChannel(MessageChannel):
             )
 
         @self._tree.command(
+            name="results",
+            description="Upload the trial parameters + metrics table as TSV",
+            guild=guild,
+        )
+        async def results_cmd(interaction: discord.Interaction) -> None:
+            if not await in_bound_channel(interaction):
+                return
+            await interaction.response.defer(thinking=True)
+            try:
+                built = await asyncio.get_running_loop().run_in_executor(
+                    None, cmd_mod.build_results_table, self._workspace,
+                )
+            except Exception as e:
+                await interaction.followup.send(
+                    f"⚠️ Couldn't build results table: {type(e).__name__}: {e}",
+                    ephemeral=True,
+                )
+                return
+            if built is None:
+                await interaction.followup.send(
+                    "No trials in manifest yet — nothing to summarize.",
+                    ephemeral=True,
+                )
+                return
+
+            code_block = f"```\n{built['table_text']}\n```"
+            INLINE_LIMIT = 1900
+            content = code_block if len(code_block) <= INLINE_LIMIT else None
+
+            import tempfile
+            tsv_path = Path(tempfile.mkstemp(suffix=".tsv", prefix="results-")[1])
+            try:
+                tsv_path.write_text(built["tsv"])
+                try:
+                    f = discord.File(str(tsv_path))
+                    await interaction.followup.send(content=content, file=f)
+                except Exception as e:
+                    await interaction.followup.send(
+                        f"⚠️ Results upload failed: {e}", ephemeral=True,
+                    )
+            finally:
+                try:
+                    tsv_path.unlink()
+                except OSError:
+                    pass
+
+        @self._tree.command(
             name="tail",
             description="Last N lines of a trial's stderr log",
             guild=guild,
