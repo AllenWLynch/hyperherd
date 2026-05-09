@@ -356,10 +356,12 @@ class DiscordChannel(MessageChannel):
             log.warning("Failed to post to Discord: %s", e)
 
     async def post_file(
-        self, path: Path, *, body: Optional[str] = None,
+        self, path, *, body: Optional[str] = None,
     ) -> None:
-        """Upload a file to the channel. `body` is the optional
-        accompanying message text (Discord renders it above the file)."""
+        """Upload one or more files to the channel. `path` is either a
+        single Path or a list of Paths (multi-attachment in one message,
+        which Discord renders as a stacked carousel). `body` is the
+        optional accompanying message text rendered above the files."""
         if self._channel is None:
             log.warning(
                 "post_file() called before channel is ready; dropping %s",
@@ -370,11 +372,15 @@ class DiscordChannel(MessageChannel):
             import discord
         except ImportError:  # pragma: no cover
             return
+        paths = path if isinstance(path, list) else [path]
         try:
-            f = discord.File(str(path))
-            await self._channel.send(content=body, file=f)
+            files = [discord.File(str(p)) for p in paths]
+            if len(files) == 1:
+                await self._channel.send(content=body, file=files[0])
+            else:
+                await self._channel.send(content=body, files=files)
         except Exception as e:
-            log.warning("Failed to upload %s to Discord: %s", path, e)
+            log.warning("Failed to upload %s to Discord: %s", paths, e)
 
     async def post_to_trial_thread(
         self,
@@ -1180,10 +1186,18 @@ class DiscordChannel(MessageChannel):
 
         @self._tree.command(
             name="results",
-            description="Upload the trial parameters + metrics table as TSV",
+            description="Upload the results table (and per-step history) as files",
             guild=guild,
         )
-        async def results_cmd(interaction: discord.Interaction) -> None:
+        @app_commands.describe(
+            with_steps=(
+                "Also attach steps.tsv.gz — the long-form per-step "
+                "history (default true). Set false for summary only."
+            ),
+        )
+        async def results_cmd(
+            interaction: discord.Interaction, with_steps: bool = True,
+        ) -> None:
             if not await in_bound_channel(interaction):
                 return
             await interaction.response.defer(thinking=True)
@@ -1204,26 +1218,66 @@ class DiscordChannel(MessageChannel):
                 )
                 return
 
+            steps = None
+            if with_steps:
+                try:
+                    steps = await asyncio.get_running_loop().run_in_executor(
+                        None, cmd_mod.build_steps_blob, self._workspace,
+                    )
+                except Exception as e:
+                    log.warning("Couldn't build steps blob: %s", e)
+
+            DISCORD_FILE_LIMIT = 10 * 1024 * 1024
+            steps_oversize = (
+                steps is not None
+                and len(steps["gz_bytes"]) > DISCORD_FILE_LIMIT
+            )
+            if steps_oversize:
+                steps = None
+
             code_block = f"```\n{built['table_text']}\n```"
             INLINE_LIMIT = 1900
-            content = code_block if len(code_block) <= INLINE_LIMIT else None
+            content_parts: list = []
+            if len(code_block) <= INLINE_LIMIT:
+                content_parts.append(code_block)
+            if steps_oversize:
+                content_parts.append(
+                    "(per-step history was over Discord's 10 MB cap — "
+                    "pull it via `herd res --steps` on the host)"
+                )
+            content = "\n".join(content_parts) if content_parts else None
 
             import tempfile
             tsv_path = Path(tempfile.mkstemp(suffix=".tsv", prefix="results-")[1])
+            steps_path: Optional[Path] = None
             try:
                 tsv_path.write_text(built["tsv"])
+                files = [discord.File(str(tsv_path), filename="results.tsv")]
+                if steps is not None:
+                    steps_path = Path(tempfile.mkstemp(
+                        suffix=".tsv.gz", prefix="steps-",
+                    )[1])
+                    steps_path.write_bytes(steps["gz_bytes"])
+                    files.append(discord.File(
+                        str(steps_path), filename="steps.tsv.gz",
+                    ))
                 try:
-                    f = discord.File(str(tsv_path))
-                    await interaction.followup.send(content=content, file=f)
+                    if len(files) == 1:
+                        await interaction.followup.send(content=content, file=files[0])
+                    else:
+                        await interaction.followup.send(content=content, files=files)
                 except Exception as e:
                     await interaction.followup.send(
                         f"⚠️ Results upload failed: {e}", ephemeral=True,
                     )
             finally:
-                try:
-                    tsv_path.unlink()
-                except OSError:
-                    pass
+                for p in (tsv_path, steps_path):
+                    if p is None:
+                        continue
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
 
         @self._tree.command(
             name="tail",

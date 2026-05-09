@@ -65,11 +65,13 @@ class MessageChannel(Protocol):
         """Send a message body to the configured outbound destination."""
 
     async def post_file(
-        self, path: "Path", *, body: Optional[str] = None,
+        self, path, *, body: Optional[str] = None,
     ) -> None:
-        """Upload a file (PNG plot, log excerpt, ...) with optional
-        accompanying message text. Transports without a file primitive
-        should degrade gracefully — log + send `body` alone."""
+        """Upload one or more files with optional accompanying message
+        text. `path` may be a single `Path` or a list of `Path`s — when a
+        transport supports it, list form posts everything as a single
+        message with multiple attachments. Transports without a file
+        primitive should degrade gracefully (log + send `body` alone)."""
 
     async def post_to_trial_thread(
         self,

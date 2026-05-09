@@ -702,13 +702,20 @@ async def post_plot(args: Dict[str, Any]) -> Dict[str, Any]:
     "shows) to the chat channel as a TSV file, so the user can download "
     "it for plotting or analysis. When the rendered table is small "
     "enough, an inline code-block preview is included in the message "
-    "body alongside the file. Use this at sweep end — call it before "
+    "body alongside the file. By default also attaches `steps.tsv.gz` — "
+    "a gzipped long-form TSV of every per-step metric record (the same "
+    "data `herd res --steps` produces). Pass `with_steps=False` to "
+    "suppress that attachment, e.g. when the user only wants the "
+    "summary. Use this at sweep end — call it before "
     "`halt('sweep complete')`. Optional `caption` is posted as the "
     "message body above the file.",
-    {"caption": Optional[str]},
+    {"caption": Optional[str], "with_steps": Optional[bool]},
 )
 async def post_results_table(args: Dict[str, Any]) -> Dict[str, Any]:
     caption = args.get("caption")
+    with_steps = args.get("with_steps")
+    if with_steps is None:
+        with_steps = True
     channel = _CTX.get("channel")
     if channel is None:
         _audit("post_results_table_skipped_no_channel")
@@ -719,8 +726,11 @@ async def post_results_table(args: Dict[str, Any]) -> Dict[str, Any]:
 
     workspace = _CTX["workspace"]
     try:
-        from hyperherd.monitor_agent.commands import build_results_table
+        from hyperherd.monitor_agent.commands import (
+            build_results_table, build_steps_blob,
+        )
         built = build_results_table(workspace)
+        steps = build_steps_blob(workspace) if with_steps else None
     except Exception as e:
         _audit("post_results_table_failed_load", error=str(e))
         return _text_response(
@@ -744,30 +754,70 @@ async def post_results_table(args: Dict[str, Any]) -> Dict[str, Any]:
     INLINE_LIMIT = 1900
     body = inline if len(inline) <= INLINE_LIMIT else (body_prefix.rstrip() or None)
 
+    # Discord caps a single attachment at 10 MB on a non-boosted server.
+    # Skip the steps blob if it's too big (the agent can suggest the user
+    # pull it via `herd res --steps` on the host instead).
+    DISCORD_FILE_LIMIT = 10 * 1024 * 1024
+    steps_dropped_reason: Optional[str] = None
+    if steps is not None and len(steps["gz_bytes"]) > DISCORD_FILE_LIMIT:
+        steps_dropped_reason = (
+            f"steps.tsv.gz is {len(steps['gz_bytes']) / 1e6:.1f} MB — "
+            f"over Discord's 10 MB attachment cap; pull it via "
+            f"`herd res --steps` on the host."
+        )
+        steps = None
+
     import tempfile
     tsv_path = Path(tempfile.mkstemp(suffix=".tsv", prefix="results-")[1])
+    steps_path: Optional[Path] = None
     try:
         tsv_path.write_text(built["tsv"])
+        paths: list = [tsv_path]
+        if steps is not None:
+            steps_path = Path(tempfile.mkstemp(suffix=".tsv.gz", prefix="steps-")[1])
+            steps_path.write_bytes(steps["gz_bytes"])
+            paths.append(steps_path)
+
         try:
-            await channel.post_file(tsv_path, body=body)
-            _audit("post_results_table",
-                   trials=built["n_trials"], metrics=built["n_metrics"],
-                   inline_preview=(body == inline))
-            return _text_response({
+            await channel.post_file(paths if len(paths) > 1 else paths[0], body=body)
+            audit_fields = {
+                "trials": built["n_trials"],
+                "metrics": built["n_metrics"],
+                "inline_preview": (body == inline),
+                "steps_attached": steps is not None,
+            }
+            if steps is not None:
+                audit_fields.update({
+                    "steps_rows": steps["n_rows"],
+                    "steps_gz_bytes": len(steps["gz_bytes"]),
+                })
+            if steps_dropped_reason:
+                audit_fields["steps_dropped"] = steps_dropped_reason
+            _audit("post_results_table", **audit_fields)
+            response: Dict[str, Any] = {
                 "posted": True,
                 "trials": built["n_trials"], "metrics": built["n_metrics"],
                 "inline_preview": (body == inline),
-            })
+                "steps_attached": steps is not None,
+            }
+            if steps is not None:
+                response["steps_rows"] = steps["n_rows"]
+            if steps_dropped_reason:
+                response["steps_dropped"] = steps_dropped_reason
+            return _text_response(response)
         except Exception as e:
             _audit("post_results_table_failed_upload", error=str(e))
             return _text_response(
                 {"posted": False, "error": str(e)}, is_error=True,
             )
     finally:
-        try:
-            tsv_path.unlink()
-        except OSError:
-            pass
+        for p in (tsv_path, steps_path):
+            if p is None:
+                continue
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 @tool(

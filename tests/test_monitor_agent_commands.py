@@ -490,5 +490,57 @@ class TestBuildResultsTable(unittest.TestCase):
             shutil.rmtree(empty)
 
 
+class TestBuildStepsBlob(unittest.TestCase):
+    def setUp(self):
+        from hyperherd import manifest
+        self.tmp = tempfile.mkdtemp()
+        self.workspace = Path(self.tmp)
+        manifest.init_workspace(self.tmp)
+        (self.workspace / ".hyperherd" / "manifest.json").write_text(json.dumps([
+            {"index": 0, "params": {"lr": 0.01}, "status": "completed"},
+            {"index": 1, "params": {"lr": 0.001}, "status": "completed"},
+        ]))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _seed(self, idx, name, records):
+        d = self.workspace / ".hyperherd" / "results" / str(idx) / "stream"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{name}.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+
+    def test_returns_none_when_no_streams(self):
+        self.assertIsNone(cmd_mod.build_steps_blob(self.workspace))
+
+    def test_compresses_long_form_tsv_and_dedups_by_ts(self):
+        import gzip
+        self._seed(0, "val_loss", [
+            {"step": 0, "value": 1.0, "ts": 1000.0},
+            {"step": 1, "value": 0.5, "ts": 1100.0},
+            # Restart re-emits step 1 with a newer ts → new value wins.
+            {"step": 1, "value": 0.4, "ts": 1200.0},
+        ])
+        self._seed(1, "val_loss", [{"step": 0, "value": 0.9, "ts": 2000.0}])
+
+        blob = cmd_mod.build_steps_blob(self.workspace)
+        self.assertIsNotNone(blob)
+        self.assertEqual(blob["n_rows"], 3)  # (0,0), (0,1 dedup), (1,0)
+        self.assertEqual(blob["n_trials"], 2)
+        self.assertEqual(blob["n_metrics"], 1)
+        # gz_bytes should be smaller than uncompressed for a TSV
+        self.assertLess(len(blob["gz_bytes"]), blob["uncompressed"])
+
+        text = gzip.decompress(blob["gz_bytes"]).decode("utf-8")
+        lines = text.strip().split("\n")
+        self.assertEqual(lines[0], "trial_id\tstep\tmetric\ttimestamp\tvalue")
+        # Dedup picked 0.4, not 0.5
+        self.assertIn("0.4", text)
+        self.assertNotIn("0.5", text)
+
+
 if __name__ == "__main__":
     unittest.main()

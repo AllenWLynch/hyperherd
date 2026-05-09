@@ -682,6 +682,61 @@ def build_results_table(workspace: Path) -> Optional[dict]:
     }
 
 
+def build_steps_blob(workspace: Path) -> Optional[dict]:
+    """Build a gzipped TSV of every per-step metric record across the
+    workspace's trials, in long form (trial_id,step,metric,timestamp,value).
+
+    Returns None when no trial has streamed any metric. Otherwise:
+        {
+          "gz_bytes":      bytes,    # gzip-compressed UTF-8 TSV
+          "n_rows":        int,
+          "n_trials":      int,
+          "n_metrics":     int,
+          "uncompressed":  int,      # bytes
+        }
+
+    The TSV uses tabs (matching `results.tsv` from build_results_table).
+    Discord caps a single attachment at 10 MB on a non-boosted server,
+    50 MB at boost tier 2; the caller decides whether to upload based on
+    `len(gz_bytes)`.
+    """
+    import gzip
+    from hyperherd import manifest as manifest_mod
+    from hyperherd.logging import collect_step_rows
+
+    trials = manifest_mod.load_manifest(str(workspace))
+    if not trials:
+        return None
+
+    rows = collect_step_rows(str(workspace), trials)
+    if not rows:
+        return None
+
+    metrics_seen: set = set()
+    trials_seen: set = set()
+    body_lines: list = []
+    for tid, step, metric, ts_iso, value in rows:
+        trials_seen.add(tid)
+        metrics_seen.add(metric)
+        if isinstance(value, float):
+            v = f"{value:.6g}"
+        else:
+            v = str(value)
+        body_lines.append("\t".join([str(tid), str(step), metric, ts_iso, v]))
+
+    header = "\t".join(["trial_id", "step", "metric", "timestamp", "value"])
+    text = header + "\n" + "\n".join(body_lines) + "\n"
+    raw = text.encode("utf-8")
+    gz = gzip.compress(raw, compresslevel=6)
+    return {
+        "gz_bytes": gz,
+        "n_rows": len(rows),
+        "n_trials": len(trials_seen),
+        "n_metrics": len(metrics_seen),
+        "uncompressed": len(raw),
+    }
+
+
 # --- /help ----------------------------------------------------------------
 
 def cmd_help() -> str:
@@ -694,7 +749,7 @@ def cmd_help() -> str:
         "`/params` — sweep config: parameters, grid shape, all trial combos\n"
         "`/metrics` — list logged metric names; `/metrics <name>` shows each trial's value\n"
         "`/plot <metric> [trials] [smooth]` — PNG plot of a metric across trials (e.g. `/plot train/loss 0-3`)\n"
-        "`/results` — upload the per-trial parameters + final metrics table as a TSV file\n"
+        "`/results [with_steps]` — upload the per-trial parameters + final metrics table as a TSV (and `steps.tsv.gz` with the full per-step history unless `with_steps=false`)\n"
         "`/info` — daemon metadata: workspace, phase, uptime, ticks, cost\n"
         "`/plan` — show the agent's `MONITOR_PLAN.md`\n"
         "`/run <index>` — submit (or resubmit) one trial\n"

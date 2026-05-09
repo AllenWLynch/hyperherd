@@ -26,9 +26,7 @@ from hyperherd.preflight import PreflightError, run_preflight
 from hyperherd.search import generate_combinations
 from hyperherd import manifest
 from hyperherd import slurm
-from hyperherd.logging import (
-    load_all_results, list_metric_streams, load_metric_stream,
-)
+from hyperherd.logging import load_all_results, collect_step_rows
 
 
 _ACTIVE_STATUSES = ("running", "queued", "submitted", "completed")
@@ -808,34 +806,7 @@ def _cmd_results_steps(workspace: str, trials: list, *, json_output: bool) -> in
     trainer re-emitted a metric after a restart — keep the value with the
     largest `ts`.
     """
-    from datetime import datetime, timezone
-
-    rows = []  # (trial_id, step, metric, ts_iso, value)
-    for trial in trials:
-        idx = trial["index"]
-        for metric in list_metric_streams(workspace, idx):
-            stream = load_metric_stream(workspace, idx, metric)
-            # dedup by step, keeping the entry with the largest ts
-            by_step: dict = {}
-            for rec in stream:
-                step = rec.get("step")
-                if step is None:
-                    continue
-                ts = rec.get("ts", 0)
-                if step not in by_step or ts >= by_step[step].get("ts", 0):
-                    by_step[step] = rec
-            for step in sorted(by_step):
-                rec = by_step[step]
-                ts = rec.get("ts")
-                if isinstance(ts, (int, float)):
-                    ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(
-                        timespec="seconds"
-                    ).replace("+00:00", "Z")
-                else:
-                    ts_iso = ""
-                rows.append((idx, int(step), metric, ts_iso, rec.get("value")))
-
-    rows.sort(key=lambda r: (r[0], r[2], r[1]))
+    rows = collect_step_rows(workspace, trials)
 
     if json_output:
         agent_output.emit({"rows": [

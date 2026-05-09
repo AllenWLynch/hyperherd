@@ -256,6 +256,45 @@ def load_trial_results(workspace: str, trial_id: int) -> dict:
         return json.load(f)
 
 
+def collect_step_rows(workspace: str, trials: list) -> list:
+    """Walk every trial's per-metric stream files and produce long-form rows
+    (trial_id, step, metric, ts_iso, value) suitable for CSV/TSV emission.
+
+    When the same (trial, metric, step) was logged more than once — e.g.
+    a trainer re-emitted a metric after a restart — keep only the record
+    with the largest `ts`.
+
+    Rows are sorted (trial_id, metric, step). `ts_iso` is UTC ISO 8601
+    with seconds precision; missing timestamps render as the empty string.
+    """
+    from datetime import datetime, timezone
+
+    rows: list = []
+    for trial in trials:
+        idx = trial["index"]
+        for metric in list_metric_streams(workspace, idx):
+            by_step: dict = {}
+            for rec in load_metric_stream(workspace, idx, metric):
+                step = rec.get("step")
+                if step is None:
+                    continue
+                ts = rec.get("ts", 0)
+                if step not in by_step or ts >= by_step[step].get("ts", 0):
+                    by_step[step] = rec
+            for step in sorted(by_step):
+                rec = by_step[step]
+                ts = rec.get("ts")
+                if isinstance(ts, (int, float)):
+                    ts_iso = datetime.fromtimestamp(
+                        ts, tz=timezone.utc,
+                    ).isoformat(timespec="seconds").replace("+00:00", "Z")
+                else:
+                    ts_iso = ""
+                rows.append((idx, int(step), metric, ts_iso, rec.get("value")))
+    rows.sort(key=lambda r: (r[0], r[2], r[1]))
+    return rows
+
+
 def load_all_results(workspace: str) -> dict:
     """Load results for all trials. Returns {trial_id: {metric: value, ...}}."""
     results_dir = os.path.join(workspace, WORKSPACE_DIR, RESULTS_DIR)
