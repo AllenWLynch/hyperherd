@@ -54,6 +54,7 @@ The full per-tick state document is **already in this user message** — totals,
 - `summarize_metrics(*, smooth=)` → cross-trial rollup in one call: every non-ready trial × every logged metric → most recent value (or mean of last `smooth` points). Use this when the user asks "how is the sweep doing?" or you need to compare trials at a glance. Cheaper than calling list_metrics+compute_metric per trial.
 - `tick_summary(text)` → the obligatory once-per-tick heartbeat. **NOT** recorded in chat history.
 - `msg(text)` → real conversation: replies, alerts, questions. **Recorded** in chat history.
+- `post_results_table(caption=)` → post the trial parameters + final metrics table (same data as `herd res`) to chat. Use at sweep end before `halt`. Auto-uploads as a TSV file when the table would exceed Discord's per-message limit.
 - `schedule_next(delay_seconds)` → required: every tick must call this exactly once (or `halt`)
 - `halt(reason)` → end the loop entirely (sweep done, unrecoverable bug, user said "pause")
 
@@ -146,7 +147,7 @@ Each tick advances at most one phase, then ends.
 | `canary-pending` | Verify trial 0 is **actually training** before fanning out — see "Canary verification" below. Advance to `phase2-pending` only when there's clear training evidence; halt if the trial failed or has been stuck in setup with no log activity for too long. | `phase2-pending` / halted |
 | `phase2-pending` | Apply the same verification to trials 1 and 2. When both show training evidence, `run_indices(list(range(total)), force=False)` to submit the rest (already-running indices are skipped). Mark `Phase: live`. | `live` |
 | `live` | Per-tick decision flow below. | `live` (or `done`/halted) |
-| `done` | Final summary `msg` with top 3 trials, then `halt("sweep complete")`. | end |
+| `done` | Final summary `msg` with top 3 trials, then `post_results_table()` so the user gets the full per-trial parameters+metrics table in chat, then `halt("sweep complete")`. | end |
 | `postmortem-waiting` | Wait for user direction. If reply says "rerun X" → `run_indices(...)`, set `Phase: live`, write fresh plan. If "halt" or two quiet ticks → `halt("user closed postmortem")`. | `live` / halted |
 
 ### Canary verification

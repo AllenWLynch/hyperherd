@@ -697,6 +697,142 @@ async def post_plot(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @tool(
+    "post_results_table",
+    "Post a column-aligned summary of trial parameters and logged metrics "
+    "(the same data `herd res` shows) to the chat channel. Use this at "
+    "sweep end — call it before `halt('sweep complete')` so the user gets "
+    "the final table without having to shell into the host. Posts inline "
+    "as a code block when small; uploads as a TSV file when the table "
+    "would exceed Discord's per-message limit. If `caption` is set, it's "
+    "posted alongside as a chat message.",
+    {"caption": Optional[str]},
+)
+async def post_results_table(args: Dict[str, Any]) -> Dict[str, Any]:
+    caption = args.get("caption")
+    channel = _CTX.get("channel")
+    if channel is None:
+        _audit("post_results_table_skipped_no_channel")
+        return _text_response(
+            {"posted": False, "reason": "no chat channel configured"},
+            is_error=True,
+        )
+
+    workspace = _CTX["workspace"]
+    try:
+        from hyperherd.config import load_config
+        from hyperherd.logging import load_all_results
+        from hyperherd import manifest as manifest_mod
+
+        config = load_config(str(workspace))
+        trials = manifest_mod.load_manifest(config.workspace)
+        results = load_all_results(config.workspace)
+        param_names = list(config.param_names)
+    except Exception as e:
+        _audit("post_results_table_failed_load", error=str(e))
+        return _text_response(
+            {"posted": False, "error": f"{type(e).__name__}: {e}"},
+            is_error=True,
+        )
+
+    if not trials:
+        return _text_response(
+            {"posted": False, "reason": "no trials in manifest"},
+            is_error=True,
+        )
+
+    metric_names: list = []
+    seen: set = set()
+    for trial_results in results.values():
+        for k in trial_results:
+            if k not in seen:
+                metric_names.append(k)
+                seen.add(k)
+
+    header = ["idx", "experiment_name"] + param_names + metric_names
+
+    def _fmt(v: Any) -> str:
+        if v == "" or v is None:
+            return ""
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        return str(v)
+
+    body_rows: list = []
+    for trial in trials:
+        idx = trial["index"]
+        params = trial.get("params", {})
+        trial_results = results.get(idx, {})
+        row = [str(idx), trial.get("experiment_name") or ""]
+        for p in param_names:
+            row.append(_fmt(params.get(p, "")))
+        for m in metric_names:
+            row.append(_fmt(trial_results.get(m, "")))
+        body_rows.append(row)
+
+    widths = [len(h) for h in header]
+    for row in body_rows:
+        for i, cell in enumerate(row):
+            if len(cell) > widths[i]:
+                widths[i] = len(cell)
+
+    def _line(cells: list) -> str:
+        return "  ".join(c.ljust(widths[i]) for i, c in enumerate(cells)).rstrip()
+
+    table_lines = [_line(header)] + [_line(r) for r in body_rows]
+    table_text = "\n".join(table_lines)
+
+    body_prefix = _agent_prefix(caption) + "\n" if caption else None
+    code_block = f"```\n{table_text}\n```"
+
+    # Discord caps a single message at 2000 chars. Leave headroom for the
+    # agent prefix + caption + code-fence overhead; if we'd exceed it,
+    # upload as a TSV file instead so nothing is truncated.
+    inline = (body_prefix or "") + code_block
+    INLINE_LIMIT = 1900
+
+    if len(inline) <= INLINE_LIMIT:
+        try:
+            await channel.post(inline)
+            _audit("post_results_table",
+                   trials=len(trials), metrics=len(metric_names), mode="inline")
+            return _text_response({
+                "posted": True, "mode": "inline",
+                "trials": len(trials), "metrics": len(metric_names),
+            })
+        except Exception as e:
+            _audit("post_results_table_failed_post", error=str(e))
+            return _text_response(
+                {"posted": False, "error": str(e)}, is_error=True,
+            )
+
+    import tempfile
+    tsv_path = Path(tempfile.mkstemp(suffix=".tsv", prefix="results-")[1])
+    try:
+        with tsv_path.open("w") as f:
+            f.write("\t".join(header) + "\n")
+            for r in body_rows:
+                f.write("\t".join(r) + "\n")
+        try:
+            await channel.post_file(tsv_path, body=body_prefix.rstrip() if body_prefix else None)
+            _audit("post_results_table",
+                   trials=len(trials), metrics=len(metric_names), mode="file")
+            return _text_response({
+                "posted": True, "mode": "file",
+                "trials": len(trials), "metrics": len(metric_names),
+            })
+        except Exception as e:
+            _audit("post_results_table_failed_upload", error=str(e))
+            return _text_response(
+                {"posted": False, "error": str(e)}, is_error=True,
+            )
+    finally:
+        try:
+            tsv_path.unlink()
+        except OSError:
+            pass
+
+
+@tool(
     "msg_thread",
     "Post a message into a per-trial discussion thread (creating the "
     "thread if it doesn't exist yet). Use this for trial-specific "
@@ -936,7 +1072,7 @@ ALL = [
     run_indices, stop_index, stop_all, prune_index,
     validate_config, tail_log, list_metrics, compute_metric,
     summarize_metrics,
-    msg, tick_summary, schedule_next, halt,
+    msg, tick_summary, post_results_table, schedule_next, halt,
 ]
 """All in-process tools, in the order they're registered with the SDK's
 `create_sdk_mcp_server(name='hyperherd', tools=ALL)`."""
