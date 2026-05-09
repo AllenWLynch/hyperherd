@@ -402,12 +402,14 @@ async def list_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     "validate_config",
     "Run `herd test --cfg-job <workspace> <index>` to preflight a "
     "trial's resolved config without spending SLURM time. Hydra-"
-    "specific: appends `--cfg job` to the override string so a Hydra "
-    "trainer prints the resolved config and exits. Catches missing "
-    "required fields, type mismatches, unknown parameter names, and "
-    "launcher-level errors (missing container, bad conda env). Use as "
-    "a canary preflight when the user said `yes` to the Hydra interview "
-    "question. Returns {valid, returncode, stdout_tail, stderr_tail}.",
+    "specific: appends `--cfg job --resolve` so the Hydra trainer "
+    "prints the *fully-resolved* config (interpolations and OmegaConf "
+    "resolvers expanded) and exits. Catches missing required fields, "
+    "type mismatches, unknown parameter names, broken `${...}` "
+    "interpolations, and launcher-level errors (missing container, bad "
+    "conda env). Use as a canary preflight when the user said `yes` to "
+    "the Hydra interview question. Returns {valid, returncode, "
+    "stdout_tail, stderr_tail}.",
     {"index": int},
 )
 async def validate_config(args: Dict[str, Any]) -> Dict[str, Any]:

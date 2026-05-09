@@ -625,10 +625,12 @@ def cmd_test(args):
     array would, and refuses any index that has ever been submitted to SLURM
     (so the launcher's outputs/logs aren't clobbered).
 
-    With `--cfg-job`, appends `--cfg job` to the override string. Hydra
-    trainers interpret this as "print the resolved config and exit without
-    running" — useful as a quick config-validation step. In this mode no
-    real outputs are produced, so the previously-submitted guard is skipped.
+    With `--cfg-job`, appends `--cfg job --resolve` to the override string.
+    Hydra trainers interpret this as "print the *fully-resolved* config and
+    exit without running" — `--resolve` forces interpolations and OmegaConf
+    resolvers to expand, so resolver errors surface in this preflight
+    instead of in a SLURM job ten minutes later. In this mode no real
+    outputs are produced, so the previously-submitted guard is skipped.
     """
     import subprocess
 
@@ -685,7 +687,13 @@ def cmd_test(args):
         config.workspace, index, config.static_overrides or None
     )
     if cfg_job:
-        overrides = f"{overrides} --cfg job"
+        # `--resolve` forces Hydra to fully resolve interpolations
+        # (`${...}` references, OmegaConf resolvers, etc.) before
+        # printing — without it `--cfg job` happily prints unresolved
+        # `${env:FOO}` placeholders and a real run would fail at
+        # resolution time. Pair them so the preflight catches resolver
+        # errors instead of postponing them to SLURM.
+        overrides = f"{overrides} --cfg job --resolve"
 
     if cfg_job:
         print(f"Validating Hydra config for trial {index}")
@@ -1593,9 +1601,11 @@ def main():
         "--cfg-job",
         action="store_true",
         help=(
-            "Append `--cfg job` to the override string. For Hydra trainers this "
-            "prints the resolved config and exits without running training "
-            "(safe to use on indices already submitted to SLURM)."
+            "Append `--cfg job --resolve` to the override string. For Hydra "
+            "trainers this prints the fully-resolved config (interpolations and "
+            "OmegaConf resolvers expanded) and exits without running training, "
+            "so resolver errors surface here instead of in SLURM. Safe to use "
+            "on indices already submitted to SLURM."
         ),
     )
 
