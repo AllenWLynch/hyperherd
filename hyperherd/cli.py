@@ -631,6 +631,12 @@ def cmd_test(args):
     resolvers to expand, so resolver errors surface in this preflight
     instead of in a SLURM job ten minutes later. In this mode no real
     outputs are produced, so the previously-submitted guard is skipped.
+
+    With `--cfg-job --all`, validates every trial in the sweep. Useful for
+    catching parameter combinations whose resolved config is malformed
+    (e.g. interpolations that only break under certain override values).
+    `--all` requires `--cfg-job`; running every trial end-to-end locally
+    is not supported.
     """
     import subprocess
 
@@ -659,12 +665,24 @@ def cmd_test(args):
 
     trials = manifest.load_manifest(config.workspace)
 
+    cfg_job = getattr(args, "cfg_job", False)
+    test_all = getattr(args, "all", False)
+
+    if test_all and not cfg_job:
+        print(
+            "--all requires --cfg-job. Running every trial end-to-end locally "
+            "is not supported (use SLURM via `herd run`).",
+            file=sys.stderr,
+        )
+        return 1
+
+    if test_all:
+        return _cmd_test_all(config, trials)
+
     index = args.index if args.index is not None else 0
     if index < 0 or index >= len(trials):
         print(f"Trial index {index} out of range (0-{len(trials) - 1}).", file=sys.stderr)
         return 1
-
-    cfg_job = getattr(args, "cfg_job", False)
 
     # End-to-end runs would clobber a trial that's already been launched.
     # `--cfg-job` validates without running, so it's safe to skip.
@@ -687,13 +705,7 @@ def cmd_test(args):
         config.workspace, index, config.static_overrides or None
     )
     if cfg_job:
-        # `--resolve` forces Hydra to fully resolve interpolations
-        # (`${...}` references, OmegaConf resolvers, etc.) before
-        # printing — without it `--cfg job` happily prints unresolved
-        # `${env:FOO}` placeholders and a real run would fail at
-        # resolution time. Pair them so the preflight catches resolver
-        # errors instead of postponing them to SLURM.
-        overrides = f"{overrides} --cfg job --resolve"
+        overrides = _append_cfg_job(overrides)
 
     if cfg_job:
         print(f"Validating Hydra config for trial {index}")
@@ -706,16 +718,7 @@ def cmd_test(args):
     print("-" * 60)
     print()
 
-    env = os.environ.copy()
-    env["HYPERHERD_WORKSPACE"] = config.workspace
-    env["HYPERHERD_SWEEP_NAME"] = config.name
-    env["HYPERHERD_TRIAL_ID"] = str(index)
-    env["HYPERHERD_TRIAL_NAME"] = exp_name
-    # Legacy alias — `experiment` here means "this trial's identifier",
-    # which is confusing with the broader use of "experiment" for the
-    # whole sweep. Kept for backward compat with trainer code that
-    # reads it. New code should use HYPERHERD_TRIAL_NAME.
-    env["HYPERHERD_EXPERIMENT_NAME"] = exp_name
+    env = _trial_env(config, index, exp_name)
 
     result = subprocess.run(
         ["bash", config.launcher, overrides],
@@ -737,6 +740,76 @@ def cmd_test(args):
         print(f"Trial {index}: {msg} (exit code {result.returncode}).")
 
     return result.returncode
+
+
+def _append_cfg_job(overrides: str) -> str:
+    # `--resolve` forces Hydra to fully resolve interpolations
+    # (`${...}` references, OmegaConf resolvers, etc.) before printing
+    # — without it `--cfg job` happily prints unresolved `${env:FOO}`
+    # placeholders and a real run would fail at resolution time. Pair
+    # them so the preflight catches resolver errors instead of
+    # postponing them to SLURM.
+    return f"{overrides} --cfg job --resolve"
+
+
+def _trial_env(config, index: int, exp_name: str) -> dict:
+    env = os.environ.copy()
+    env["HYPERHERD_WORKSPACE"] = config.workspace
+    env["HYPERHERD_SWEEP_NAME"] = config.name
+    env["HYPERHERD_TRIAL_ID"] = str(index)
+    env["HYPERHERD_TRIAL_NAME"] = exp_name
+    # Legacy alias — `experiment` here means "this trial's identifier",
+    # which is confusing with the broader use of "experiment" for the
+    # whole sweep. Kept for backward compat with trainer code that
+    # reads it. New code should use HYPERHERD_TRIAL_NAME.
+    env["HYPERHERD_EXPERIMENT_NAME"] = exp_name
+    return env
+
+
+def _cmd_test_all(config, trials) -> int:
+    """Run `--cfg job --resolve` against every trial in the sweep."""
+    import subprocess
+
+    n = len(trials)
+    print(f"Validating Hydra config for {n} trial(s) in {config.workspace}")
+    print(f"  launcher: {config.launcher}")
+    print("-" * 60)
+
+    failures: list[tuple[int, int, str]] = []  # (index, returncode, stderr_tail)
+    for index, trial in enumerate(trials):
+        exp_name = trial.get("experiment_name", "")
+        overrides = manifest.resolve_overrides(
+            config.workspace, index, config.static_overrides or None
+        )
+        overrides = _append_cfg_job(overrides)
+
+        env = _trial_env(config, index, exp_name)
+
+        result = subprocess.run(
+            ["bash", config.launcher, overrides],
+            cwd=config.workspace,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode == 0:
+            print(f"  [{index:>3}/{n}] OK   {exp_name}")
+        else:
+            err = (result.stderr or b"").decode("utf-8", errors="replace")
+            failures.append((index, result.returncode, err[-1000:]))
+            print(f"  [{index:>3}/{n}] FAIL {exp_name} (exit {result.returncode})")
+
+    print("-" * 60)
+    if not failures:
+        print(f"All {n} trial(s) validated successfully.")
+        return 0
+
+    print(f"{len(failures)}/{n} trial(s) failed validation:")
+    for index, rc, err in failures:
+        print()
+        print(f"--- trial {index} (exit {rc}) ---")
+        print(err.rstrip())
+    return 1
 
 
 def cmd_results(args):
@@ -1606,6 +1679,17 @@ def main():
             "OmegaConf resolvers expanded) and exits without running training, "
             "so resolver errors surface here instead of in SLURM. Safe to use "
             "on indices already submitted to SLURM."
+        ),
+    )
+    p_test.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Validate every trial in the sweep (requires --cfg-job). Useful "
+            "for catching resolver/interpolation errors that only manifest "
+            "for certain parameter combinations. Stops nothing on first "
+            "failure — runs the full sweep and reports all failures at the "
+            "end with their stderr tails."
         ),
     )
 

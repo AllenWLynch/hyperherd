@@ -407,16 +407,22 @@ async def list_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     "resolvers expanded) and exits. Catches missing required fields, "
     "type mismatches, unknown parameter names, broken `${...}` "
     "interpolations, and launcher-level errors (missing container, bad "
-    "conda env). Use as a canary preflight when the user said `yes` to "
-    "the Hydra interview question. Returns {valid, returncode, "
-    "stdout_tail, stderr_tail}.",
+    "conda env). Pass `index=-1` to validate every trial in the sweep "
+    "(useful when an interpolation may only break for certain "
+    "parameter combinations). Use as a canary preflight when the user "
+    "said `yes` to the Hydra interview question. Returns {valid, "
+    "returncode, stdout_tail, stderr_tail}.",
     {"index": int},
 )
 async def validate_config(args: Dict[str, Any]) -> Dict[str, Any]:
     index = int(args["index"])
     workspace = str(_CTX["workspace"])
+    if index < 0:
+        cmd = ["herd", "test", "--cfg-job", "--all", workspace]
+    else:
+        cmd = ["herd", "test", "--cfg-job", workspace, str(index)]
     proc = await asyncio.create_subprocess_exec(
-        "herd", "test", "--cfg-job", workspace, str(index),
+        *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
