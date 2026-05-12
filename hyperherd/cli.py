@@ -835,8 +835,14 @@ def cmd_results(args):
         return 0
 
     if not results:
-        print("No results logged yet. Use hyperherd.log_result() from your training script.", file=sys.stderr)
-        return 1
+        # Still useful to dump the parameter table for a freshly-launched
+        # sweep — surface the warning but keep going so the user can see
+        # trial_id / experiment_name / param columns.
+        print(
+            "Warning: no results logged yet. Use hyperherd.log_result() from "
+            "your training script. Printing parameter table only.",
+            file=sys.stderr,
+        )
 
     # Collect all metric names across trials
     metric_names = []
