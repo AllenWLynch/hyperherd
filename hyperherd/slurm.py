@@ -345,6 +345,15 @@ def _query_squeue(job_ids: List[str]) -> Dict[Tuple[str, int], str]:
             [
                 "squeue",
                 "-j", job_spec,
+                # -r/--array expands each array task onto its own line. Without
+                # it, squeue collapses pending tasks into a compact spec like
+                # "12345_[0-1,5,7-...%2]" AND truncates that string at an
+                # internal buffer (~30 chars) for large sparse arrays — the
+                # closing ']' is lost, the range regex fails to match, and the
+                # pending tasks vanish from the result. The cross-check in
+                # _sync_slurm_status then reads them as "gone from the queue"
+                # and flips live PENDING trials to "cancelled".
+                "-r",
                 "--format=%i %t",
                 "--noheader",
             ],
