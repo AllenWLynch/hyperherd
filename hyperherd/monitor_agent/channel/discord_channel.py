@@ -1148,6 +1148,28 @@ class DiscordChannel(MessageChannel):
             await interaction.followup.send(text)
 
         @self._tree.command(
+            name="sh",
+            description="Run a successive-halving tick: prune/pause/submit trials by their metric",
+            guild=guild,
+        )
+        @app_commands.describe(
+            dry_run="Preview the planned actions without applying them (default false)",
+            max_concurrent="Cap concurrent running array tasks on (re)submission",
+        )
+        async def sh_cmd(
+            interaction: discord.Interaction,
+            dry_run: bool = False,
+            max_concurrent: Optional[int] = None,
+        ) -> None:
+            if not await in_bound_channel(interaction):
+                return
+            await interaction.response.defer(thinking=True)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, cmd_mod.cmd_sh, ws, dry_run, max_concurrent,
+            )
+            await interaction.followup.send(_codeblock(text))
+
+        @self._tree.command(
             name="metrics",
             description="List logged metric names, or show one metric's value per trial",
             guild=guild,

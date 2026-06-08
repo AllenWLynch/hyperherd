@@ -162,6 +162,61 @@ class TestTieBreak(unittest.TestCase):
         self.assertEqual(v[3], Verdict.PRUNE)
 
 
+class TestLastSurvivorNeverPruned(unittest.TestCase):
+    """The field can never be pruned to zero.
+
+    For a cohort of size m, K = ceil(m/2) >= 1 and PRUNE requires
+    ahead_definite >= K. The cohort leader (best objective, ties broken by
+    smallest index) always has ahead_definite == 0, so 0 >= K is never true:
+    every non-empty cohort promotes at least one trial, and a singleton
+    always promotes. These pin that guarantee against regressions.
+    """
+
+    def test_single_running_trial_with_terrible_metric_not_pruned(self):
+        # A sole trial blowing up (huge loss) must still survive — there is
+        # nobody to lose the comparison to.
+        cfg = _cfg(min_steps=1, budget=8)
+        trials = [TrialState(0, "running", _stream(*[(i, 999.0) for i in range(9)]))]
+        p = _by_index(plan_successive_halving(trials, cfg))[0]
+        self.assertNotEqual(p.action, Action.PRUNE)
+        self.assertIn(p.verdict, (Verdict.PROMOTE, Verdict.RUN_FREE))
+
+    def test_single_trial_with_nan_not_pruned(self):
+        cfg = _cfg(min_steps=1, budget=8)
+        trials = [TrialState(0, "running", _stream((0, math.nan), (1, math.nan)))]
+        p = _by_index(plan_successive_halving(trials, cfg))[0]
+        self.assertNotEqual(p.action, Action.PRUNE)
+
+    def test_sole_survivor_among_excluded_not_pruned(self):
+        # Everyone else is already pruned/failed/cancelled (excluded from the
+        # cohort). The lone competitor must not be pruned even with a bad metric.
+        cfg = _cfg(min_steps=1, budget=8)
+        trials = [
+            TrialState(0, "pruned",    _stream((0, 0.1))),
+            TrialState(1, "failed",    _stream((0, 0.1))),
+            TrialState(2, "cancelled", _stream((0, 0.1))),
+            TrialState(4, "running",   _stream(*[(i, 50.0) for i in range(9)])),
+        ]
+        p = _by_index(plan_successive_halving(trials, cfg))[4]
+        self.assertNotEqual(p.action, Action.PRUNE)
+        self.assertIn(p.verdict, (Verdict.PROMOTE, Verdict.RUN_FREE))
+
+    def test_never_prunes_whole_cohort(self):
+        # Exhaustive small-field check: across cohort sizes and value
+        # orderings, at least one trial always survives each tick.
+        import itertools
+        cfg = _cfg(min_steps=1, budget=8)
+        for m in range(1, 7):
+            for vals in itertools.permutations(range(m)):
+                trials = [
+                    TrialState(i, "running", _stream(*[(s, float(v)) for s in range(9)]))
+                    for i, v in enumerate(vals)
+                ]
+                plan = plan_successive_halving(trials, cfg)
+                pruned = sum(1 for p in plan if p.action == Action.PRUNE)
+                self.assertLess(pruned, m, f"all {m} pruned for values {vals}")
+
+
 class TestAmbiguityAndPause(unittest.TestCase):
     def test_lone_reached_with_unreached_pauses(self):
         cfg = _cfg(min_steps=10, budget=80)

@@ -308,6 +308,82 @@ class TestRun(unittest.TestCase):
         self.assertIn("failed", out)
 
 
+class TestSh(unittest.TestCase):
+    _PLAN = json.dumps({
+        "dry_run": False,
+        "rungs": [2, 4, 8],
+        "slurm_job_id": "54321",
+        "submitted": [5],
+        "pruned": [1, 3],
+        "paused": [],
+        "decisions": [
+            {"index": 0, "action": "none", "verdict": "promote",
+             "rung": 1, "reason": "top-half at rung 1 (step 4)"},
+            {"index": 1, "action": "prune", "verdict": "prune",
+             "rung": 0, "reason": "bottom-half at rung 0 (step 2)"},
+            {"index": 3, "action": "prune", "verdict": "prune",
+             "rung": 0, "reason": "bottom-half at rung 0 (step 2)"},
+            {"index": 5, "action": "submit", "verdict": "promote",
+             "rung": 1, "reason": "top-half at rung 1 (step 4)"},
+        ],
+    })
+
+    def test_applies_and_summarizes_actions(self):
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout=self._PLAN)) as run:
+            out = cmd_mod.cmd_sh(Path("/tmp/anything"))
+        argv = run.call_args[0][0]
+        self.assertIn("sh", argv)
+        self.assertIn("--json", argv)
+        self.assertNotIn("--dry-run", argv)
+        # Headline counts, rung ladder, and per-trial action lines.
+        self.assertIn("Did: 1 submitted, 2 pruned", out)
+        self.assertIn("Rungs (steps): 2, 4, 8", out)
+        self.assertIn("#1", out)
+        self.assertIn("PRUNE", out)
+        self.assertIn("SUBMIT", out)
+        self.assertIn("54321", out)
+        # Untouched trials (action none) don't get an action line.
+        self.assertNotIn("#0", out)
+
+    def test_dry_run_passes_flag_and_labels_output(self):
+        plan = json.loads(self._PLAN)
+        plan["dry_run"] = True
+        plan["slurm_job_id"] = None
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout=json.dumps(plan))) as run:
+            out = cmd_mod.cmd_sh(Path("/tmp/anything"), dry_run=True)
+        self.assertIn("--dry-run", run.call_args[0][0])
+        self.assertIn("(dry run)", out)
+        self.assertIn("Would:", out)
+        self.assertNotIn("SLURM job array", out)
+
+    def test_max_concurrent_passes_flag(self):
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout=self._PLAN)) as run:
+            cmd_mod.cmd_sh(Path("/tmp/anything"), max_concurrent=4)
+        argv = run.call_args[0][0]
+        self.assertIn("-j", argv)
+        self.assertIn("4", argv)
+
+    def test_no_actions_message(self):
+        plan = {"dry_run": False, "rungs": [], "slurm_job_id": None,
+                "submitted": [], "pruned": [], "paused": [], "decisions": []}
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(stdout=json.dumps(plan))):
+            out = cmd_mod.cmd_sh(Path("/tmp/anything"))
+        self.assertIn("no trials need action", out)
+
+    def test_misconfiguration_surfaced(self):
+        with mock.patch.object(cmd_mod.subprocess, "run",
+                               return_value=_fake_completed(
+                                   returncode=1,
+                                   stderr="Error: successive halving is not configured.\n")):
+            out = cmd_mod.cmd_sh(Path("/tmp/anything"))
+        self.assertIn("failed", out)
+        self.assertIn("not configured", out)
+
+
 class TestPlan(unittest.TestCase):
     def setUp(self):
         import shutil, tempfile
@@ -370,7 +446,7 @@ class TestHelp(unittest.TestCase):
         text = cmd_mod.cmd_help()
         for keyword in ("/status", "/stats", "/params", "/info", "/plan",
                         "/run", "/run_all", "/stop", "/stop_all",
-                        "/pause", "/prune", "/metrics",
+                        "/pause", "/prune", "/sh", "/metrics",
                         "/tail", "/shutdown", "/help"):
             self.assertIn(keyword, text)
 

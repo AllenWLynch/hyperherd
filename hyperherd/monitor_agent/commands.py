@@ -358,6 +358,87 @@ def cmd_pause(workspace: Path, index: int) -> str:
     )
 
 
+# --- /sh ------------------------------------------------------------------
+
+def cmd_sh(
+    workspace: Path,
+    dry_run: bool = False,
+    max_concurrent: Optional[int] = None,
+) -> str:
+    """Run one successive-halving tick. Backed by `herd sh --json`.
+
+    Recomputes every trial's standing from its logged metric stream and
+    PRUNE/PAUSE/SUBMITs as warranted (the stateless planner in
+    `successive_halving.py`). With `dry_run` it prints the planned
+    actions without touching the manifest or SLURM — the safe way to
+    preview a sweep-wide prune before committing.
+
+    Distinct from the autonomous daemon's own SH ticks: this is the
+    user reaching for the algorithm on demand from chat."""
+    argv = _RUNNABLE + ["sh", "--json"]
+    if dry_run:
+        argv.append("--dry-run")
+    if max_concurrent is not None:
+        argv += ["-j", str(max_concurrent)]
+    argv.append(str(workspace))
+
+    proc = subprocess.run(argv, capture_output=True, text=True)
+    if proc.returncode != 0:
+        # `herd sh` writes a user-facing "Error: ..." line to stderr for
+        # the common misconfiguration (no successive_halving: section).
+        err = _strip_ansi(proc.stderr or proc.stdout).strip() or "(no output)"
+        return f"`herd sh` failed (exit {proc.returncode}):\n{err}"
+
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return f"Unparseable `herd sh` output:\n{proc.stdout[:500]}"
+
+    return _format_sh(result)
+
+
+def _format_sh(result: dict) -> str:
+    """Render the JSON from `herd sh --json` into a chat-friendly summary:
+    a headline (counts), the rung ladder, and one line per acted trial."""
+    dry = result.get("dry_run", False)
+    rungs = result.get("rungs") or []
+    submitted = result.get("submitted") or []
+    pruned = result.get("pruned") or []
+    paused = result.get("paused") or []
+    job_id = result.get("slurm_job_id")
+    decisions = result.get("decisions") or []
+
+    verb = "Would" if dry else "Did"
+    head = "Successive halving" + (" (dry run)" if dry else "")
+    parts = []
+    if submitted:
+        parts.append(f"{len(submitted)} submitted")
+    if pruned:
+        parts.append(f"{len(pruned)} pruned")
+    if paused:
+        parts.append(f"{len(paused)} paused")
+    summary = f"{verb}: {', '.join(parts)}." if parts else "no trials need action right now."
+
+    lines = [f"{head} — {summary}"]
+    if rungs:
+        lines.append(f"Rungs (steps): {', '.join(str(r) for r in rungs)}")
+
+    # One line per trial the algorithm actually moved (SUBMIT/PRUNE/PAUSE).
+    acted = [d for d in decisions if (d.get("action") or "none") != "none"]
+    if acted:
+        idx_w = max(len(str(d.get("index", "?"))) for d in acted) + 1
+        lines.append("")
+        for d in sorted(acted, key=lambda x: x.get("index", 0)):
+            idx_col = f"#{d.get('index', '?')}".ljust(idx_w)
+            action = (d.get("action") or "?").upper().ljust(7)
+            lines.append(f"  {idx_col}  {action}  {d.get('reason', '')}")
+
+    if job_id and not dry:
+        lines.append("")
+        lines.append(f"SLURM job array: {job_id}")
+    return "\n".join(lines)
+
+
 # --- /run -----------------------------------------------------------------
 
 def cmd_run(workspace: Path, index: int) -> str:
@@ -791,6 +872,7 @@ def cmd_help() -> str:
         "`/stop_all` — cancel every live trial\n"
         "`/pause <index>` — pause one trial (graceful, resumable; SH-aware)\n"
         "`/prune <index> [reason]` — algorithmic kill, NOT resubmitted on `herd run`\n"
+        "`/sh [dry_run] [max_concurrent]` — run a successive-halving tick (prune/pause/submit by metric)\n"
         "`/tail <index> [lines]` — last N lines of a trial's logs (default 20)\n"
         "`/shutdown` — stop the monitor daemon entirely\n"
         "`/help` — this list\n"
