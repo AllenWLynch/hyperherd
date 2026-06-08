@@ -25,6 +25,12 @@ class TestComputeMetric(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         manifest.init_workspace(self.tmp)
+        # `log_result(strict=True)` requires the manifest to exist (its
+        # bind-mount check). Drop a stub so the seeding calls below succeed.
+        with open(os.path.join(
+            self.tmp, manifest.WORKSPACE_DIR, manifest.MANIFEST_FILE,
+        ), "w") as f:
+            f.write("{}")
         # Bind the tool context the way tick.run_tick would.
         tools_mod.set_context(
             workspace=Path(self.tmp),
@@ -136,6 +142,11 @@ class TestListMetrics(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         manifest.init_workspace(self.tmp)
+        # log_result(strict=True) needs the manifest present (bind-mount check).
+        with open(os.path.join(
+            self.tmp, manifest.WORKSPACE_DIR, manifest.MANIFEST_FILE,
+        ), "w") as f:
+            f.write("{}")
         tools_mod.set_context(
             workspace=Path(self.tmp),
             sweep_name="t",

@@ -40,7 +40,10 @@ class TestStatus(unittest.TestCase):
         self.assertIn("2 completed", out)
         self.assertIn("3 total", out)
         # Per-trial line: name + status, one value of info per trial.
-        self.assertIn("lr-0.001_opt-adam", out)
+        # `_align_names` splits the experiment name on '_' into padded columns,
+        # so the underscores become spaces — assert the segments are present.
+        self.assertIn("lr-0.001", out)
+        self.assertIn("opt-adam", out)
         self.assertIn("running", out)
 
     def test_handles_subprocess_failure(self):
@@ -431,7 +434,7 @@ class TestCmdMetrics(unittest.TestCase):
         # smooth=2 → mean of [0.5, 0.0] = 0.25
         text = cmd_mod.cmd_metrics(self.workspace, metric="val_loss", smooth=2)
         self.assertIn("0.25", text)
-        self.assertIn("smoothed", text)
+        self.assertIn("mean of last 2", text)
 
     def test_no_streams_returns_friendly_msg(self):
         text = cmd_mod.cmd_metrics(self.workspace)

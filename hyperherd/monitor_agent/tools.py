@@ -34,8 +34,19 @@ try:
     from claude_agent_sdk import tool  # type: ignore
 except ImportError:  # pragma: no cover
     def tool(name, description, schema):  # noqa: D401 - SDK shim
-        """No-op decorator used when claude-agent-sdk isn't installed."""
+        """No-op decorator used when claude-agent-sdk isn't installed.
+
+        Mirrors the real `@tool`'s surface enough for tests and introspection:
+        the returned object exposes `.handler` (the async callable), `.name`,
+        `.description`, and `.input_schema`. The live daemon path needs the real
+        SDK anyway (`create_sdk_mcp_server`), so this shim only ever feeds tests
+        and the `ALL` registry listing."""
         def _wrap(fn):
+            fn.handler = fn          # the real SdkMcpTool exposes the coroutine here
+            fn.name = name
+            fn.description = description
+            fn.input_schema = schema
+            # Back-compat aliases kept for any older introspection.
             fn._tool_name = name
             fn._tool_description = description
             fn._tool_schema = schema
