@@ -26,7 +26,20 @@ from hyperherd.preflight import PreflightError, run_preflight
 from hyperherd.search import generate_combinations
 from hyperherd import manifest
 from hyperherd import slurm
-from hyperherd.logging import load_all_results, collect_step_rows
+from hyperherd.logging import (
+    load_all_results,
+    collect_step_rows,
+    load_metric_stream,
+    write_prune_signal,
+    clear_prune_signal,
+)
+from hyperherd.successive_halving import (
+    Action,
+    SweepConfig,
+    TrialState,
+    plan_successive_halving,
+    rung_schedule,
+)
 
 
 _ACTIVE_STATUSES = ("running", "queued", "submitted", "completed")
@@ -337,6 +350,10 @@ def cmd_launch(args):
     # Record submission and update statuses
     manifest.record_job_submission(config.workspace, job_id, pending)
     manifest.bulk_update_status(config.workspace, {i: "submitted" for i in pending})
+    # Clear any stale SH prune/pause signal so a resubmitted (e.g. previously
+    # paused) trial doesn't immediately self-terminate on its first log_result.
+    for i in pending:
+        clear_prune_signal(config.workspace, i)
 
     if json_mode:
         agent_output.emit(agent_output.launch_payload(
@@ -1004,6 +1021,166 @@ def cmd_stop(args):
     return 0
 
 
+def _resolve_sh_config(args, config):
+    """Build the effective SH config from `hyperherd.yaml` + CLI overrides.
+
+    Returns a validated `config.SuccessiveHalving`, or raises `ValueError`
+    with a user-facing message if required fields are missing/invalid.
+    """
+    from hyperherd.config import SuccessiveHalving
+
+    base = config.successive_halving
+    metric = args.metric or (base.metric if base else None)
+    direction = args.direction or (base.direction if base else None)
+    min_steps = args.min_steps if args.min_steps is not None else (base.min_steps if base else None)
+    budget = args.budget if args.budget is not None else (base.budget if base else None)
+    eta = args.eta if args.eta is not None else (base.eta if base else 2)
+
+    missing = [
+        name for name, val in (
+            ("metric", metric), ("direction", direction),
+            ("min_steps", min_steps), ("budget", budget),
+        ) if val is None
+    ]
+    if missing:
+        raise ValueError(
+            "successive halving is not configured. Add a `successive_halving:` "
+            "section to hyperherd.yaml (metric, direction, min_steps, budget) "
+            f"or pass the missing flag(s): {', '.join('--' + m.replace('_','-') for m in missing)}."
+        )
+    try:
+        return SuccessiveHalving(
+            metric=metric, direction=direction,
+            min_steps=min_steps, budget=budget, eta=eta,
+        )
+    except Exception as e:
+        raise ValueError(f"invalid successive-halving parameters: {e}") from e
+
+
+def cmd_sh(args):
+    """Successive halving: read sweep state, compute pruning decisions, apply them.
+
+    Stateless and re-runnable: each invocation recomputes every trial's standing
+    from its logged metric stream and the manifest, then PRUNE/PAUSE/SUBMITs as
+    warranted. Pruning is *cooperative* — we write a per-trial signal that the
+    running trainer honors at its next `log_result(step=...)` and stamp the
+    manifest; we don't `scancel` here.
+    """
+    _apply_workspace_env(args.workspace)
+    config = load_config(args.workspace)
+    json_mode = getattr(args, "json_output", False)
+
+    if not manifest.workspace_exists(config.workspace):
+        print("No workspace found. Run 'herd run' first.", file=sys.stderr)
+        return 1
+
+    try:
+        sh_cfg = _resolve_sh_config(args, config)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    _sync_slurm_status(config.workspace)
+    trials = manifest.load_manifest(config.workspace)
+
+    sweep = SweepConfig(
+        metric=sh_cfg.metric,
+        direction=sh_cfg.direction,
+        min_steps=sh_cfg.min_steps,
+        budget=sh_cfg.budget,
+        eta=sh_cfg.eta,
+    )
+    states = [
+        TrialState(
+            index=t["index"],
+            status=t.get("status", "ready"),
+            stream=load_metric_stream(config.workspace, t["index"], sh_cfg.metric),
+        )
+        for t in trials
+    ]
+
+    plan = plan_successive_halving(states, sweep)
+
+    submits = [p for p in plan if p.action == Action.SUBMIT]
+    prunes = [p for p in plan if p.action == Action.PRUNE]
+    pauses = [p for p in plan if p.action == Action.PAUSE]
+
+    dry_run = getattr(args, "dry_run", False)
+
+    if not dry_run:
+        # Cooperative stop: signal + stamp manifest (no scancel this phase).
+        for p in prunes:
+            write_prune_signal(config.workspace, p.index, "prune")
+        for p in pauses:
+            write_prune_signal(config.workspace, p.index, "pause")
+        status_updates = {p.index: "pruned" for p in prunes}
+        status_updates.update({p.index: "paused" for p in pauses})
+        if status_updates:
+            manifest.bulk_update_status(config.workspace, status_updates)
+
+    # Batch every SUBMIT (initial launches + paused resumes) into one throttled
+    # array submission. Clear resumed trials' stale signals first.
+    submit_indices = sorted(p.index for p in submits)
+    slurm_job_id = None
+    if submit_indices and not dry_run:
+        for idx in submit_indices:
+            clear_prune_signal(config.workspace, idx)
+        script = slurm.generate_sbatch_script(
+            config, submit_indices, getattr(args, "max_concurrent", None)
+        )
+        slurm_job_id = slurm.submit_job(config, script, dry_run=False)
+        assert slurm_job_id is not None
+        manifest.record_job_submission(config.workspace, slurm_job_id, submit_indices)
+        manifest.bulk_update_status(
+            config.workspace, {i: "submitted" for i in submit_indices}
+        )
+
+    if json_mode:
+        agent_output.emit({
+            "dry_run": dry_run,
+            "rungs": rung_schedule(sweep.min_steps, sweep.budget, sweep.eta),
+            "slurm_job_id": slurm_job_id,
+            "submitted": submit_indices,
+            "pruned": sorted(p.index for p in prunes),
+            "paused": sorted(p.index for p in pauses),
+            "decisions": [
+                {
+                    "index": p.index,
+                    "action": p.action.value,
+                    "verdict": p.verdict.value,
+                    "rung": p.rung,
+                    "reason": p.reason,
+                }
+                for p in plan
+            ],
+        })
+        return 0
+
+    _print_sh_plan(plan, submit_indices, prunes, pauses, dry_run, slurm_job_id)
+    return 0
+
+
+def _print_sh_plan(plan, submit_indices, prunes, pauses, dry_run, slurm_job_id):
+    verb = "Would" if dry_run else "Did"
+    acted = [p for p in plan if p.action != Action.NONE]
+    if not acted:
+        print("Successive halving: no trials need action right now.")
+        return
+    print(f"Successive halving {'(dry run) ' if dry_run else ''}— {len(acted)} action(s):")
+    for p in sorted(acted, key=lambda x: x.index):
+        print(f"  #{p.index:<4} {p.action.value.upper():<7} {p.reason}")
+    summary = []
+    if submit_indices:
+        summary.append(f"{len(submit_indices)} submitted")
+    if prunes:
+        summary.append(f"{len(prunes)} pruned")
+    if pauses:
+        summary.append(f"{len(pauses)} paused")
+    print(f"{verb}: {', '.join(summary)}.")
+    if slurm_job_id:
+        print(f"SLURM job array: {slurm_job_id}")
+
+
 def cmd_clean(args):
     """Cancel running jobs and clean up workspace."""
     config = load_config(args.workspace)
@@ -1508,12 +1685,14 @@ def _sync_slurm_status(workspace: str):
         "OUT_OF_MEMORY": "failed",
     }
 
-    # `pruned` and `cancelled` are user/agent decisions that the manifest
-    # owns — sacct lag (or sacct still reporting an old PENDING/RUNNING
-    # row before scancel propagates) must not flip them back to a live
-    # state. Without this guard, `herd stop 3` followed by `herd run`
-    # would resync to "queued" before `get_pending_indices` runs, and
-    # the trial would never be resubmitted.
+    # `pruned`, `cancelled`, and `paused` are user/agent/SH decisions that
+    # the manifest owns — sacct lag (or sacct still reporting an old
+    # PENDING/RUNNING row before the trial self-terminates) must not flip
+    # them back to a live state. Without this guard, `herd stop 3` followed
+    # by `herd run` would resync to "queued" before `get_pending_indices`
+    # runs, and the trial would never be resubmitted. `paused` is sticky for
+    # the same reason: a cooperatively-paused trial's stale RUNNING row would
+    # otherwise un-pause it.
     #
     # When the user *does* want to resubmit a cancelled trial, `herd
     # run` calls `bulk_update_status({i: "submitted" ...})` AFTER the
@@ -1521,7 +1700,7 @@ def _sync_slurm_status(workspace: str):
     trials = manifest.load_manifest(workspace)
     sticky = {
         t["index"] for t in trials
-        if t.get("status") in ("pruned", "cancelled")
+        if t.get("status") in ("pruned", "cancelled", "paused")
     }
 
     updates = {}
@@ -1736,6 +1915,27 @@ def main():
     p_stop.add_argument("index", nargs="?", type=int, default=None, help="Trial index to cancel")
     p_stop.add_argument("-a", "--all", action="store_true", help="Cancel every running/queued trial in the workspace")
 
+    # sh — successive-halving pruning
+    p_sh = subparsers.add_parser(
+        "sh",
+        help="Successive-halving: prune/pause/submit trials by their logged metric",
+        parents=[json_parent],
+    )
+    p_sh.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
+    p_sh.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="Show the planned actions without applying them (no manifest/SLURM changes)",
+    )
+    p_sh.add_argument("--metric", default=None, help="Objective metric name (overrides config)")
+    p_sh.add_argument("--direction", choices=("min", "max"), default=None, help="Optimization direction (overrides config)")
+    p_sh.add_argument("--min-steps", dest="min_steps", type=int, default=None, help="First rung step (overrides config)")
+    p_sh.add_argument("--budget", type=int, default=None, help="Total step budget (overrides config)")
+    p_sh.add_argument("--eta", type=int, default=None, help="Reduction factor, >=2 (overrides config; default 2)")
+    p_sh.add_argument(
+        "-j", "--max-concurrent", type=int, default=None,
+        help="Cap concurrent running array tasks on (re)submission",
+    )
+
     # monitor — autonomous monitor daemon (Claude Agent SDK + Discord)
     p_monitor = subparsers.add_parser(
         "monitor",
@@ -1854,6 +2054,7 @@ def main():
         "tail": cmd_tail,
         "res": cmd_results,
         "stop": cmd_stop,
+        "sh": cmd_sh,
         "clean": cmd_clean,
         "monitor": cmd_monitor,
         "snapshot": cmd_snapshot,

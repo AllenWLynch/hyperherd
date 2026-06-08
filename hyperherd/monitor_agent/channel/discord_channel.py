@@ -6,7 +6,7 @@ notification surface and the inbox for user replies.
 
 Three message paths in the channel:
 
-1. **Slash commands** (`/status`, `/stop`, `/tail`, `/help`, …) — handled
+1. **Slash commands** (`/status`, `/pause`, `/tail`, `/shutdown`, …) — handled
    locally via `monitor_agent.commands` without invoking the agent.
    Discord's UI provides typed parameter prompts.
 2. **Mentions / replies** (`@HerdDog ...` or replying to a bot message)
@@ -682,9 +682,9 @@ class DiscordChannel(MessageChannel):
         emoji = {
             "ready": "⚪", "submitted": "🔵", "queued": "🟡",
             "running": "🟢", "completed": "✅", "failed": "🔴",
-            "pruned": "🟣", "cancelled": "⚫",
+            "pruned": "🟣", "cancelled": "⚫", "paused": "⏸️",
         }
-        order = ["running", "queued", "submitted", "failed",
+        order = ["running", "queued", "submitted", "paused", "failed",
                  "completed", "pruned", "cancelled", "ready"]
         total = totals.get("total", len(trials))
         status_lines = []
@@ -1080,10 +1080,10 @@ class DiscordChannel(MessageChannel):
             await interaction.followup.send(_codeblock(text))
 
         @self._tree.command(
-            name="cancel", description="Cancel one trial", guild=guild,
+            name="stop", description="Cancel one trial (resubmittable)", guild=guild,
         )
         @app_commands.describe(index="Trial index to cancel")
-        async def cancel_cmd(
+        async def stop_trial_cmd(
             interaction: discord.Interaction, index: int,
         ) -> None:
             if not await in_bound_channel(interaction):
@@ -1095,16 +1095,33 @@ class DiscordChannel(MessageChannel):
             await interaction.followup.send(text)
 
         @self._tree.command(
-            name="cancel_all",
+            name="stop_all",
             description="Cancel every live trial",
             guild=guild,
         )
-        async def cancel_all_cmd(interaction: discord.Interaction) -> None:
+        async def stop_all_cmd(interaction: discord.Interaction) -> None:
             if not await in_bound_channel(interaction):
                 return
             await interaction.response.defer(thinking=True)
             text = await asyncio.get_running_loop().run_in_executor(
                 None, cmd_mod.cmd_stop_all, ws,
+            )
+            await interaction.followup.send(text)
+
+        @self._tree.command(
+            name="pause",
+            description="Pause one trial — graceful, resumable, SH-aware",
+            guild=guild,
+        )
+        @app_commands.describe(index="Trial index to pause")
+        async def pause_cmd(
+            interaction: discord.Interaction, index: int,
+        ) -> None:
+            if not await in_bound_channel(interaction):
+                return
+            await interaction.response.defer(thinking=True)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, cmd_mod.cmd_pause, ws, index,
             )
             await interaction.followup.send(text)
 
@@ -1302,11 +1319,11 @@ class DiscordChannel(MessageChannel):
             await interaction.followup.send(_codeblock(text))
 
         @self._tree.command(
-            name="stop",
+            name="shutdown",
             description="Stop the monitor daemon entirely",
             guild=guild,
         )
-        async def stop_cmd(interaction: discord.Interaction) -> None:
+        async def shutdown_cmd(interaction: discord.Interaction) -> None:
             if not await in_bound_channel(interaction):
                 return
             if self._on_stop is None:

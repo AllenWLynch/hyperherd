@@ -161,6 +161,7 @@ async def run_tick(
             "mcp__hyperherd__stop_index",
             "mcp__hyperherd__stop_all",
             "mcp__hyperherd__prune_index",
+            "mcp__hyperherd__run_sh",
             "mcp__hyperherd__validate_config",
             "mcp__hyperherd__tail_log",
             "mcp__hyperherd__list_metrics",

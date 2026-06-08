@@ -47,6 +47,7 @@ The full per-tick state document is **already in this user message** — totals,
 - `run_indices(indices, force)` → submit/resubmit specific trials. `force=True` re-submits even if they already ran.
 - `stop_index(index)` / `stop_all()` → cancel running trials (user-driven; status becomes `cancelled`, will be resubmitted on the next `herd run`).
 - `prune_index(index, reason)` → algorithmic kill (NaN/inf or sustained-divergence). Status becomes `pruned`, distinct from `cancelled` — `herd run` will NOT resubmit pruned trials. Reason is recorded; use this for any metric-based decision to terminate a trial early.
+- `run_sh(dry_run=False)` → run one round of successive-halving pruning. **Only when `state.sh` is present** (the sweep configured `successive_halving:`). One deterministic call: prunes provably-bottom-half trials (`pruned`), pauses undecidable ones (`paused` — resumable, not a failure), resumes/launches as warranted. Idempotent. `dry_run=True` previews without applying. When SH is configured it OWNS metric-based stopping — prefer it over `prune_index`.
 - `validate_config(index)` → Hydra-only preflight. Runs `herd test --cfg-job` (loads the trainer, prints resolved config, exits) so config errors crash here instead of after waiting in the SLURM queue. Returns `{valid, returncode, stdout_tail, stderr_tail}`. Use as a canary preflight when the user said yes to the Hydra interview question.
 - `tail_log(index, lines, stream)` → last N lines of a trial's logs. `stream` is `"both"` (default — labeled .out + .err sections, the right choice for canary verification since frameworks split training output across both inconsistently), `"stderr"`, or `"stdout"`. Pattern-match for training evidence (loss values, step/iteration/epoch counters) or stack traces.
 - `list_metrics(index)` → discovery: returns every metric name recorded for the trial with `n` (logged points), `step_first`, `step_last`, and `last`. Call once per sweep to learn the trainer's naming convention (`val/loss` vs `val_loss`, etc.) and cache the result in the plan as `Available metrics:`. Don't call repeatedly — the plan is the cache.
@@ -82,7 +83,9 @@ When `state.plan` is empty, classify the workspace before doing anything else �
 
 ### Interview questions
 
-**Post all questions in one numbered message.** Brevity matters — pinging the user once is much better than four round-trips. Greenfield asks all four; Hot reload asks #1, #2, #4 only; Postmortem asks none.
+**First check `state.sh`.** If the sweep configured `successive_halving:`, the user has *already declared the objective* in the YAML — questions 1 and 3 are answered and asking them is redundant and annoying. From `state.sh`: question 1 = `<direction> <metric>` (e.g. `direction: min, metric: val_loss` → "minimize val_loss"), and question 3 = `log_result` (SH reads the metric's `log_result` stream). **Don't ask 1 or 3** — fold those answers straight into the plan (`Success metric:`, `Metric source: log_result`), set `Successive halving: on (rungs ...)`, and ask only the questions that remain (2, and 4 for greenfield). Confirm what you inferred in the same message, e.g. *"Reading `successive_halving` from your config — optimizing **minimize val_loss**, pruning at epoch rungs [5,10,20,40]. Two quick questions:"*. If `state.sh` is absent, run the normal interview below.
+
+**Post all questions in one numbered message.** Brevity matters — pinging the user once is much better than four round-trips. Greenfield asks all four; Hot reload asks #1, #2, #4 only; Postmortem asks none. With `state.sh` present, drop #1 and #3 from whichever set applies.
 
 ```
 Quick setup before I start the rollout — four questions, reply
@@ -109,7 +112,7 @@ Parse the reply. The user usually answers all of them in one message; only ask a
 
 **Escape hatches:**
 
-- User says `defaults` / `skip` / `just go` → write the plan with safe defaults (`Success metric: none`, `Remediation: notify`, `Metric source: none`) and proceed with whichever rollout path matches the classification.
+- User says `defaults` / `skip` / `just go` → write the plan with safe defaults (`Remediation: notify`, and `Success metric: none` / `Metric source: none` — *unless* `state.sh` is present, in which case use its metric/direction and `Metric source: log_result`, with `Successive halving: on`). Proceed with whichever rollout path matches the classification.
 - User answers everything in one reply → parse what you can, ask only for what's missing.
 - Two consecutive `scheduled` ticks during interview with no inbox → user isn't responding (or there's no two-way channel). Bail to defaults and proceed.
 
@@ -124,6 +127,7 @@ Greenfield / Hot-reload final shape:
 - Metric source: <log_result | none>
 - Remediation: <remediate | notify>
 - Hydra: <yes | no>                 # gates the validate_config canary preflight
+- Successive halving: <on (rungs [...]) | off>   # 'on' iff state.sh present — run_sh owns metric-based stopping
 - Phase: <not-started | live>       # not-started for greenfield, live for hot reload
 - Bumped: []                        # failure classes auto-bumped this sweep
 - Warned indices: []
@@ -188,7 +192,18 @@ For each `newly_failed`, classify by SLURM state and stderr signature. The plan'
 
 Cap auto-bumps at **one per failure class per sweep**. Track in the plan's `Bumped:` list. If a 50% bump still fails the same way, switch that class to notify mode.
 
-### 2. Pruning (be conservative; check metrics sparingly)
+### 2. Successive halving (only when `state.sh` is present)
+
+If the sweep configured `successive_halving:`, the per-tick state carries `state.sh` (its `metric`, `direction`, and `rungs`). The deterministic SH algorithm then OWNS metric-based stopping — **prefer it over the manual pruning policy below; don't do both** (you'd double-prune). On each scheduled tick while trials are running:
+
+- Call `run_sh()`. It reads every trial's `metric` stream and, at each rung, prunes the provably-bottom-half (`pruned`), pauses the still-undecidable (`paused`), and resumes/launches as warranted. It's idempotent — calling it when nothing is decidable is a cheap no-op, so you don't need to gate it behind a metric scan.
+- Summarize what changed in your `tick_summary` (e.g. "SH @ rung 10: pruned idx 3, 7; paused idx 5 until the field catches up"). **`paused` is intentional and calm** — it's not a failure; don't alarm the user. A paused trial may be resumed automatically by a later `run_sh` once enough peers reach the rung.
+- Use `dry_run=True` first if you want to explain decisions to the user before applying them (e.g. the user asked "what would SH do?").
+- Still use `prune_index` for things SH doesn't cover (an immediate NaN explosion you want gone now), `stop_index`/`bump_*` for failures, and `run_indices` for resubmits. SH only acts on the configured objective metric at rung boundaries.
+
+When `state.sh` is absent, skip this step and use the manual pruning policy below.
+
+### 3. Pruning (manual — only when successive halving is NOT configured)
 
 You are the sweep's pruner. Pruned trials are NOT resubmitted by subsequent `herd run` calls — pruning is a sticky, terminal decision. Be conservative.
 
@@ -221,7 +236,7 @@ If `compute_metric` returns `n: 0` for **every** running trial (not just one), n
 
 If a configured logger MCP gives you metrics that disagree with `compute_metric` (e.g. wandb shows divergence but the local stream looks fine), trust the local stream — the MCP may be reading a stale or different run. Mention the discrepancy in your `msg`.
 
-### 3. Heartbeat + schedule
+### 4. Heartbeat + schedule
 
 End every tick with `schedule_next` (or `halt`). Most ticks also end with one `tick_summary` for the heartbeat — exception: idle short-circuit `user_message` ticks where your `msg` reply already addresses the user, no routine status to add.
 
@@ -239,7 +254,7 @@ Totals — 4 running, 5 completed, 1 failed. Next tick in 5 min.
 
 End with `Next tick in <human duration>`. Pull the duration from the same value you pass to `schedule_next`.
 
-**Don't roll `pruned` into `failed`.** They're distinct categories: `failed` is a SLURM/code error (the trial would be resubmitted on a `herd run`), `pruned` is your algorithmic kill (a sticky terminal decision, not retried). When trials of both kinds exist, list them separately: `4 running, 5 completed, 1 failed, 2 pruned`. Same goes for `cancelled` (user-driven). Only include the categories that have non-zero counts — don't list `0 pruned` for sweeps where you haven't pruned anything.
+**Don't roll `pruned` into `failed`.** They're distinct categories: `failed` is a SLURM/code error (the trial would be resubmitted on a `herd run`), `pruned` is an algorithmic kill (a sticky terminal decision, not retried). `paused` is an intentional, *resumable* SH stop — calm, not an error. `cancelled` is user-driven. When trials of several kinds exist, list them separately: `4 running, 2 paused, 5 completed, 1 failed, 2 pruned`. Only include categories with non-zero counts — don't list `0 pruned` for sweeps where nothing was pruned.
 
 Cadence table (pass to `schedule_next`):
 

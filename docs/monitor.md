@@ -100,11 +100,15 @@ Type `/` and Discord shows the autocomplete list:
 | `/plan` | The agent's `MONITOR_PLAN.md` contents |
 | `/run <index>` | Submit (or resubmit) one trial |
 | `/run_all` | Submit every ready trial |
-| `/cancel <index>` | Cancel one trial |
-| `/cancel_all` | Cancel every live trial |
+| `/stop <index>` | Cancel one trial (resubmitted on the next `herd run`) |
+| `/stop_all` | Cancel every live trial |
+| `/pause <index>` | Pause one trial — graceful and resumable (SH-aware); status becomes `paused` |
+| `/prune <index> [reason]` | Algorithmic kill — terminal, NOT resubmitted by `herd run` |
 | `/tail <index> [lines]` | Last N lines of a trial's stderr |
-| `/stop` | Stop the daemon entirely |
+| `/shutdown` | Stop the daemon entirely |
 | `/help` | List of these commands |
+
+The three trial-stopping commands differ by intent: **`/stop`** cancels (resubmittable), **`/pause`** stops gracefully and keeps the trial resumable (`paused` — used by [successive halving](#successive-halving)), and **`/prune`** is a terminal kill that `herd run` will never resurrect.
 
 These run locally against the workspace and post the answer in the channel. No model call, no spend.
 
@@ -162,9 +166,22 @@ Each agent tick posts one summary message, even on quiet ticks — silence means
 
 Auto-bumps are capped at one per failure class per sweep. If a 50% mem bump still OOMs, that class switches to notify mode for the rest of the sweep.
 
+## Successive halving
+
+If the sweep configures a [`successive_halving:`](configuration.md#successive-halving-pruning) block, the monitor's metric-based stopping is handled by the deterministic SH algorithm instead of the agent's judgment-based pruning. On each scheduled tick while trials are running, the agent calls its `run_sh` tool (which runs [`herd sh`](commands.md#herd-sh)) and reports what changed:
+
+```
+🐕 SH @ rung 10: pruned idx 3, 7 (bottom half); paused idx 5 until the field
+catches up. Totals — 4 running, 2 paused, 4 completed, 2 pruned. Next tick in 30 min.
+```
+
+`paused` is intentional and resumable — not a failure. A paused trial may be resumed automatically by a later `run_sh` once enough peers reach its rung, or you can resume it yourself with `herd run -i <index>`. The agent won't *also* judgment-prune on metrics when SH is configured (that would double up); it reserves `/prune` for things SH doesn't cover, like an immediate NaN explosion.
+
+You can drive SH by hand too — `herd sh --dry-run` previews the decisions, `herd sh` applies them — independent of whether the daemon is running.
+
 ## Stop, restart, override
 
-`/stop` from Discord stops the daemon and posts a final summary. From the terminal: SIGINT (Ctrl-C in the foreground) or SIGTERM does the same.
+`/shutdown` from Discord stops the daemon and posts a final summary. From the terminal: SIGINT (Ctrl-C in the foreground) or SIGTERM does the same.
 
 To re-run the setup interview from scratch: `rm <workspace>/.hyperherd/MONITOR_PLAN.md` then `herd monitor`.
 

@@ -73,7 +73,7 @@ def _build_heartbeat_text(workspace: Path, runtime_stats: dict) -> Optional[str]
     # (algorithmic kill vs SLURM error) and `cancelled` (user kill);
     # surfacing all three keeps the running+terminal sum visibly equal
     # to the trial total.
-    order = ["ready", "submitted", "queued", "running",
+    order = ["ready", "submitted", "queued", "running", "paused",
              "completed", "failed", "pruned", "cancelled"]
     parts = [f"{totals[k]} {k}" for k in order if totals.get(k)]
     digest = ", ".join(parts) or "no trials yet"
@@ -151,7 +151,7 @@ async def run_daemon(
         "started_at_iso": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         # Health is one of: "running" (green), "degraded" (yellow — at least
         # one consecutive tick failure but under the halt threshold),
-        # "halted" (red), "stopping" (a /stop or signal is mid-shutdown),
+        # "halted" (red), "stopping" (a /shutdown or signal is mid-shutdown),
         # "passive" (white — agent loop disabled, daemon just keeps the
         # chat surface and dashboard alive without spending tokens).
         # The dashboard reads this to render a one-char status emoji.
@@ -187,7 +187,7 @@ async def run_daemon(
     if channel is not None:
         writer = make_inbox_writer(workspace, on_write=_on_inbox_write)
         channel.set_inbound_handler(writer)
-        # Let /stop trigger the same shutdown path SIGINT/SIGTERM use.
+        # Let /shutdown trigger the same shutdown path SIGINT/SIGTERM use.
         def _stop_via_channel():
             runtime_stats["health"] = "stopping"
             shutdown.set()

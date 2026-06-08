@@ -40,7 +40,7 @@ except ImportError:
             "`pip install hyperherd[lightning]`."
         ) from e
 
-from hyperherd.logging import log_result
+from hyperherd.logging import TrialPruned, log_result
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,11 @@ class HyperHerdLogger(Logger):
                 # Lightning-style names like 'train/loss' are preserved.
                 log_result(name, value, step=s)
                 self._latest[name] = value
+            except TrialPruned:
+                # Successive-halving asked this trial to stop. Must propagate
+                # (not swallow) so trainer.fit() unwinds and the process exits
+                # cleanly — see train.py's top-level handler.
+                raise
             except Exception as e:
                 logger.warning("HyperHerdLogger: log_result(%s) failed: %s", name, e)
 

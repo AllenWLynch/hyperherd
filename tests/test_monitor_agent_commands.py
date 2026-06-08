@@ -156,6 +156,33 @@ class TestStop(unittest.TestCase):
         self.assertIn("Cancelled 4", out)
 
 
+class TestPause(unittest.TestCase):
+    def setUp(self):
+        from hyperherd import manifest
+        self.tmp = tempfile.mkdtemp()
+        self.workspace = Path(self.tmp)
+        manifest.init_workspace(self.tmp)
+        (self.workspace / ".hyperherd" / "manifest.json").write_text(json.dumps([
+            {"index": 0, "status": "running", "params": {}, "experiment_name": "a"},
+        ]))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_pause_writes_signal_and_stamps_paused(self):
+        from hyperherd import manifest
+        from hyperherd.logging import read_prune_signal
+        out = cmd_mod.cmd_pause(self.workspace, index=0)
+        self.assertIn("Paused trial 0", out)
+        self.assertEqual(read_prune_signal(str(self.workspace), 0), "pause")
+        st = {t["index"]: t["status"] for t in manifest.load_manifest(str(self.workspace))}
+        self.assertEqual(st[0], "paused")
+
+    def test_pause_unknown_index(self):
+        out = cmd_mod.cmd_pause(self.workspace, index=99)
+        self.assertIn("No trial with index 99", out)
+
+
 class TestTail(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -339,9 +366,9 @@ class TestHelp(unittest.TestCase):
     def test_lists_each_command(self):
         text = cmd_mod.cmd_help()
         for keyword in ("/status", "/stats", "/params", "/info", "/plan",
-                        "/run", "/run_all", "/cancel", "/cancel_all",
-                        "/prune", "/metrics",
-                        "/tail", "/stop", "/help"):
+                        "/run", "/run_all", "/stop", "/stop_all",
+                        "/pause", "/prune", "/metrics",
+                        "/tail", "/shutdown", "/help"):
             self.assertIn(keyword, text)
 
 

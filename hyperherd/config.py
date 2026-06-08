@@ -287,6 +287,44 @@ class McpServerConfig(BaseModel):
     expands these from its own environment at startup."""
 
 
+class SuccessiveHalving(BaseModel):
+    """Successive-halving pruning parameters for a sweep.
+
+    SH runs trials in "rungs" at geometrically-spaced step milestones
+    (`min_steps`, `min_steps*eta`, ... up to `budget`). At each rung the
+    better half of the surviving cohort is promoted; the worse half is
+    pruned; trials whose standing is not yet decidable are paused until
+    enough of the field reaches the rung. See `hyperherd/successive_halving.py`.
+    """
+
+    metric: str
+    """Objective metric name — must match a `log_result(name, ..., step=...)`
+    stream the trainer emits."""
+
+    direction: Literal["min", "max"]
+    """Whether lower (`min`, e.g. val_loss) or higher (`max`, e.g. accuracy)
+    is better."""
+
+    min_steps: int = Field(ge=1)
+    """First rung: the earliest step at which a trial can be pruned."""
+
+    budget: int = Field(ge=1)
+    """Total/maximum steps a trial runs to. The rung ladder stops at `budget`."""
+
+    eta: int = Field(default=2, ge=2)
+    """Reduction factor. `eta=2` keeps the better half at each rung; rungs are
+    spaced by powers of `eta`."""
+
+    @model_validator(mode="after")
+    def _check_budget(self):
+        if self.min_steps > self.budget:
+            raise ValueError(
+                f"successive_halving.min_steps ({self.min_steps}) must be "
+                f"<= budget ({self.budget})"
+            )
+        return self
+
+
 class Config(BaseModel):
     name: str
     workspace: str = ""  # set by load_config from the config file's directory
@@ -314,6 +352,8 @@ class Config(BaseModel):
         default_factory=list,
         validation_alias=AliasChoices("conditions", "constraints"),
     )
+
+    successive_halving: Optional[SuccessiveHalving] = None
 
     @model_validator(mode="before")
     @classmethod

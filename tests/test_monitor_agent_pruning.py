@@ -213,6 +213,41 @@ class TestPrunedStatus(unittest.TestCase):
         self.assertNotIn(1, pending)
 
 
+class TestRunShTool(unittest.TestCase):
+    """The `run_sh` agent tool shells out to `herd sh --json`."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        manifest.init_workspace(self.tmp)
+        tools_mod.set_context(
+            workspace=Path(self.tmp), sweep_name="s", last_state_json="{}",
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _run(self, **args):
+        async def _fake_run_herd_json(cmd, *, audit_event, audit_fields):
+            self._cmd = cmd
+            return {"ok": True, "pruned": [3]}
+        # `run_sh` is an SdkMcpTool (`.handler`) when claude-agent-sdk is
+        # installed, or the bare async function under the no-op shim.
+        fn = getattr(tools_mod.run_sh, "handler", tools_mod.run_sh)
+        with mock.patch.object(tools_mod, "_run_herd_json", _fake_run_herd_json):
+            result = asyncio.run(fn(args))
+        return json.loads(result["content"][0]["text"])
+
+    def test_default_builds_sh_json_command(self):
+        out = self._run()
+        self.assertEqual(self._cmd[:3], ["herd", "sh", "--json"])
+        self.assertNotIn("--dry-run", self._cmd)
+        self.assertEqual(out["pruned"], [3])
+
+    def test_dry_run_appends_flag(self):
+        self._run(dry_run=True)
+        self.assertIn("--dry-run", self._cmd)
+
+
 class TestMcpEnvExpansion(unittest.TestCase):
     def test_expands_env_var_references(self):
         from hyperherd.monitor_agent.tick import _resolve_env

@@ -241,5 +241,71 @@ class TestParseOverrides(unittest.TestCase):
                 parse_overrides()
 
 
+class TestPruneSignal(unittest.TestCase):
+    """`log_result(step=...)` self-terminates a cooperative trial when `herd sh`
+    has written a prune/pause signal for it."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        manifest.init_workspace(self.tmpdir)
+        with open(os.path.join(
+            self.tmpdir, manifest.WORKSPACE_DIR, manifest.MANIFEST_FILE,
+        ), "w") as f:
+            f.write("{}")
+        os.environ["HYPERHERD_WORKSPACE"] = self.tmpdir
+        os.environ["HYPERHERD_TRIAL_ID"] = "3"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+        os.environ.pop("HYPERHERD_WORKSPACE", None)
+        os.environ.pop("HYPERHERD_TRIAL_ID", None)
+
+    def test_no_signal_streaming_is_silent(self):
+        log_result("loss", 0.5, step=1)  # must not raise
+
+    def test_streaming_raises_when_signalled(self):
+        from hyperherd.logging import TrialPruned, write_prune_signal
+        write_prune_signal(self.tmpdir, 3, "pause")
+        with self.assertRaises(TrialPruned) as cm:
+            log_result("loss", 0.4, step=2)
+        self.assertEqual(cm.exception.action, "pause")
+        self.assertEqual(cm.exception.index, 3)
+        # The metric was still recorded before the raise.
+        self.assertEqual(len(load_metric_stream(self.tmpdir, 3, "loss")), 1)
+
+    def test_prune_action_propagates(self):
+        from hyperherd.logging import TrialPruned, write_prune_signal
+        write_prune_signal(self.tmpdir, 3, "prune")
+        with self.assertRaises(TrialPruned) as cm:
+            log_result("loss", 0.4, step=2)
+        self.assertEqual(cm.exception.action, "prune")
+
+    def test_final_summary_mode_never_raises(self):
+        from hyperherd.logging import write_prune_signal
+        write_prune_signal(self.tmpdir, 3, "prune")
+        log_result("test_acc", 0.9)  # no step → must NOT raise
+
+    def test_clear_signal_stops_raising(self):
+        from hyperherd.logging import (
+            TrialPruned, write_prune_signal, clear_prune_signal,
+        )
+        write_prune_signal(self.tmpdir, 3, "pause")
+        with self.assertRaises(TrialPruned):
+            log_result("loss", 0.4, step=2)
+        clear_prune_signal(self.tmpdir, 3)
+        log_result("loss", 0.3, step=3)  # must not raise
+
+    def test_signal_is_per_trial(self):
+        from hyperherd.logging import write_prune_signal
+        # Signal targets trial 7, but we're running as trial 3 → no raise.
+        write_prune_signal(self.tmpdir, 7, "prune")
+        log_result("loss", 0.4, step=2)
+
+    def test_invalid_action_rejected(self):
+        from hyperherd.logging import write_prune_signal
+        with self.assertRaises(ValueError):
+            write_prune_signal(self.tmpdir, 3, "bogus")
+
+
 if __name__ == "__main__":
     unittest.main()

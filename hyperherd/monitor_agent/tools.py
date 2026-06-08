@@ -310,6 +310,30 @@ async def prune_index(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @tool(
+    "run_sh",
+    "Run one round of successive-halving pruning (shells `herd sh --json`). "
+    "Only meaningful when the sweep configured a `successive_halving:` block "
+    "in hyperherd.yaml — check `state.sh` first. In one deterministic call it "
+    "reads each trial's logged metric stream, PRUNES provably-bottom-half "
+    "trials (terminal), PAUSES undecidable ones (status `paused` — resumable, "
+    "NOT a failure), and SUBMITS/resumes trials as warranted. Idempotent: "
+    "calling it when nothing is decidable is a cheap no-op. Pass dry_run=true "
+    "to preview decisions without applying them. Returns {dry_run, rungs, "
+    "slurm_job_id, submitted, pruned, paused, decisions:[{index, action, "
+    "verdict, rung, reason}]}.",
+    {"dry_run": bool},
+)
+async def run_sh(args: Dict[str, Any]) -> Dict[str, Any]:
+    dry = bool(args.get("dry_run", False))
+    cmd = ["herd", "sh", "--json", str(_CTX["workspace"])]
+    if dry:
+        cmd.append("--dry-run")
+    return _text_response(await _run_herd_json(
+        cmd, audit_event="run_sh", audit_fields={"dry_run": dry},
+    ))
+
+
+@tool(
     "summarize_metrics",
     "Summarize the optimization state in one call: for each non-ready "
     "trial and each logged metric, the most recent value (or the mean "
@@ -1065,7 +1089,7 @@ ALL = [
     read_state, read_plan, write_plan,
     read_user_prompt, mark_user_prompt_read,
     bump_mem, bump_time,
-    run_indices, stop_index, stop_all, prune_index,
+    run_indices, stop_index, stop_all, prune_index, run_sh,
     validate_config, tail_log, list_metrics, compute_metric,
     summarize_metrics,
     msg, tick_summary, post_results_table, schedule_next, halt,

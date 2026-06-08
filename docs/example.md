@@ -7,9 +7,10 @@ The repo ships a complete end-to-end sweep at `examples/mnist_training/`. PyTorc
 A 4-step learning rate (1e-4 → 1e-1, log-scaled) crossed with three optimizers (`adam`, `sgd`, `adamw`) — 12 combinations, reduced to 11 after a condition drops `sgd` at `lr > 0.05` (it's unstable). Each trial trains a small MLP on MNIST for 50 epochs and logs:
 
 - **Final** `test_acc` / `test_loss` / `best_val_acc` via plain `log_result(name, value)` — these show up in `herd res`.
-- **Streaming** `val_loss` / `val_acc` per validation epoch via `log_result(name, value, step=trainer.global_step)`, wired in through a `HyperHerdStreamCallback` in `train.py`. The autonomous monitor's `compute_metric` reads these for pruning decisions.
+- **Streaming** `train_loss` / `train_acc` every training step via the `HyperHerdLogger` Lightning logger (good for `/plot` curves).
+- **Epoch-keyed** `val_loss` / `val_acc`, logged once per epoch from `on_validation_epoch_end` via `log_result(name, value, step=self.current_epoch)`. The integer-per-epoch step is what [successive halving](#successive-halving) compares trials on, and what the monitor's `compute_metric` reads for pruning decisions.
 
-The config showcases all four condition forms — programmatic predicate, literal-extra injection, expression-computed extra, structured force — so you can see what the YAML looks like beyond the bare minimum.
+The config showcases all four condition forms — programmatic predicate, literal-extra injection, expression-computed extra, structured force — plus a `successive_halving:` block, so you can see what the YAML looks like beyond the bare minimum.
 
 ## Run it
 
@@ -68,7 +69,21 @@ The daemon will:
 4. Run the canary (trial 0), then phase 2 (trials 1–2), then the rest.
 5. Diagnose failures, post heartbeats, summarize the result when it's done.
 
-You drive it from the channel — `/status`, `/run 5`, `/cancel 3`, `/tail 7`, or `@HerdDog please bump mem to 4G`.
+You drive it from the channel — `/status`, `/run 5`, `/stop 3`, `/tail 7`, or `@HerdDog please bump mem to 4G`.
+
+## Successive halving
+
+The example's `hyperherd.yaml` includes a `successive_halving:` block (objective `val_loss`, rungs at epochs `[5, 10, 20, 40]`). Run it by hand against an in-flight sweep:
+
+```bash
+# Preview what SH would do right now (no changes):
+herd sh examples/mnist_training/ --dry-run
+
+# Apply: prune the provably-worst trials, pause the undecidable, promote the rest:
+herd sh examples/mnist_training/
+```
+
+Run it on a loop (`watch -n 300 herd sh examples/mnist_training/`) or just let the monitor's `run_sh` tool handle it. Because the trainer raises `hyperherd.TrialPruned` at its next logged epoch and `train.py` catches it at the top level, a pruned/paused trial stops cleanly (its `last.ckpt` is preserved, so a resumed trial picks up where it left off). Paused trials show up `paused` in `herd status`; SH may resume them automatically once enough peers reach the same rung.
 
 ## Things to play with
 
@@ -76,7 +91,8 @@ Once you have it running, edit `examples/mnist_training/hyperherd.yaml` and re-r
 
 - Add `0.5` to `dropout.values` → 4 new trials get appended on the next `herd run`, existing ones stay.
 - Change `grid` from `[learning_rate, optimizer]` to `all` → full Cartesian (with constraint pruning) — many more trials.
-- Add a `static_overrides: ["max_epochs=10"]` → faster iteration for debugging.
+- Add a `static_overrides: ["max_epochs=10"]` → faster iteration for debugging. (Lower `successive_halving.budget` to match.)
+- Tweak `successive_halving.min_steps` / `eta` → prune earlier or more aggressively, then watch `herd sh --dry-run`.
 - Edit a condition to invert it (`> 0.05` → `< 0.05`) → see the constraint engine prune a different chunk of the grid.
 
 Anything you change persists on subsequent runs — no manifest regeneration needed.

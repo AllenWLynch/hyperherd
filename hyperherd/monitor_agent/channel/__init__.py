@@ -94,7 +94,7 @@ class MessageChannel(Protocol):
 
     def set_stop_handler(self, handler: StopHandler) -> None:
         """Register a callback the channel can invoke to ask the daemon
-        to shut down (e.g. from a `/stop` slash command). Optional —
+        to shut down (e.g. from a `/shutdown` slash command). Optional —
         transports without a way to receive 'stop' commands can ignore."""
 
     def set_info_handler(self, handler: InfoHandler) -> None:

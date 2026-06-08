@@ -38,11 +38,12 @@ _STATUS_PRIORITY = {
     "running":   0,
     "queued":    1,
     "submitted": 2,
-    "failed":    3,
-    "pruned":    4,
-    "cancelled": 5,
-    "completed": 6,
-    "ready":     7,
+    "paused":    3,
+    "failed":    4,
+    "pruned":    5,
+    "cancelled": 6,
+    "completed": 7,
+    "ready":     8,
 }
 
 # Statuses considered "active" by /running — i.e. work that hasn't
@@ -113,7 +114,7 @@ def _format_status(snap: dict, only_active: bool = False) -> str:
     totals = snap.get("totals") or {}
     trials = snap.get("trials") or []
 
-    order = ["ready", "submitted", "queued", "running",
+    order = ["ready", "submitted", "queued", "running", "paused",
              "completed", "failed", "pruned", "cancelled"]
     counts = ", ".join(
         f"{totals[k]} {k}" for k in order if totals.get(k)
@@ -301,8 +302,9 @@ def cmd_metrics(
 
 def cmd_prune(workspace: Path, index: int, reason: str = "user-pruned via /prune") -> str:
     """Prune one trial: scancel via `herd stop` + stamp manifest as
-    `pruned`. Distinct from `/cancel` — pruned trials are NOT
-    resubmitted by future `herd run` calls."""
+    `pruned`. Distinct from `/stop` (cancel, resubmittable) and `/pause`
+    (resumable) — pruned trials are NOT resubmitted by future `herd run`
+    calls."""
     proc = subprocess.run(
         _RUNNABLE + ["stop", "-i", str(index), str(workspace)],
         capture_output=True, text=True,
@@ -322,6 +324,37 @@ def cmd_prune(workspace: Path, index: int, reason: str = "user-pruned via /prune
     return (
         f"Pruned trial {index}. Reason: {reason}\n"
         f"(Won't be resubmitted by future `herd run` calls.)\n{stop_out}"
+    )
+
+
+# --- /pause ---------------------------------------------------------------
+
+def cmd_pause(workspace: Path, index: int) -> str:
+    """Pause one trial cooperatively: write a `pause` signal and stamp the
+    manifest `paused`. The running trial self-terminates at its next
+    `log_result(step=...)` call (checkpointing first if it checkpoints) —
+    no scancel. Distinct from `/stop` (cancel) and `/prune` (terminal):
+    a paused trial is resumable, by `herd sh` (if it's later judged
+    top-half) or `herd run -i <index>`."""
+    try:
+        from hyperherd import manifest
+        from hyperherd.logging import write_prune_signal
+    except Exception as e:
+        return f"Couldn't import hyperherd: {e}"
+
+    trials = manifest.load_manifest(str(workspace))
+    trial = next((t for t in trials if t["index"] == index), None)
+    if trial is None:
+        return f"No trial with index {index}."
+    status = trial.get("status", "unknown")
+    try:
+        write_prune_signal(str(workspace), index, "pause")
+        manifest.update_trial_status(str(workspace), index, "paused")
+    except Exception as e:
+        return f"Couldn't pause trial {index}: {e}"
+    return (
+        f"Paused trial {index} (was {status}). It stops at its next logged "
+        f"step and is resumable (`herd sh`, or `herd run -i {index}`)."
     )
 
 
@@ -754,11 +787,12 @@ def cmd_help() -> str:
         "`/plan` — show the agent's `MONITOR_PLAN.md`\n"
         "`/run <index>` — submit (or resubmit) one trial\n"
         "`/run_all` — submit every ready trial\n"
-        "`/cancel <index>` — cancel one trial (will be resubmitted on next `herd run`)\n"
-        "`/cancel_all` — cancel every live trial\n"
+        "`/stop <index>` — cancel one trial (resubmitted on next `herd run`)\n"
+        "`/stop_all` — cancel every live trial\n"
+        "`/pause <index>` — pause one trial (graceful, resumable; SH-aware)\n"
         "`/prune <index> [reason]` — algorithmic kill, NOT resubmitted on `herd run`\n"
         "`/tail <index> [lines]` — last N lines of a trial's logs (default 20)\n"
-        "`/stop` — stop the monitor daemon entirely\n"
+        "`/shutdown` — stop the monitor daemon entirely\n"
         "`/help` — this list\n"
         "\n"
         "For anything else (cadence changes, remediation policy, questions), "

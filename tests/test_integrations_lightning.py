@@ -141,6 +141,17 @@ class TestHyperHerdLoggerEnabled(unittest.TestCase):
         acc = load_metric_stream(self.tmp, 5, "val_acc")
         self.assertEqual(len(acc), 3)
 
+    def test_trial_pruned_propagates(self):
+        """A prune/pause signal must surface as TrialPruned through the
+        Lightning logger — not be swallowed — so trainer.fit() unwinds and
+        the trial exits cooperatively."""
+        from hyperherd.logging import TrialPruned, write_prune_signal
+        log = HyperHerdLogger()
+        log.log_metrics({"val_loss": 0.9}, step=0)  # fine, no signal yet
+        write_prune_signal(self.tmp, 5, "pause")
+        with self.assertRaises(TrialPruned):
+            log.log_metrics({"val_loss": 0.8}, step=100)
+
     def test_log_metrics_with_slash_nested_names(self):
         """Lightning trainers commonly use 'train/loss' / 'val/loss' so
         the underlying log_result must accept the slashes verbatim."""

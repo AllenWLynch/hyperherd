@@ -24,6 +24,77 @@ from hyperherd.manifest import MANIFEST_FILE, WORKSPACE_DIR
 
 RESULTS_DIR = "results"
 
+# Name of the per-trial signal file (lives at results/<trial_id>/_signal).
+# Written by `herd sh` when a trial is pruned/paused; read in-trial by
+# `log_result(step=...)` so a cooperative trainer self-terminates at its next
+# logging point. Contents are the action word: "prune" or "pause".
+SIGNAL_FILE = "_signal"
+
+# Valid signal actions.
+_SIGNAL_ACTIONS = ("prune", "pause")
+
+
+class TrialPruned(Exception):
+    """Raised inside a trial when the pruner has asked it to stop.
+
+    `log_result(..., step=...)` raises this when `herd sh` has written a prune/
+    pause signal for the current trial — letting a cooperative trainer unwind
+    its loop, checkpoint, and exit cleanly instead of being force-killed.
+
+    `action` is "prune" (terminal; won't be resumed by SH) or "pause"
+    (resumable; SH may resubmit it later). Trainers can catch this to exit 0
+    gracefully; the trial's terminal manifest status is already owned by
+    `herd sh`, so uncaught propagation is also fine.
+    """
+
+    def __init__(self, action: str = "prune", index: Optional[int] = None):
+        self.action = action
+        self.index = index
+        who = f"trial {index}" if index is not None else "this trial"
+        super().__init__(
+            f"{who} was asked to {action} by successive-halving pruning"
+        )
+
+
+def signal_path(workspace: str, trial_id) -> str:
+    """Path to a trial's prune/pause signal file."""
+    return os.path.join(
+        workspace, WORKSPACE_DIR, RESULTS_DIR, str(trial_id), SIGNAL_FILE
+    )
+
+
+def write_prune_signal(workspace: str, trial_id, action: str) -> None:
+    """Write a prune/pause signal for a trial (called by `herd sh`)."""
+    if action not in _SIGNAL_ACTIONS:
+        raise ValueError(f"signal action must be one of {_SIGNAL_ACTIONS}, got {action!r}")
+    path = signal_path(workspace, trial_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(action)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def read_prune_signal(workspace: str, trial_id) -> Optional[str]:
+    """Read a trial's prune/pause signal, or None if none is set."""
+    path = signal_path(workspace, trial_id)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r") as f:
+        action = f.read().strip()
+    return action if action in _SIGNAL_ACTIONS else None
+
+
+def clear_prune_signal(workspace: str, trial_id) -> None:
+    """Remove a trial's prune/pause signal (e.g. before resuming it)."""
+    path = signal_path(workspace, trial_id)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
 
 def assert_writable() -> None:
     """Verify the trainer is running in a usable HyperHerd trial context.
@@ -146,6 +217,27 @@ def log_result(
         _log_result_final(name, value)
     else:
         _log_result_stream(name, value, step)
+        # After recording the step, honor any pending prune/pause signal so a
+        # cooperative trainer stops at this logging point. Only in streaming
+        # mode — the bare final-summary call at the end of training must never
+        # raise. Absent signal (the common case) is a cheap stat and a no-op.
+        _raise_if_signalled()
+
+
+def _raise_if_signalled() -> None:
+    """Raise `TrialPruned` if `herd sh` has signalled the current trial.
+
+    Reads the same `HYPERHERD_WORKSPACE` / `HYPERHERD_TRIAL_ID` env the logging
+    path uses, so it only ever fires for *this* trial. Missing env or missing
+    file → no-op (e.g. running outside a trial, or no pruning configured).
+    """
+    workspace = os.environ.get("HYPERHERD_WORKSPACE")
+    trial_id = os.environ.get("HYPERHERD_TRIAL_ID")
+    if not workspace or trial_id is None:
+        return
+    action = read_prune_signal(workspace, trial_id)
+    if action is not None:
+        raise TrialPruned(action, index=int(trial_id) if str(trial_id).isdigit() else None)
 
 
 def _log_result_final(name: str, value) -> None:

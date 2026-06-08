@@ -91,6 +91,7 @@ class TickState:
     inbox: List[InboundMessage]
     chat_history: List[ChatEntry]   # rolling buffer of recent real messages
     user_prompt: Optional["UserPromptView"] = None   # PROMPT.md state (None if file absent)
+    sh: Optional[Dict[str, Any]] = None   # successive_halving config + rungs (None if not configured)
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-serializable form — what `read_state()` hands the agent."""
@@ -107,6 +108,7 @@ class TickState:
             "inbox": [asdict(m) for m in self.inbox],
             "chat_history": [asdict(m) for m in self.chat_history],
             "user_prompt": asdict(self.user_prompt) if self.user_prompt else None,
+            "sh": self.sh,
         }
 
 
@@ -197,6 +199,28 @@ def _diff_pruned(prev: Optional[Dict[str, Any]], cur: Dict[str, Any]) -> List[in
     cur_pruned = _indices_with_status(cur, "pruned")
     prev_pruned = _indices_with_status(prev, "pruned") if prev else set()
     return sorted(cur_pruned - prev_pruned)
+
+
+def _read_sh_config(workspace: Path) -> Optional[Dict[str, Any]]:
+    """Surface the sweep's `successive_halving:` config (plus its computed
+    rung ladder) so the agent knows SH is available and can call `run_sh`.
+    None when not configured or the config can't be read."""
+    try:
+        from hyperherd.config import load_config
+        from hyperherd.successive_halving import rung_schedule
+        sh = load_config(str(workspace)).successive_halving
+        if sh is None:
+            return None
+        return {
+            "metric": sh.metric,
+            "direction": sh.direction,
+            "min_steps": sh.min_steps,
+            "budget": sh.budget,
+            "eta": sh.eta,
+            "rungs": rung_schedule(sh.min_steps, sh.budget, sh.eta),
+        }
+    except Exception:
+        return None
 
 
 # --- plan + inbox -----------------------------------------------------------
@@ -389,4 +413,5 @@ def compute(workspace: Path, trigger: TickTrigger = "scheduled") -> TickState:
         inbox=_drain_inbox(workspace),
         chat_history=_read_chat_history(workspace),
         user_prompt=_read_user_prompt(workspace),
+        sh=_read_sh_config(workspace),
     )

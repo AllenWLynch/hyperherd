@@ -27,7 +27,7 @@ def render_state(state: TickState) -> str:
 
     totals = state.totals or {}
     if totals:
-        order = ["ready", "submitted", "queued", "running",
+        order = ["ready", "submitted", "queued", "running", "paused",
                  "completed", "failed", "pruned", "cancelled"]
         parts = [f"{totals.get(k, 0)} {k}" for k in order if totals.get(k)]
         parts.append(f"{totals.get('total', len(state.trials))} total")
@@ -35,6 +35,16 @@ def render_state(state: TickState) -> str:
     else:
         lines.append("Totals: (no trials yet)")
     lines.append("")
+
+    if getattr(state, "sh", None):
+        rungs = state.sh.get("rungs")
+        lines.append(
+            f"Successive halving: optimizing `{state.sh.get('metric')}` "
+            f"({state.sh.get('direction')}), rungs {rungs} "
+            f"(in the metric's step units). Call `run_sh()` on scheduled "
+            f"ticks while trials are running — it owns metric-based stopping."
+        )
+        lines.append("")
 
     if state.newly_failed:
         lines.append(f"**Newly failed since last tick: {len(state.newly_failed)}**")

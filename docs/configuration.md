@@ -14,6 +14,7 @@ The configuration file is YAML. Every field is documented below with its type, w
 | `discord`     | object | no       | *unset*  | Discord channel for the [`herd monitor`](monitor.md) daemon. See [discord](#discord). |
 | `parameters`  | object | **yes**  | —       | Hyperparameter definitions. At least one parameter is required. See [parameters](#parameters). |
 | `conditions`  | list   | no       | `[]`    | Conditional rules that filter or modify parameter combinations. See [Conditions](conditions.md). |
+| `successive_halving` | object | no | *unset* | Successive-halving pruning parameters for [`herd sh`](commands.md#herd-sh). See [below](#successive-halving-pruning). |
 
 The **workspace** is the directory containing `hyperherd.yaml`. HyperHerd stores its state in a `.hyperherd/` subdirectory within the workspace.
 
@@ -200,6 +201,33 @@ parameters:
 
 !!! note "Default validation"
     Discrete defaults must be in `values`. Continuous defaults must be within `[low, high]`. Both are validated at parse time.
+
+## Successive-halving pruning
+
+An optional `successive_halving:` block enables [`herd sh`](commands.md#herd-sh) — early-stopping that concentrates compute on the promising trials. As trials reach geometrically-spaced step *rungs*, the better half of the surviving cohort is promoted, the worse half is pruned, and trials whose standing isn't yet decidable are paused until it is.
+
+```yaml
+successive_halving:
+  metric: val_loss      # the metric the trainer logs via log_result(name, val, step=...)
+  direction: min        # "min" (lower is better, e.g. loss) or "max" (e.g. accuracy)
+  min_steps: 5          # first rung: earliest step a trial can be pruned
+  budget: 50            # total/max steps a trial trains to
+  eta: 2                # reduction factor (default 2 → keep the better half each rung)
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `metric` | string | **yes** | — | Objective metric name. Must match a streaming `log_result(name, value, step=...)` the trainer emits. |
+| `direction` | `min` \| `max` | **yes** | — | Whether lower or higher is better. |
+| `min_steps` | int ≥ 1 | **yes** | — | First rung — the earliest step at which a trial can be pruned. |
+| `budget` | int ≥ 1 | **yes** | — | Total/maximum steps a trial runs to. Must be ≥ `min_steps`. |
+| `eta` | int ≥ 2 | no | `2` | Reduction factor. Rungs are spaced by powers of `eta`; `eta=2` keeps the better half at each rung. |
+
+Rungs are `min_steps × eta^k` for each value `≤ budget` — e.g. `min_steps: 5, budget: 50, eta: 2` gives rungs `[5, 10, 20, 40]`.
+
+The **step units are whatever the trainer logs the metric with.** If you log once per epoch (`log_result("val_loss", v, step=epoch)`), express `min_steps`/`budget` in epochs; if per global training step, use those. Log on a consistent cadence across trials so the field is compared fairly — epoch-aligned logging is the simplest. See the [MNIST example](example.md) for an epoch-aligned setup.
+
+`herd sh` is stateless — run it on a loop, or let the autonomous monitor's `run_sh` tool call it. See [`herd sh`](commands.md#herd-sh) and the [monitor docs](monitor.md#successive-halving) for details.
 
 ## Complete example
 

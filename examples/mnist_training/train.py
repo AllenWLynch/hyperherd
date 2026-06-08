@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from torchvision.datasets import MNIST
 
+from hyperherd import TrialPruned
 from hyperherd.integrations.lightning import HyperHerdLogger
 
 
@@ -68,8 +69,30 @@ class MNISTClassifier(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         loss, acc = self._shared_step(batch)
-        self.log("val_loss", loss, prog_bar=True)
-        self.log("val_acc", acc, prog_bar=True)
+        # logger=False keeps these out of HyperHerdLogger's per-global-step
+        # stream; we re-log them per EPOCH in on_validation_epoch_end so the
+        # `successive_halving` rungs in hyperherd.yaml are expressed in epochs
+        # (clean integers) rather than batch counts. Lightning still routes
+        # them to callback_metrics for the prog bar + ModelCheckpoint.
+        self.log("val_loss", loss, prog_bar=True, logger=False)
+        self.log("val_acc", acc, prog_bar=True, logger=False)
+
+    def on_validation_epoch_end(self):
+        # Epoch-indexed validation metrics for successive halving (`herd sh`):
+        # one integer step per epoch regardless of batch size / dataset size.
+        # `log_result` raises `hyperherd.TrialPruned` if the pruner has
+        # signalled this trial — that propagates up to train.py's top-level
+        # handler for a clean, checkpoint-preserving exit.
+        metrics = self.trainer.callback_metrics
+        try:
+            from hyperherd import log_result
+            for name in ("val_loss", "val_acc"):
+                value = metrics.get(name)
+                if value is not None:
+                    log_result(name, float(value), step=self.current_epoch)
+        except (ImportError, RuntimeError):
+            # Not running inside a HyperHerd trial (local dev) — skip.
+            pass
 
     def test_step(self, batch, batch_idx):
         loss, acc = self._shared_step(batch)
@@ -212,4 +235,14 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except TrialPruned as e:
+        # Successive-halving (`herd sh`) asked this trial to stop. The
+        # HyperHerdLogger raises TrialPruned at the next streamed metric;
+        # we unwind here and exit cleanly. Lightning's `save_last`
+        # checkpoint means a resumed ('paused') trial picks up where it
+        # left off. The terminal manifest status is owned by `herd sh`,
+        # so a clean exit-0 is correct — this isn't a failure.
+        print(f"\n[hyperherd] {e} — stopping cleanly (action={e.action}).")
+        raise SystemExit(0)

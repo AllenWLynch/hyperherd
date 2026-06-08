@@ -17,6 +17,20 @@ static_overrides:
   - "data_dir=./data/mnist"
   - "accelerator=auto"
 
+# Successive-halving pruning. `herd sh` (run on a loop, or by the autonomous
+# monitor) reads each trial's `val_loss` stream — which train.py logs once per
+# EPOCH (see on_validation_epoch_end) — and at each rung promotes the better
+# half, prunes the worse half, and pauses trials whose standing isn't yet
+# decidable. `min_steps`/`budget` are in the same units the trainer logs the
+# metric with: epochs. Rungs here are epochs [5, 10, 20, 40] (min_steps × eta^k
+# ≤ budget). Pruned trials stop cooperatively at their next logged epoch.
+successive_halving:
+  metric: val_loss
+  direction: min        # lower val_loss is better
+  min_steps: 5          # first rung: prune-eligible after 5 epochs
+  budget: 50            # trains to at most 50 epochs (matches max_epochs)
+  eta: 2                # keep the better half at each rung
+
 # Optional: enable the autonomous monitor's Discord channel. Walk through
 # docs/discord-setup.md once to mint a bot, then put your server's ID here.
 # Without this block, `herd monitor` still runs (failure triage, resubmits,

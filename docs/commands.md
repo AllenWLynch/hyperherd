@@ -259,6 +259,48 @@ Calls `scancel <jobid>_<index>` and updates the manifest to `cancelled`. Pass ei
 }
 ```
 
+## `herd sh`
+
+Run one round of **successive-halving** pruning. Reads each trial's logged metric stream and the sweep's `successive_halving:` config, then applies the decisions: prune the provably worst, pause the undecidable, promote/submit the rest.
+
+```bash
+herd sh [WORKSPACE] [flags]
+```
+
+Requires a [`successive_halving:`](configuration.md#successive-halving-pruning) block in `hyperherd.yaml` (or pass the equivalent flags). At geometrically-spaced step *rungs* (`min_steps`, `min_steps×eta`, … ≤ `budget`), it keeps the better half of the surviving cohort and prunes the worse half; a trial whose standing can't yet be decided (not enough of the field has reached the rung) is **paused** until it can. It acts as soon as a trial's rank is certain — it doesn't wait for every trial to reach a rung.
+
+`herd sh` is **stateless and idempotent**: each call recomputes every trial's standing from its metric stream, so it's safe to run on a loop (cron, or the autonomous monitor's `run_sh` tool).
+
+| Flag | Description |
+|---|---|
+| `-n, --dry-run` | Print the planned actions without applying them (no manifest/SLURM changes) |
+| `--metric NAME` | Objective metric (overrides config) |
+| `--direction {min,max}` | Optimization direction (overrides config) |
+| `--min-steps N` | First rung step (overrides config) |
+| `--budget N` | Total step budget (overrides config) |
+| `--eta N` | Reduction factor, ≥2 (overrides config; default 2) |
+| `-j, --max-concurrent N` | Cap concurrent running array tasks on (re)submission |
+
+**Pruning is cooperative.** `herd sh` doesn't `scancel`; it writes a per-trial signal and stamps the manifest. A running trial honors the signal at its next `log_result(..., step=...)` call by raising `hyperherd.TrialPruned`, so it can checkpoint and exit cleanly. Pruned trials become `pruned` (terminal, not resubmitted); paused trials become `paused` (resumable — `herd sh` may resume one automatically once enough peers reach its rung, or you can `herd run -i <index>`).
+
+**Agent mode** — `herd sh --json`:
+
+```json
+{
+  "dry_run": false,
+  "rungs": [5, 10, 20, 40],
+  "slurm_job_id": null,
+  "submitted": [],
+  "pruned": [2, 3],
+  "paused": [5],
+  "decisions": [
+    {"index": 0, "action": "none", "verdict": "promote", "rung": 0, "reason": "top-half at rung 0 (step 5)"},
+    {"index": 2, "action": "prune", "verdict": "prune", "rung": 0, "reason": "bottom-half at rung 0 (step 5)"},
+    {"index": 5, "action": "pause", "verdict": "pause", "rung": 0, "reason": "undecidable at rung 0 (step 5) — pausing until field catches up"}
+  ]
+}
+```
+
 ## `herd snapshot`
 
 Bundle every read-style command's output (status + sacct + logged metrics + per-trial last-log line + recent failed-trial stderr) into a single JSON document.

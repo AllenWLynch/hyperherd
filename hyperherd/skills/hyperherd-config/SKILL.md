@@ -36,6 +36,7 @@ The full reference lives at `docs/configuration.md` in this repo. **Read it befo
    - Need to inject **non-parameter** overrides (e.g. `scheduler.warmup_steps`)? Use `set`
 4. **Launcher:** does it need a container, conda env, or modules? Most launchers are 5–10 lines.
 5. **Autonomous monitor** (optional but recommended for sweeps > a few minutes): set `discord.guild_id` so `herd monitor` has a channel to post in. See "Discord block" below.
+6. **Early-stopping** (optional): if the user wants to prune underperforming trials automatically as they train, add a `successive_halving:` block. See "Successive halving" below.
 
 ## `when` matchers (the flexible part)
 
@@ -170,7 +171,32 @@ mcp_servers:
 
 If the user wants `herd monitor` to be able to prune diverging trials early, the trainer needs to call `log_result(name, value, step=N)` periodically (in addition to the bare `log_result(name, value)` for final summary metrics). The monitor's `compute_metric` tool reads these streams. See `docs/results.md` for framework-specific patterns (Lightning callback, HuggingFace TrainerCallback, plain PyTorch loop).
 
-This is independent of the YAML — the YAML doesn't need a config knob for it. Just mention it when the user asks about pruning or early-stopping.
+This is independent of the YAML — the YAML doesn't need a config knob for it. Just mention it when the user asks about pruning or early-stopping. (For *automatic* halving-based early-stopping with a config knob, see the next section.)
+
+## Successive halving (early-stopping)
+
+Add a `successive_halving:` block when the user wants automatic early-stopping that concentrates compute on promising trials. `herd sh` (run on a loop, or by the autonomous monitor's `run_sh` tool) reads each trial's streamed metric and, at geometrically-spaced step *rungs*, prunes the worse half of the surviving cohort, pauses the still-undecidable, and promotes the rest.
+
+```yaml
+successive_halving:
+  metric: val_loss      # must match a streamed log_result(name, value, step=...)
+  direction: min        # "min" (loss-like) or "max" (accuracy-like)
+  min_steps: 5          # first rung — earliest step a trial can be pruned
+  budget: 50            # total/max steps a trial trains to (>= min_steps)
+  eta: 2                # reduction factor; default 2 → keep the better half per rung
+```
+
+| Field | Required | Notes |
+|-------|----------|-------|
+| `metric` | yes | The objective. Must be a metric the trainer **streams** with `log_result(name, value, step=...)` — not a final-summary-only metric. |
+| `direction` | yes | `min` or `max`. |
+| `min_steps` | yes | First rung. Rungs are `min_steps × eta^k ≤ budget` (e.g. `5,50,2` → `[5,10,20,40]`). |
+| `budget` | yes | Max steps; must be `>= min_steps`. Usually matches the trainer's epoch/step cap (e.g. a `max_epochs` static override). |
+| `eta` | no (default 2) | Integer `>= 2`. |
+
+**Critical: step units must be consistent across trials.** SH compares trials at the same rung, so `min_steps`/`budget` are in *whatever units the trainer passes as `step`*. The cleanest choice is to log the objective **once per epoch** with `step=epoch` — then express the rungs in epochs. Warn against using a framework's global batch-step counter when `batch_size` is swept (different trials reach "step N" at different epochs — an unfair comparison). When you add this block, tell the user their trainer must stream `metric` per-epoch (or per a consistent step unit), and that pruning is cooperative — the trial stops at its next `log_result(step=...)` (which raises `hyperherd.TrialPruned`), so a long-running loop should let that exception propagate (or catch it to checkpoint+exit 0). See `docs/configuration.md#successive-halving-pruning` and the MNIST example's `on_validation_epoch_end`.
+
+Only add this block when the user asks for early-stopping/pruning/successive-halving — it's opt-in. Without it, `herd sh` is simply unavailable and trials run to completion.
 
 ## Environment variables in the launcher
 

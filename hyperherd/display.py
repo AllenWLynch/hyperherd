@@ -19,6 +19,7 @@ _STATUS_COLORS = {
     "FAILED": "\033[31m",     # red
     "CANCELLED": "\033[90m",  # gray
     "PRUNED": "\033[35m",     # magenta — algorithmic kill, distinct from cancelled
+    "PAUSED": "\033[36m",     # cyan — intentionally paused by SH, resumable (calm, not alarming)
     "TIMEOUT": "\033[31m",    # red
 }
 
