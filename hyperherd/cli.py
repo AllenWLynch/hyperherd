@@ -37,6 +37,8 @@ from hyperherd.successive_halving import (
     Action,
     SweepConfig,
     TrialState,
+    decision_label,
+    explain as explain_decision,
     plan_successive_halving,
     rung_schedule,
 )
@@ -1035,6 +1037,7 @@ def _resolve_sh_config(args, config):
     min_steps = args.min_steps if args.min_steps is not None else (base.min_steps if base else None)
     budget = args.budget if args.budget is not None else (base.budget if base else None)
     eta = args.eta if args.eta is not None else (base.eta if base else 2)
+    mode = getattr(args, "mode", None) or (base.mode if base else "sync")
 
     missing = [
         name for name, val in (
@@ -1051,7 +1054,7 @@ def _resolve_sh_config(args, config):
     try:
         return SuccessiveHalving(
             metric=metric, direction=direction,
-            min_steps=min_steps, budget=budget, eta=eta,
+            min_steps=min_steps, budget=budget, eta=eta, mode=mode,
         )
     except Exception as e:
         raise ValueError(f"invalid successive-halving parameters: {e}") from e
@@ -1089,6 +1092,7 @@ def cmd_sh(args):
         min_steps=sh_cfg.min_steps,
         budget=sh_cfg.budget,
         eta=sh_cfg.eta,
+        mode=sh_cfg.mode,
     )
     states = [
         TrialState(
@@ -1118,8 +1122,8 @@ def cmd_sh(args):
         if status_updates:
             manifest.bulk_update_status(config.workspace, status_updates)
 
-    # Batch every SUBMIT (initial launches + paused resumes) into one throttled
-    # array submission. Clear resumed trials' stale signals first.
+    # Batch every SUBMIT (paused resumes — SH never does initial launches) into
+    # one throttled array submission. Clear resumed trials' stale signals first.
     submit_indices = sorted(p.index for p in submits)
     slurm_job_id = None
     if submit_indices and not dry_run:
@@ -1138,6 +1142,7 @@ def cmd_sh(args):
     if json_mode:
         agent_output.emit({
             "dry_run": dry_run,
+            "mode": sweep.mode,
             "rungs": rung_schedule(sweep.min_steps, sweep.budget, sweep.eta),
             "slurm_job_id": slurm_job_id,
             "submitted": submit_indices,
@@ -1146,10 +1151,25 @@ def cmd_sh(args):
             "decisions": [
                 {
                     "index": p.index,
+                    "status": p.status,
+                    "max_step": p.max_step,
                     "action": p.action.value,
                     "verdict": p.verdict.value,
                     "rung": p.rung,
                     "reason": p.reason,
+                    "explanation": explain_decision(p),
+                    "standing": (
+                        {
+                            "rung": p.standing.rung,
+                            "step": p.standing.step,
+                            "value": p.standing.value,
+                            "cohort_size": p.standing.cohort_size,
+                            "keep": p.standing.keep,
+                            "ahead_definite": p.standing.ahead_definite,
+                            "unreached": p.standing.unreached,
+                        }
+                        if p.standing is not None else None
+                    ),
                 }
                 for p in plan
             ],
@@ -1157,6 +1177,9 @@ def cmd_sh(args):
         return 0
 
     _print_sh_plan(plan, submit_indices, prunes, pauses, dry_run, slurm_job_id)
+    if getattr(args, "reason", False):
+        _print_sh_reasons(
+            plan, rung_schedule(sweep.min_steps, sweep.budget, sweep.eta))
     return 0
 
 
@@ -1179,6 +1202,53 @@ def _print_sh_plan(plan, submit_indices, prunes, pauses, dry_run, slurm_job_id):
     print(f"{verb}: {', '.join(summary)}.")
     if slurm_job_id:
         print(f"SLURM job array: {slurm_job_id}")
+
+
+# Statuses that participate in the SH cohort — the trials `--reason` explains.
+# (Excludes ready/failed/cancelled/pruned, which are out of the competition.)
+_COHORT_STATUSES = ("running", "paused", "submitted", "queued", "completed")
+
+
+def _fmt_metric_value(v):
+    if v is None:
+        return "n/a"
+    try:
+        return f"{float(v):.4g}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _print_sh_reasons(plan, rungs):
+    """`herd sh --reason`: explain SH's stance on every cohort trial. Trials it
+    actually ranked at a rung come first, each with the cohort arithmetic behind
+    the decision; trials still training toward the first rung follow as compact
+    one-liners (so it's clear they're just not there yet, not being ignored)."""
+    shown = [p for p in plan if p.status in _COHORT_STATUSES]
+    print()
+    if not shown:
+        print("Why: no trials are in the successive-halving cohort yet.")
+        return
+    judged = sorted((p for p in shown if p.standing is not None),
+                    key=lambda x: x.index)
+    waiting = sorted((p for p in shown if p.standing is None),
+                     key=lambda x: x.index)
+    first_rung = rungs[0] if rungs else None
+
+    print("Why:")
+    for p in judged:
+        s = p.standing
+        print(f"  #{p.index:<4} {decision_label(p).upper():<13} "
+              f"rung {s.rung} (step {s.step}), "
+              f"value {_fmt_metric_value(s.value)}")
+        print(f"        {explain_decision(p)}")
+    for p in waiting:
+        if first_rung is not None:
+            at = (f"at step {p.max_step}" if p.max_step is not None
+                  else "no metric logged yet")
+            where = f"{at}, not yet at rung 0 (step {first_rung})"
+        else:
+            where = p.reason
+        print(f"  #{p.index:<4} {decision_label(p).upper():<13} {where}")
 
 
 def cmd_clean(args):
@@ -1926,11 +1996,21 @@ def main():
         "-n", "--dry-run", action="store_true",
         help="Show the planned actions without applying them (no manifest/SLURM changes)",
     )
+    p_sh.add_argument(
+        "-r", "--reason", action="store_true",
+        help="Explain each decision: the cohort arithmetic behind every "
+             "prune/pause/continue/resume (the 'why' for the relevant trials)",
+    )
     p_sh.add_argument("--metric", default=None, help="Objective metric name (overrides config)")
     p_sh.add_argument("--direction", choices=("min", "max"), default=None, help="Optimization direction (overrides config)")
     p_sh.add_argument("--min-steps", dest="min_steps", type=int, default=None, help="First rung step (overrides config)")
     p_sh.add_argument("--budget", type=int, default=None, help="Total step budget (overrides config)")
     p_sh.add_argument("--eta", type=int, default=None, help="Reduction factor, >=2 (overrides config; default 2)")
+    p_sh.add_argument(
+        "--mode", choices=("sync", "asha"), default=None,
+        help="Scheduler (overrides config): 'asha' ranks only arrived trials "
+             "(never waits); 'sync' pauses undecidable trials until the field arrives",
+    )
     p_sh.add_argument(
         "-j", "--max-concurrent", type=int, default=None,
         help="Cap concurrent running array tasks on (re)submission",

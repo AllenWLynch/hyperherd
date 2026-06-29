@@ -327,11 +327,20 @@ async def prune_index(args: Dict[str, Any]) -> Dict[str, Any]:
     "in hyperherd.yaml — check `state.sh` first. In one deterministic call it "
     "reads each trial's logged metric stream, PRUNES provably-bottom-half "
     "trials (terminal), PAUSES undecidable ones (status `paused` — resumable, "
-    "NOT a failure), and SUBMITS/resumes trials as warranted. Idempotent: "
-    "calling it when nothing is decidable is a cheap no-op. Pass dry_run=true "
-    "to preview decisions without applying them. Returns {dry_run, rungs, "
+    "NOT a failure), and RESUMES paused trials that become provably top-half. "
+    "It never launches never-submitted (`ready`) trials — starting trials is "
+    "your job (`run_sweep`/`herd run`), not SH's. Idempotent: "
+    "calling it when nothing is decidable is a cheap no-op. The scheduler is set "
+    "in config (`successive_halving.mode`): `sync` pauses undecidable trials "
+    "until the field arrives; `asha` ranks only arrived trials and never pauses "
+    "(so `paused` is always empty under asha). Pass dry_run=true to preview "
+    "decisions without applying them. Returns {dry_run, mode, rungs, "
     "slurm_job_id, submitted, pruned, paused, decisions:[{index, action, "
-    "verdict, rung, reason}]}.",
+    "verdict, rung, reason, explanation, standing}]}. Each decision's "
+    "`explanation` is a plain-language 'why' and `standing` is the cohort "
+    "arithmetic behind it (rung, step, value, cohort_size, keep, "
+    "ahead_definite, unreached) — use these to tell a user why a trial was "
+    "paused/pruned/kept (null for trials not yet at a rung).",
     {"dry_run": bool},
 )
 async def run_sh(args: Dict[str, Any]) -> Dict[str, Any]:

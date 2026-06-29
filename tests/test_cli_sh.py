@@ -73,7 +73,7 @@ class TestCmdSh(unittest.TestCase):
 
     def _args(self, **over):
         base = dict(
-            workspace=self.tmp, dry_run=False, json_output=False,
+            workspace=self.tmp, dry_run=False, json_output=False, reason=False,
             metric=None, direction=None, min_steps=None, budget=None,
             eta=None, max_concurrent=None,
         )
@@ -154,8 +154,9 @@ class TestCmdSh(unittest.TestCase):
         self.assertEqual(self._status()[2], "running")
         self.assertFalse(os.path.exists(signal_path(self.tmp, 2)))
 
-    def test_submits_ready_trials_in_one_array(self):
-        # All ready → one batched submission, statuses become 'submitted'.
+    def test_does_not_submit_ready_trials(self):
+        # Launching never-submitted (ready) trials is the user's job, not SH's.
+        # All ready → SH submits nothing and leaves every status untouched.
         with mock.patch("hyperherd.cli._sync_slurm_status"), \
              mock.patch("hyperherd.cli.slurm.generate_sbatch_script",
                         return_value="#sbatch"), \
@@ -163,13 +164,11 @@ class TestCmdSh(unittest.TestCase):
                         return_value="999") as submit:
             rc = cmd_sh(self._args())
         self.assertEqual(rc, 0)
-        submit.assert_called_once()
+        submit.assert_not_called()
         st = self._status()
-        self.assertTrue(all(v == "submitted" for v in st.values()))
-        # One job_ids record covering all four indices.
-        recs = manifest.get_job_ids(self.tmp)
-        self.assertEqual(recs[-1]["slurm_job_id"], "999")
-        self.assertEqual(sorted(recs[-1]["indices"]), [0, 1, 2, 3])
+        self.assertTrue(all(v == "ready" for v in st.values()))
+        # No job submission was recorded.
+        self.assertEqual(manifest.get_job_ids(self.tmp), [])
 
     def test_resume_clears_signal(self):
         # idx0 paused with a stale signal but now provably top-half → resume.
@@ -204,6 +203,85 @@ class TestCmdSh(unittest.TestCase):
         self.assertEqual(payload["rungs"], [10, 20, 40, 80])
         self.assertEqual(sorted(payload["pruned"]), [2, 3])
         self.assertEqual(len(payload["decisions"]), 4)
+
+    def test_json_includes_standing_and_explanation(self):
+        # All four reach rung 0 → each decision carries the cohort arithmetic.
+        manifest.bulk_update_status(
+            self.tmp, {0: "running", 1: "running", 2: "running", 3: "running"})
+        for i, v in enumerate([0.1, 0.2, 0.3, 0.4]):
+            _stream(self.tmp, i, (10, v))
+        buf = io.StringIO()
+        with mock.patch("hyperherd.cli._sync_slurm_status"), redirect_stdout(buf):
+            rc = cmd_sh(self._args(json_output=True))
+        self.assertEqual(rc, 0)
+        decisions = {d["index"]: d for d in json.loads(buf.getvalue())["decisions"]}
+        worst = decisions[3]   # pruned
+        self.assertEqual(worst["action"], "prune")
+        self.assertEqual(worst["standing"]["cohort_size"], 4)
+        self.assertEqual(worst["standing"]["keep"], 2)
+        self.assertEqual(worst["standing"]["ahead_definite"], 3)
+        self.assertIn("below the cut", worst["explanation"])
+
+    def test_reason_flag_explains_decisions(self):
+        # idx0,1,2 reached rung 0; idx3 still below it. Cohort=4, keep top 2:
+        # idx0 (best) continues, idx1 pauses (undecidable), idx2 prunes.
+        manifest.bulk_update_status(
+            self.tmp, {0: "running", 1: "running", 2: "running", 3: "running"})
+        _stream(self.tmp, 0, (10, 0.1))
+        _stream(self.tmp, 1, (10, 0.2))
+        _stream(self.tmp, 2, (10, 0.3))
+        _stream(self.tmp, 3, (5, 0.05))
+        buf = io.StringIO()
+        with mock.patch("hyperherd.cli._sync_slurm_status"), redirect_stdout(buf):
+            rc = cmd_sh(self._args(dry_run=True, reason=True))
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        why = out.split("Why:")[1]
+        self.assertIn("cohort of 4", why)
+        self.assertIn("keep top 2", why)
+        self.assertIn("CONTINUE", why)
+        self.assertIn("PAUSE", why)
+        # The below-rung trial (idx3) now renders too — as a warming-up
+        # one-liner showing its current step, not silently dropped.
+        self.assertIn("#3", why)
+        self.assertIn("PRE-RUNG", why)
+        self.assertIn("at step 5, not yet at rung 0 (step 10)", why)
+
+    def test_mode_asha_never_pauses(self):
+        # idx0,1,2 at rung 0; idx3 below. SYNC would pause; ASHA cuts among the
+        # three arrived (keep floor(3/2)=1) and never pauses.
+        manifest.bulk_update_status(
+            self.tmp, {0: "running", 1: "running", 2: "running", 3: "running"})
+        _stream(self.tmp, 0, (10, 0.1))
+        _stream(self.tmp, 1, (10, 0.2))
+        _stream(self.tmp, 2, (10, 0.3))
+        _stream(self.tmp, 3, (5, 0.05))
+        buf = io.StringIO()
+        with mock.patch("hyperherd.cli._sync_slurm_status"), redirect_stdout(buf):
+            rc = cmd_sh(self._args(dry_run=True, json_output=True, mode="asha"))
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["mode"], "asha")
+        self.assertEqual(payload["paused"], [])
+        self.assertEqual(sorted(payload["pruned"]), [1, 2])  # only idx0 survives
+
+    def test_reason_flag_labels_completed_not_paused(self):
+        # Regression: when the running field is still below the rung, a completed
+        # trial is the only one judged — and was wrongly labelled "STAY PAUSED".
+        # It must read COMPLETE.
+        manifest.bulk_update_status(
+            self.tmp, {0: "completed", 1: "running", 2: "running", 3: "running"})
+        _stream(self.tmp, 0, (10, 0.1))   # completed, at rung 0
+        for i in (1, 2, 3):
+            _stream(self.tmp, i, (5, 0.2))  # all below rung 0
+        buf = io.StringIO()
+        with mock.patch("hyperherd.cli._sync_slurm_status"), redirect_stdout(buf):
+            rc = cmd_sh(self._args(dry_run=True, reason=True))
+        self.assertEqual(rc, 0)
+        why = out = buf.getvalue().split("Why:")[1]
+        self.assertIn("#0", why)
+        self.assertIn("COMPLETE", why)
+        self.assertNotIn("PAUSED", why)
 
 
 class TestPausedSticky(unittest.TestCase):

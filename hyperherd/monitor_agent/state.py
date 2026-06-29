@@ -217,6 +217,7 @@ def _read_sh_config(workspace: Path) -> Optional[Dict[str, Any]]:
             "min_steps": sh.min_steps,
             "budget": sh.budget,
             "eta": sh.eta,
+            "mode": sh.mode,
             "rungs": rung_schedule(sh.min_steps, sh.budget, sh.eta),
         }
     except Exception:

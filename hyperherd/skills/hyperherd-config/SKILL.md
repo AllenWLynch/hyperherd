@@ -175,7 +175,7 @@ This is independent of the YAML — the YAML doesn't need a config knob for it. 
 
 ## Successive halving (early-stopping)
 
-Add a `successive_halving:` block when the user wants automatic early-stopping that concentrates compute on promising trials. `herd sh` (run on a loop, or by the autonomous monitor's `run_sh` tool) reads each trial's streamed metric and, at geometrically-spaced step *rungs*, prunes the worse half of the surviving cohort, pauses the still-undecidable, and promotes the rest.
+Add a `successive_halving:` block when the user wants automatic early-stopping that concentrates compute on promising trials. `herd sh` (run on a loop, or by the autonomous monitor's `run_sh` tool) reads each trial's streamed metric and, at geometrically-spaced step *rungs*, keeps the better fraction of the field and prunes the rest.
 
 ```yaml
 successive_halving:
@@ -184,6 +184,7 @@ successive_halving:
   min_steps: 5          # first rung — earliest step a trial can be pruned
   budget: 50            # total/max steps a trial trains to (>= min_steps)
   eta: 2                # reduction factor; default 2 → keep the better half per rung
+  mode: sync            # scheduler: "sync" (default) or "asha"
 ```
 
 | Field | Required | Notes |
@@ -193,6 +194,7 @@ successive_halving:
 | `min_steps` | yes | First rung. Rungs are `min_steps × eta^k ≤ budget` (e.g. `5,50,2` → `[5,10,20,40]`). |
 | `budget` | yes | Max steps; must be `>= min_steps`. Usually matches the trainer's epoch/step cap (e.g. a `max_epochs` static override). |
 | `eta` | no (default 2) | Integer `>= 2`. |
+| `mode` | no (default `sync`) | `sync`: conservative bracket — pauses undecidable trials until enough of the field arrives (never an early-stop mistake, but stalls on uneven launches). `asha`: asynchronous halving — ranks only the trials that have arrived at each rung and never waits (suits fields launched/relaunched over time). Suggest `asha` when the user starts trials in waves or lets the monitor relaunch them. |
 
 **Critical: step units must be consistent across trials.** SH compares trials at the same rung, so `min_steps`/`budget` are in *whatever units the trainer passes as `step`*. The cleanest choice is to log the objective **once per epoch** with `step=epoch` — then express the rungs in epochs. Warn against using a framework's global batch-step counter when `batch_size` is swept (different trials reach "step N" at different epochs — an unfair comparison). When you add this block, tell the user their trainer must stream `metric` per-epoch (or per a consistent step unit), and that pruning is cooperative — the trial stops at its next `log_result(step=...)` (which raises `hyperherd.TrialPruned`), so a long-running loop should let that exception propagate (or catch it to checkpoint+exit 0). See `docs/configuration.md#successive-halving-pruning` and the MNIST example's `on_validation_epoch_end`.
 

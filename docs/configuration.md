@@ -204,7 +204,7 @@ parameters:
 
 ## Successive-halving pruning
 
-An optional `successive_halving:` block enables [`herd sh`](commands.md#herd-sh) — early-stopping that concentrates compute on the promising trials. As trials reach geometrically-spaced step *rungs*, the better half of the surviving cohort is promoted, the worse half is pruned, and trials whose standing isn't yet decidable are paused until it is.
+An optional `successive_halving:` block enables [`herd sh`](commands.md#herd-sh) — early-stopping that concentrates compute on the promising trials. As trials reach geometrically-spaced step *rungs*, the better fraction of the field is kept and the rest is pruned.
 
 ```yaml
 successive_halving:
@@ -213,6 +213,7 @@ successive_halving:
   min_steps: 5          # first rung: earliest step a trial can be pruned
   budget: 50            # total/max steps a trial trains to
   eta: 2                # reduction factor (default 2 → keep the better half each rung)
+  mode: sync            # scheduler: "sync" (default) or "asha" — see below
 ```
 
 | Field | Type | Required | Default | Description |
@@ -222,6 +223,12 @@ successive_halving:
 | `min_steps` | int ≥ 1 | **yes** | — | First rung — the earliest step at which a trial can be pruned. |
 | `budget` | int ≥ 1 | **yes** | — | Total/maximum steps a trial runs to. Must be ≥ `min_steps`. |
 | `eta` | int ≥ 2 | no | `2` | Reduction factor. Rungs are spaced by powers of `eta`; `eta=2` keeps the better half at each rung. |
+| `mode` | `sync` \| `asha` | no | `sync` | Scheduler — how the cut is made at each rung (see below). |
+
+**Scheduler (`mode`).** Both keep the top `1/eta` at each rung; they differ in how they handle a partially-arrived field:
+
+- **`sync`** (default) — the conservative bracket. A trial is only pruned/promoted once its standing is certain *regardless of how the trials that haven't reached the rung yet turn out*; undecidable trials are **paused** until enough of the field arrives. Never makes an early-stop mistake, but stalls when trials are launched unevenly (every arrival waits for the stragglers).
+- **`asha`** — asynchronous halving ([Li et al. 2020](https://arxiv.org/abs/1810.05934)). At each rung it ranks **only the trials that have arrived** and keeps the top `floor(n/eta)` (all of them while fewer than `eta` have arrived). It never waits and never pauses, so it suits fields that are launched or relaunched over time — at the cost of occasionally stopping a trial that a slower, worse-but-later arrival would have spared. Override per-run with `herd sh --mode asha`.
 
 Rungs are `min_steps × eta^k` for each value `≤ budget` — e.g. `min_steps: 5, budget: 50, eta: 2` gives rungs `[5, 10, 20, 40]`.
 

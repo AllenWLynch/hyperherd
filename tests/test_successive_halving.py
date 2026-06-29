@@ -14,7 +14,9 @@ from hyperherd.successive_halving import (
     SweepConfig,
     TrialState,
     Verdict,
+    decision_label,
     dedup_stream,
+    explain,
     plan_successive_halving,
     reached_rung_index,
     rung_schedule,
@@ -28,9 +30,9 @@ def _stream(*pairs, ts_offset=0):
     return [{"step": s, "value": v, "ts": s + ts_offset} for s, v in pairs]
 
 
-def _cfg(direction="min", min_steps=10, budget=80, eta=2):
+def _cfg(direction="min", min_steps=10, budget=80, eta=2, mode="sync"):
     return SweepConfig(metric="m", direction=direction,
-                       min_steps=min_steps, budget=budget, eta=eta)
+                       min_steps=min_steps, budget=budget, eta=eta, mode=mode)
 
 
 def _by_index(plan):
@@ -360,13 +362,35 @@ class TestThrashGuards(unittest.TestCase):
         p = _by_index(plan_successive_halving(trials, cfg))
         self.assertEqual(p[0].action, Action.NONE)
 
-    def test_ready_trial_submits(self):
+    def test_ready_trial_not_submitted(self):
+        # SH never launches never-submitted (ready) trials — that's the user's
+        # job (`herd run`). SH only ever resumes trials it itself paused.
         cfg = _cfg(min_steps=10, budget=80)
         trials = [TrialState(i, "ready", []) for i in range(3)]
         p = _by_index(plan_successive_halving(trials, cfg))
         for i in range(3):
-            self.assertEqual(p[i].action, Action.SUBMIT)
+            self.assertEqual(p[i].action, Action.NONE)
             self.assertEqual(p[i].verdict, Verdict.NOT_AT_RUNG)
+
+    def test_ready_trials_excluded_from_cohort_denominator(self):
+        # Policy A: ready (never-launched) trials are out of the cohort, so they
+        # neither raise K nor count as `unreached`. Two arrived running trials
+        # therefore form a 2-cohort (K=1) and decide immediately, instead of
+        # both pausing forever while waiting on ready trials SH will never start.
+        cfg = _cfg(min_steps=10, budget=80)
+        trials = [
+            TrialState(0, "running", _stream((10, 0.1))),  # better
+            TrialState(1, "running", _stream((10, 0.2))),  # worse
+            TrialState(2, "ready", []),
+            TrialState(3, "ready", []),
+        ]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        self.assertIn(p[0].verdict, (Verdict.PROMOTE, Verdict.RUN_FREE))
+        self.assertEqual(p[1].verdict, Verdict.PRUNE)
+        self.assertEqual(p[1].action, Action.PRUNE)
+        # The ready trials are untouched.
+        self.assertEqual(p[2].action, Action.NONE)
+        self.assertEqual(p[3].action, Action.NONE)
 
 
 class TestNanHandling(unittest.TestCase):
@@ -403,7 +427,7 @@ class TestVerdictToAction(unittest.TestCase):
     def test_table(self):
         # (status, verdict) -> expected action
         cases = [
-            ("ready", Verdict.NOT_AT_RUNG, Action.SUBMIT),
+            ("ready", Verdict.NOT_AT_RUNG, Action.NONE),
             ("running", Verdict.PRUNE, Action.PRUNE),
             ("running", Verdict.PAUSE, Action.PAUSE),
             ("running", Verdict.PROMOTE, Action.NONE),
@@ -425,6 +449,177 @@ class TestVerdictToAction(unittest.TestCase):
                 verdict_to_action(status, verdict), expected,
                 f"{status} + {verdict} should be {expected}",
             )
+
+
+class TestStandingAndExplain(unittest.TestCase):
+    """The cohort arithmetic surfaced by `herd sh --reason`."""
+
+    def test_standing_records_cohort_arithmetic(self):
+        cfg = _cfg(min_steps=10, budget=80)
+        # 0,1,2 reached rung 0; 3,4 below it (unreached). Cohort=5, keep top 3.
+        trials = [
+            TrialState(0, "running", _stream((10, 0.1))),  # best
+            TrialState(1, "running", _stream((10, 0.2))),
+            TrialState(2, "running", _stream((10, 0.3))),
+            TrialState(3, "running", _stream((5, 0.05))),
+            TrialState(4, "running", _stream((5, 0.06))),
+        ]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        s0 = p[0].standing
+        self.assertIsNotNone(s0)
+        self.assertEqual((s0.rung, s0.step), (0, 10))
+        self.assertEqual((s0.cohort_size, s0.keep), (5, 3))
+        self.assertEqual((s0.ahead_definite, s0.unreached), (0, 2))
+        self.assertEqual(s0.value, 0.1)
+        # idx2: 2 trials ahead, 2 unreached → undecidable → PAUSE.
+        self.assertEqual(p[2].verdict, Verdict.PAUSE)
+        self.assertEqual((p[2].standing.ahead_definite, p[2].standing.unreached),
+                         (2, 2))
+
+    def test_off_rung_trials_have_no_standing(self):
+        cfg = _cfg(min_steps=10, budget=80)
+        trials = [TrialState(0, "running", _stream((5, 0.1))),  # below rung 0
+                  TrialState(1, "ready", [])]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        self.assertIsNone(p[0].standing)
+        self.assertIsNone(p[1].standing)
+
+    def test_explain_falls_back_to_reason_off_rung(self):
+        cfg = _cfg(min_steps=10, budget=80)
+        trials = [TrialState(0, "ready", [])]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        self.assertEqual(explain(p[0]), p[0].reason)
+
+    def test_explain_spells_out_prune(self):
+        cfg = _cfg(min_steps=10, budget=10)  # single rung
+        trials = [TrialState(i, "running", _stream((10, v)))
+                  for i, v in enumerate([0.1, 0.2, 0.3, 0.4])]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        # idx3 is worst of 4 → 3 ahead, keep top 2 → prune. All four have
+        # arrived (unreached=0), so explain uses the rank-of-arrived phrasing.
+        self.assertEqual(p[3].verdict, Verdict.PRUNE)
+        text = explain(p[3])
+        self.assertIn("rank 4 of 4 arrived", text)
+        self.assertIn("keep top 2", text)
+        self.assertIn("below the cut", text)
+
+    def test_decision_label_maps_effect(self):
+        cfg = _cfg(min_steps=10, budget=10)
+        trials = [TrialState(i, "running", _stream((10, v)))
+                  for i, v in enumerate([0.1, 0.2, 0.3, 0.4])]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        self.assertEqual(decision_label(p[3]), "prune")        # PRUNE action
+        self.assertEqual(decision_label(p[0]), "run-to-budget")  # RUN_FREE
+        # A promoted (paused→resume) trial reads "resume".
+        resume = next(p2 for p2 in plan_successive_halving(
+            [TrialState(0, "paused", _stream((10, 0.1))),
+             TrialState(1, "running", _stream((10, 0.9)))], cfg) if p2.index == 0)
+        self.assertEqual(decision_label(resume), "resume")
+
+    def test_status_and_max_step_recorded(self):
+        cfg = _cfg(min_steps=10, budget=80)
+        trials = [TrialState(0, "running", _stream((10, 0.1), (20, 0.05)))]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        self.assertEqual(p[0].status, "running")
+        self.assertEqual(p[0].max_step, 20)
+
+    def test_completed_trial_labelled_complete_not_paused(self):
+        # Regression: a completed trial that is undecidable at its rung (the
+        # running field hasn't caught up) gets verdict PAUSE but action NONE —
+        # it must read "complete", never "stay-paused". It's terminal, not held.
+        cfg = _cfg(min_steps=10, budget=10)  # single rung at step 10
+        trials = [
+            TrialState(0, "completed", _stream((10, 0.1))),  # at rung 0
+            TrialState(1, "running", _stream((5, 0.2))),     # below rung 0
+            TrialState(2, "running", _stream((5, 0.3))),     # below rung 0
+        ]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        self.assertEqual(p[0].verdict, Verdict.PAUSE)   # ranking undecidable
+        self.assertEqual(p[0].action, Action.NONE)      # terminal — no action
+        self.assertEqual(decision_label(p[0]), "complete")
+
+    def test_running_below_rung_labelled_pre_rung(self):
+        cfg = _cfg(min_steps=10, budget=80)
+        trials = [TrialState(0, "running", _stream((5, 0.2)))]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        self.assertEqual(p[0].verdict, Verdict.NOT_AT_RUNG)
+        self.assertEqual(p[0].max_step, 5)
+        self.assertEqual(decision_label(p[0]), "pre-rung")
+
+    def test_just_launched_labelled(self):
+        cfg = _cfg(min_steps=10, budget=80)
+        trials = [TrialState(0, "submitted", []),
+                  TrialState(1, "queued", [])]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        self.assertEqual(decision_label(p[0]), "just-launched")
+        self.assertEqual(decision_label(p[1]), "just-launched")
+
+
+class TestAshaMode(unittest.TestCase):
+    """`mode="asha"`: rank only the arrived; keep top floor(n/eta); never pause."""
+
+    def test_never_pauses_decides_among_arrived(self):
+        # idx0,1,2 reached rung 0; idx3 still below. Under SYNC this pauses the
+        # undecidable ones; under ASHA it ranks the 3 arrived and cuts now.
+        cfg = _cfg(min_steps=10, budget=80, mode="asha")
+        trials = [
+            TrialState(0, "running", _stream((10, 0.1))),  # best of arrived
+            TrialState(1, "running", _stream((10, 0.2))),
+            TrialState(2, "running", _stream((10, 0.3))),
+            TrialState(3, "running", _stream((5, 0.05))),  # not yet at rung 0
+        ]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        verdicts = {i: p[i].verdict for i in range(4)}
+        self.assertNotIn(Verdict.PAUSE, verdicts.values())
+        # n=3 arrived, eta=2 → keep floor(3/2)=1. Only idx0 survives.
+        self.assertEqual(p[0].verdict, Verdict.PROMOTE)
+        self.assertEqual(p[1].verdict, Verdict.PRUNE)
+        self.assertEqual(p[2].verdict, Verdict.PRUNE)
+        self.assertEqual(p[3].verdict, Verdict.NOT_AT_RUNG)  # still warming up
+        # Standing reflects the arrived denominator, no stragglers.
+        self.assertEqual(p[1].standing.cohort_size, 3)
+        self.assertEqual(p[1].standing.keep, 1)
+        self.assertEqual(p[1].standing.unreached, 0)
+
+    def test_gate_keeps_all_below_eta(self):
+        # Fewer than eta arrived → no cut (keep == n), so nobody is pruned.
+        cfg = _cfg(min_steps=10, budget=80, mode="asha")
+        trials = [
+            TrialState(0, "running", _stream((10, 0.1))),
+            TrialState(1, "running", _stream((5, 0.2))),   # below rung 0
+        ]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        self.assertEqual(p[0].verdict, Verdict.PROMOTE)  # lone arrival, not cut
+        self.assertEqual(p[0].standing.keep, 1)
+        self.assertEqual(p[0].standing.cohort_size, 1)
+
+    def test_resumes_promoted_paused_trial(self):
+        # A paused trial that's top of the arrived field resumes (SUBMIT).
+        cfg = _cfg(min_steps=10, budget=80, mode="asha")
+        trials = [
+            TrialState(0, "paused", _stream((10, 0.05))),  # best
+            TrialState(1, "running", _stream((10, 0.2))),
+        ]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        self.assertEqual(p[0].action, Action.SUBMIT)
+
+    def test_cut_at_lowest_failed_rung(self):
+        # A trial that clears rung 0 but tanks at rung 1 is pruned *at rung 1*.
+        cfg = _cfg(min_steps=10, budget=40, mode="asha")  # rungs [10,20,40]
+        trials = [
+            TrialState(0, "running", _stream((10, 0.1), (20, 0.1))),  # survives
+            TrialState(1, "running", _stream((10, 0.2), (20, 0.5))),  # tanks at r1
+            TrialState(2, "running", _stream((10, 0.3))),  # cut at rung 0
+            TrialState(3, "running", _stream((10, 0.4))),  # cut at rung 0
+        ]
+        p = _by_index(plan_successive_halving(trials, cfg))
+        # rung 0: 4 arrived, keep 2 → idx0,idx1 survive; idx2,idx3 cut at rung 0.
+        self.assertEqual(p[2].rung, 0)
+        self.assertEqual(p[3].rung, 0)
+        # rung 1: 2 arrived (idx0,idx1), keep 1 → idx0 survives, idx1 cut at rung 1.
+        self.assertEqual(p[1].verdict, Verdict.PRUNE)
+        self.assertEqual(p[1].rung, 1)
+        self.assertEqual(p[0].verdict, Verdict.PROMOTE)
 
 
 if __name__ == "__main__":

@@ -291,10 +291,9 @@ class SuccessiveHalving(BaseModel):
     """Successive-halving pruning parameters for a sweep.
 
     SH runs trials in "rungs" at geometrically-spaced step milestones
-    (`min_steps`, `min_steps*eta`, ... up to `budget`). At each rung the
-    better half of the surviving cohort is promoted; the worse half is
-    pruned; trials whose standing is not yet decidable are paused until
-    enough of the field reaches the rung. See `hyperherd/successive_halving.py`.
+    (`min_steps`, `min_steps*eta`, ... up to `budget`). At each rung the better
+    fraction of the field is kept and the rest is pruned. `mode` chooses how that
+    cut is made — see `hyperherd/successive_halving.py`.
     """
 
     metric: str
@@ -314,6 +313,13 @@ class SuccessiveHalving(BaseModel):
     eta: int = Field(default=2, ge=2)
     """Reduction factor. `eta=2` keeps the better half at each rung; rungs are
     spaced by powers of `eta`."""
+
+    mode: Literal["sync", "asha"] = "sync"
+    """Scheduler. `sync` (default): the conservative bracket — pauses undecidable
+    trials until enough of the field arrives, never making an early-stop mistake
+    but stalling when launches are uneven. `asha`: asynchronous halving — at each
+    rung rank only the trials that have arrived and keep the top `1/eta`; never
+    waits, so it suits fields launched/relaunched over time."""
 
     @model_validator(mode="after")
     def _check_budget(self):
