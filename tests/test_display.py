@@ -1,8 +1,94 @@
 """Tests for terminal output formatting."""
 
+import io
+import re
 import unittest
+from contextlib import redirect_stdout
 
-from hyperherd.display import _condense_case_block, format_short_value
+from hyperherd.display import (
+    _condense_case_block,
+    format_short_value,
+    print_status_table,
+    trial_sort_key,
+)
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _render(trials, *, brief=False, log_tails=None):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        print_status_table(trials, log_tails or {}, brief=brief)
+    return _ANSI_RE.sub("", buf.getvalue())
+
+
+class TestStatusTable(unittest.TestCase):
+    def _trial(self, idx, status, name=None, params=None):
+        t = {"index": idx, "status": status, "params": params or {}}
+        if name is not None:
+            t["experiment_name"] = name
+        return t
+
+    def test_shows_experiment_name_not_params(self):
+        out = _render([
+            self._trial(0, "running", name="mix-hi_lr-3e-05",
+                        params={"dataset_config": "configs/train/data/x.yaml"}),
+        ])
+        self.assertIn("Name", out)
+        self.assertNotIn("Params", out)
+        self.assertIn("mix-hi_lr-3e-05", out)
+        # The long param path that used to get cut off is not shown.
+        self.assertNotIn("configs/train/data/x.yaml", out)
+
+    def test_falls_back_to_params_without_name(self):
+        out = _render([self._trial(0, "running", params={"lr": 0.01})])
+        self.assertIn("lr=0.01", out)
+
+    def test_brief_hides_ready_and_cancelled(self):
+        out = _render([
+            self._trial(0, "ready", name="r"),
+            self._trial(1, "cancelled", name="c"),
+            self._trial(2, "running", name="run"),
+        ], brief=True)
+        self.assertIn("run", out)
+        self.assertNotIn("READY", out)
+        self.assertNotIn("CANCELLED", out)
+
+    def test_brief_sorts_active_first(self):
+        out = _render([
+            self._trial(0, "completed", name="done"),
+            self._trial(1, "running", name="live"),
+            self._trial(2, "failed", name="broke"),
+        ], brief=True)
+        rows = [ln for ln in out.splitlines() if "RUNNING" in ln or
+                "FAILED" in ln or "COMPLETED" in ln]
+        # running < failed < completed by status priority.
+        self.assertTrue(rows[0].strip().startswith("1"))   # running
+        self.assertIn("FAILED", rows[1])
+        self.assertIn("COMPLETED", rows[2])
+
+    def test_log_tail_ansi_stripped_no_bleed(self):
+        # A wandb-style log tail with an opened-but-unterminated color must not
+        # leak ANSI into the rendered table. Render WITHOUT our test-side strip
+        # to prove the table itself emitted no foreign escape.
+        colored = "\x1b[33mView run \x1b[1;34mmy-run-name that is quite long enough"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            print_status_table(
+                [self._trial(0, "running", name="run")], {0: colored},
+            )
+        raw = buf.getvalue()
+        # The only ANSI allowed is the table's own Status colorize (which is
+        # always paired with a reset); the borrowed log color must be gone.
+        self.assertNotIn("\x1b[33m", raw)
+        self.assertNotIn("\x1b[1;34m", raw)
+        self.assertIn("View run", _ANSI_RE.sub("", raw))
+
+    def test_sort_key_priority(self):
+        self.assertLess(
+            trial_sort_key({"status": "running", "index": 9}),
+            trial_sort_key({"status": "completed", "index": 0}),
+        )
 
 
 class TestCondenseCaseBlock(unittest.TestCase):

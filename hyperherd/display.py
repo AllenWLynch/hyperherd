@@ -7,6 +7,12 @@ from typing import Any, Dict, List, Optional
 # ANSI color/style codes
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
+
+# Matches any ANSI CSI escape (color/style/cursor). Used to strip foreign codes
+# out of borrowed text (e.g. a wandb-colored log tail) so they don't bleed into
+# the rest of the table — a truncated tail can otherwise cut off mid-sequence,
+# leaving an open color that paints everything until the next reset.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _DIM = "\033[2m"
 
 # Status colors
@@ -78,8 +84,59 @@ def format_params_colored(params: Dict[str, Any]) -> str:
     return "  ".join(parts)
 
 
-def print_status_table(trials: List[dict], log_tails: Dict[int, str]) -> None:
-    """Print a formatted status table of all trials."""
+# Per-status display priority (smaller = more important). The Discord
+# dashboard sorts by the same key, so a truncated view drops the boring tail
+# (completed/ready) instead of the trials the user cares about. Single source
+# of truth — `monitor_agent.commands` re-exports these.
+STATUS_PRIORITY = {
+    "running":   0,
+    "queued":    1,
+    "submitted": 2,
+    "paused":    3,
+    "failed":    4,
+    "pruned":    5,
+    "cancelled": 6,
+    "completed": 7,
+    "ready":     8,
+}
+
+# Statuses hidden by the status table's brief view (`herd status --brief`):
+# never-ran and user-cancelled trials are noise when triaging a live sweep.
+_BRIEF_HIDDEN_STATUSES = frozenset({"ready", "cancelled"})
+
+
+def trial_sort_key(trial: dict) -> tuple:
+    """Sort by status priority then index — active trials first, then problems,
+    then settled, then never-ran. Index breaks ties so the order is
+    deterministic within each status bucket."""
+    status = (trial.get("status") or "").lower()
+    return (STATUS_PRIORITY.get(status, 99), trial.get("index", 0))
+
+
+def _trial_name(trial: dict) -> str:
+    """A trial's compact experiment name, falling back to a compact param
+    string for legacy manifests written before `experiment_name` existed."""
+    return trial.get("experiment_name") or format_params_compact(
+        trial.get("params", {})
+    )
+
+
+def print_status_table(
+    trials: List[dict], log_tails: Dict[int, str], *, brief: bool = False,
+) -> None:
+    """Print a formatted status table of all trials.
+
+    Shows each trial's compact experiment **name** (the swept-param values get
+    truncated unhelpfully). With ``brief=True``, sort by status (active first,
+    like the dashboard) and hide READY/CANCELLED trials so the view focuses on
+    what's in flight.
+    """
+    if brief:
+        trials = sorted(
+            (t for t in trials
+             if (t.get("status") or "").lower() not in _BRIEF_HIDDEN_STATUSES),
+            key=trial_sort_key,
+        )
     if not trials:
         print("No trials found.")
         return
@@ -87,16 +144,16 @@ def print_status_table(trials: List[dict], log_tails: Dict[int, str]) -> None:
     idx_width = max(len(str(t["index"])) for t in trials)
     idx_width = max(idx_width, 5)
 
-    param_strs = {t["index"]: format_params_compact(t["params"]) for t in trials}
-    param_width = max(len(s) for s in param_strs.values())
-    param_width = max(min(param_width, 50), 6)
+    name_strs = {t["index"]: _trial_name(t) for t in trials}
+    name_width = max(len(s) for s in name_strs.values())
+    name_width = max(min(name_width, 60), 6)
 
     status_width = max(len(t.get("status", "")) for t in trials)
     status_width = max(status_width, 6)
 
     header = (
         f"{'Trial':>{idx_width}}  "
-        f"{'Params':<{param_width}}  "
+        f"{'Name':<{name_width}}  "
         f"{'Status':<{status_width}}  "
         f"Last Log"
     )
@@ -106,8 +163,12 @@ def print_status_table(trials: List[dict], log_tails: Dict[int, str]) -> None:
     for trial in trials:
         idx = trial["index"]
         status = trial.get("status", "unknown").upper()
-        params = format_params_compact(trial["params"], max_width=param_width)
-        log_tail = log_tails.get(idx, "")
+        name = name_strs[idx]
+        if len(name) > name_width:
+            name = name[: name_width - 1] + "…"
+        # Strip ANSI from the borrowed log tail so its colors don't bleed into
+        # the table, and so truncation counts visible chars (not escape bytes).
+        log_tail = _ANSI_RE.sub("", log_tails.get(idx, ""))
         if len(log_tail) > 60:
             log_tail = log_tail[:57] + "..."
 
@@ -115,7 +176,7 @@ def print_status_table(trials: List[dict], log_tails: Dict[int, str]) -> None:
 
         print(
             f"{idx:>{idx_width}}  "
-            f"{params:<{param_width}}  "
+            f"{name:<{name_width}}  "
             f"{status_str}  "
             f"{log_tail}"
         )

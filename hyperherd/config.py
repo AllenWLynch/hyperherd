@@ -361,6 +361,15 @@ class Config(BaseModel):
 
     successive_halving: Optional[SuccessiveHalving] = None
 
+    prune_grace_seconds: int = Field(default=600, ge=0)
+    """Cooperative-stop backstop. `herd sh` prunes/pauses a trial by writing a
+    signal file (no `scancel`), trusting the in-trial logger to self-terminate at
+    its next logging point. If a signalled trial is *still* active in SLURM this
+    many seconds after the signal was written, `herd` force-cancels it
+    (`scancel`) on its next status sync. Guards against trainers that lack the
+    cooperative-stop hook or are wedged. Set to 0 to disable and rely purely on
+    cooperative stops."""
+
     @model_validator(mode="before")
     @classmethod
     def _migrate_hydra_static_overrides(cls, data):

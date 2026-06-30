@@ -30,33 +30,14 @@ def _strip_ansi(text: str) -> str:
 
 # --- /status --------------------------------------------------------------
 
-# How interesting is each status, smaller = more important. Used to
-# sort the per-trial table so when Discord truncates a long status post
-# the user loses the boring tail (completeds, readys) instead of the
-# things they actually care about.
-_STATUS_PRIORITY = {
-    "running":   0,
-    "queued":    1,
-    "submitted": 2,
-    "paused":    3,
-    "failed":    4,
-    "pruned":    5,
-    "cancelled": 6,
-    "completed": 7,
-    "ready":     8,
-}
+# Status-priority sort (active first, boring tail last) lives in `display` as
+# the single source of truth; re-exported here so the Discord dashboard
+# (`discord_channel.py` via `cmd_mod.trial_sort_key`) and `/status` share it.
+from hyperherd.display import STATUS_PRIORITY as _STATUS_PRIORITY, trial_sort_key
 
 # Statuses considered "active" by /running — i.e. work that hasn't
 # settled into a terminal state.
 _ACTIVE_STATUSES = ("running", "queued", "submitted")
-
-
-def trial_sort_key(trial: dict) -> tuple:
-    """Sort by status-priority then index — active trials first, then
-    problems, then completed, then never-ran. Index breaks ties so the
-    order is deterministic within each status bucket."""
-    status = (trial.get("status") or "").lower()
-    return (_STATUS_PRIORITY.get(status, 99), trial.get("index", 0))
 
 
 def cmd_status(workspace: Path) -> str:

@@ -97,6 +97,58 @@ class TestDaemonLoop(unittest.TestCase):
         self.assertFalse(out.stopped_by_signal)
         self.assertEqual(calls, ["boot", "scheduled", "scheduled"])
 
+    def test_runs_sh_before_each_tick(self):
+        """Deterministic successive halving runs once per tick, before the
+        agent — so trials stay on-policy regardless of whether the agent fires
+        run_sh itself."""
+        order = []
+        results = iter([
+            TickResult(0.001, halted=False, halt_reason=None,
+                       cost_usd=0.0, turns=1),
+            TickResult(None, halted=True, halt_reason="done",
+                       cost_usd=0.0, turns=1),
+        ])
+
+        async def fake_run_tick(workspace, trigger, **_):
+            order.append(("tick", trigger))
+            return next(results)
+
+        sh_calls = []
+
+        async def fake_sh(workspace, channel):
+            order.append(("sh", str(workspace)))
+            sh_calls.append(workspace)
+
+        out = asyncio.run(daemon_mod.run_daemon(
+            self.workspace, run_tick=fake_run_tick, run_sh_step=fake_sh,
+            enable_slurm_poll=False, post_final=False,
+        ))
+
+        self.assertEqual(out.ticks, 2)
+        self.assertEqual(len(sh_calls), 2)
+        ws = str(self.workspace.resolve())
+        self.assertEqual(order, [
+            ("sh", ws), ("tick", "boot"),
+            ("sh", ws), ("tick", "scheduled"),
+        ])
+
+    def test_sh_step_failure_does_not_break_tick(self):
+        """A raising SH step must never take down the tick loop."""
+        calls = []
+        fake = _make_run_tick(
+            [TickResult(None, halted=True, halt_reason="done",
+                        cost_usd=0.0, turns=1)],
+            calls,
+        )
+
+        async def boom_sh(workspace, channel):
+            raise RuntimeError("sacct exploded")
+
+        out = self._run(fake, run_sh_step=boom_sh)
+        self.assertEqual(out.ticks, 1)
+        self.assertTrue(out.halted)
+        self.assertEqual(calls, ["boot"])
+
     def test_none_delay_does_not_crash(self):
         """If the agent forgets schedule_next (delay=None), the loop must
         not raise. We bound with max_ticks=1 so we never sleep the fallback."""
@@ -320,6 +372,22 @@ class TestHeartbeatBuilder(unittest.TestCase):
         self.assertIn("1 running", text)
         self.assertIn("2 completed", text)
         self.assertIn("4 agent tick", text)
+        # No SH info until the first auto-SH run.
+        self.assertNotIn("SH last ran", text)
+
+    def test_heartbeat_shows_last_sh_run(self):
+        import json as _json
+        snap = self.workspace / ".hyperherd" / "last-snapshot.json"
+        snap.write_text(_json.dumps({"totals": {"total": 2, "running": 2}}))
+        text = daemon_mod._build_heartbeat_text(self.workspace, {
+            "ticks": 1,
+            "sh_last_run_iso": "2026-06-29T21:45:07+00:00",
+            "sh_last_counts": {"pruned": 2, "paused": 0, "submitted": 1},
+        })
+        self.assertIn("SH last ran 21:45:07", text)
+        self.assertIn("2 pruned", text)
+        self.assertIn("1 submitted", text)
+        self.assertNotIn("0 paused", text)
 
 
 if __name__ == "__main__":

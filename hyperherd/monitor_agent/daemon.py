@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,67 @@ from typing import Optional
 @contextlib.asynccontextmanager
 async def _noop_thinking_cm():
     yield
+
+
+async def _auto_sh_step(workspace: Path, channel):
+    """Run successive halving once, deterministically — the same `herd sh` the
+    agent's `run_sh` tool invokes — so trials stay on-policy on every tick even
+    if the agent never fires it.
+
+    Returns ``{"pruned": [...], "paused": [...], "submitted": [...]}`` when SH
+    actually ran (the lists are empty on a no-op tick), or ``None`` when there
+    was nothing to run (no `successive_halving:` block) or it failed. Always
+    logs one INFO line per successful run — even a no-op — so the daemon log
+    positively confirms SH fired each tick. Posts a one-line ✂️ summary to the
+    channel only when it pruned/paused/resumed something. Best-effort: any
+    failure is logged, never fatal to the daemon.
+    """
+    import json
+    try:
+        from hyperherd.config import load_config
+        if load_config(str(workspace)).successive_halving is None:
+            return None  # SH not configured for this sweep — nothing to schedule
+    except Exception:
+        return None  # missing/invalid config — leave scheduling to the agent
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "hyperherd.cli", "sh", "--json", str(workspace),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+    except Exception as e:
+        log.warning("Auto-SH launch failed: %s", e)
+        return None
+    if proc.returncode != 0:
+        log.warning("Auto-SH exited %s: %s", proc.returncode,
+                    (err or b"").decode(errors="replace")[:200])
+        return None
+    try:
+        res = json.loads((out or b"").decode())
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+    pruned = res.get("pruned") or []
+    paused = res.get("paused") or []
+    submitted = res.get("submitted") or []
+    # One line every run (even a no-op) so `herd monitor`'s log confirms SH
+    # fired this tick. Grep the daemon stderr for "Auto-SH ran".
+    log.info("Auto-SH ran: pruned=%d paused=%d submitted=%d",
+             len(pruned), len(paused), len(submitted))
+    if channel is not None and (pruned or paused or submitted):
+        parts = []
+        if pruned:
+            parts.append(f"{len(pruned)} pruned")
+        if paused:
+            parts.append(f"{len(paused)} paused")
+        if submitted:
+            parts.append(f"{len(submitted)} resumed")
+        try:
+            await channel.post("✂️ Auto-SH: " + ", ".join(parts) + ".")
+        except Exception as e:
+            log.warning("Auto-SH post failed: %s", e)
+    return {"pruned": pruned, "paused": paused, "submitted": submitted}
 
 
 async def _heartbeat_loop(
@@ -78,7 +140,19 @@ def _build_heartbeat_text(workspace: Path, runtime_stats: dict) -> Optional[str]
     parts = [f"{totals[k]} {k}" for k in order if totals.get(k)]
     digest = ", ".join(parts) or "no trials yet"
     ticks = runtime_stats.get("ticks", 0)
-    return f"🐾 {digest} · {ticks} agent tick(s) so far."
+    text = f"🐾 {digest} · {ticks} agent tick(s) so far."
+    # Confirm the deterministic per-tick SH is firing: show when it last ran
+    # and what it did. Absent until the first SH run (or if SH isn't configured).
+    sh_iso = runtime_stats.get("sh_last_run_iso")
+    if sh_iso:
+        c = runtime_stats.get("sh_last_counts") or {}
+        acted = ", ".join(
+            f"{c[k]} {k}" for k in ("pruned", "paused", "submitted") if c.get(k)
+        )
+        text += f" · SH last ran {sh_iso[11:19]}"
+        if acted:
+            text += f" ({acted})"
+    return text
 
 from hyperherd.monitor_agent import tick as tick_mod
 from hyperherd.monitor_agent.channel import (
@@ -104,6 +178,7 @@ async def run_daemon(
     *,
     max_ticks: Optional[int] = None,
     run_tick=None,                # injectable for tests
+    run_sh_step=None,             # per-tick deterministic SH; injectable for tests
     channel: Optional[MessageChannel] = None,  # if None, built from config
     enable_slurm_poll: bool = True,
     slurm_poll_interval: Optional[float] = None,
@@ -130,6 +205,8 @@ async def run_daemon(
     workspace = Path(workspace).resolve()
     if run_tick is None:
         run_tick = tick_mod.run_tick
+    if run_sh_step is None:
+        run_sh_step = _auto_sh_step
 
     # Build the chat channel from workspace config if the caller didn't
     # inject one. None = no channel; the daemon runs without inbox/post.
@@ -159,6 +236,25 @@ async def run_daemon(
         "consecutive_failures": 0,
         "agent_enabled": agent_enabled,
     }
+
+    async def _run_sh_and_record():
+        """Run the per-tick deterministic SH and stamp runtime_stats so the
+        heartbeat / `/info` can show when it last fired (and what it did).
+        Best-effort — never lets SH disrupt the loop."""
+        try:
+            sh_res = await run_sh_step(workspace, channel)
+        except Exception as e:
+            log.warning("Auto-SH step raised: %s", e)
+            return
+        if sh_res is None:
+            return  # SH not configured / failed — nothing to record
+        runtime_stats["sh_last_run_iso"] = (
+            datetime.now(timezone.utc).isoformat(timespec="seconds")
+        )
+        runtime_stats["sh_last_counts"] = {
+            k: len(sh_res.get(k) or [])
+            for k in ("pruned", "paused", "submitted")
+        }
 
     def _on_signal(signum):
         log.info("Received signal %s, shutting down after current tick.", signum)
@@ -263,6 +359,9 @@ async def run_daemon(
                 _state.refresh_snapshot(workspace)
             except Exception as e:
                 log.warning("Passive snapshot refresh failed: %s", e)
+            # On-policy SH still runs in passive mode — the whole point is to
+            # keep pruning/pausing trials with no agent in the loop.
+            await _run_sh_and_record()
 
             from datetime import datetime as _dt, timezone as _tz, timedelta as _td
             runtime_stats["next_tick_at_iso"] = (
@@ -281,6 +380,10 @@ async def run_daemon(
 
         while not shutdown.is_set():
             log.info("Tick %d starting (trigger=%s)", ticks + 1, trigger)
+            # Deterministic successive halving BEFORE the agent runs: keep
+            # trials on-policy every tick regardless of whether the agent fires
+            # run_sh. Best-effort — never let it disrupt the tick loop.
+            await _run_sh_and_record()
             # Show the platform's "thinking" indicator (Discord typing dots,
             # etc.) for the duration of the tick. No-op if no channel.
             thinking_cm = (

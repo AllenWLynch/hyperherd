@@ -32,6 +32,9 @@ from hyperherd.logging import (
     load_metric_stream,
     write_prune_signal,
     clear_prune_signal,
+    signal_age_seconds,
+    mark_signal_escalated,
+    signal_escalated,
 )
 from hyperherd.successive_halving import (
     Action,
@@ -470,7 +473,7 @@ def cmd_status(args):
         agent_output.emit(agent_output.status_payload(trials, log_tails))
         return 0
 
-    print_status_table(trials, log_tails)
+    print_status_table(trials, log_tails, brief=getattr(args, "brief", False))
     print_summary(trials)
     return 0
 
@@ -1827,6 +1830,69 @@ def _sync_slurm_status(workspace: str):
 
     manifest.bulk_update_status(workspace, updates)
 
+    # Backstop: force-cancel trials that ignored a prune/pause signal past the
+    # grace period (stale/wedged trainers that never self-terminate). Reads the
+    # pre-sync `trials` snapshot — pruned/paused are sticky, so their status is
+    # authoritative there.
+    _escalate_unresponsive_signals(workspace, trials, statuses, job_records)
+
+
+# SLURM states in which a signalled trial is still consuming (or about to
+# consume) resources — i.e. it has NOT honored its prune/pause signal yet.
+_ACTIVE_SLURM_STATES = frozenset({
+    "RUNNING", "PENDING", "REQUEUED", "RESIZING", "SUSPENDED", "CONFIGURING",
+})
+
+
+def _escalate_unresponsive_signals(workspace, trials, statuses, job_records):
+    """Cooperative-stop backstop (see `Config.prune_grace_seconds`).
+
+    `herd sh` prunes/pauses a trial by writing a signal file and trusting the
+    in-trial logger to self-terminate — it never `scancel`s. A trial whose
+    trainer lacks that hook (or is wedged) keeps burning GPU while the manifest
+    already reports it pruned/paused. If a signalled trial is still active in
+    SLURM `prune_grace_seconds` after the signal was written, force-cancel it.
+    Escalation is marked per trial so later syncs don't re-`scancel`/re-log it.
+    """
+    try:
+        grace = load_config(workspace).prune_grace_seconds
+    except Exception:
+        grace = 600  # config unreadable mid-sync — fall back to the default
+    if grace <= 0:
+        return
+
+    # Trials under an active prune/pause signal that's outlived the grace and
+    # hasn't been escalated yet → seconds the signal has been pending.
+    overdue = {}
+    for t in trials:
+        if t.get("status") not in ("pruned", "paused"):
+            continue
+        idx = t["index"]
+        if signal_escalated(workspace, idx):
+            continue
+        age = signal_age_seconds(workspace, idx)
+        if age is not None and age >= grace:
+            overdue[idx] = age
+    if not overdue:
+        return
+
+    status_of = {t["index"]: t.get("status") for t in trials}
+    cancelled = {}  # idx -> (job_id, age) of the first active task we cancelled
+    for (job_id, array_idx), state in statuses.items():
+        if array_idx not in overdue or state not in _ACTIVE_SLURM_STATES:
+            continue
+        slurm.cancel_array_task(job_id, array_idx)
+        cancelled.setdefault(array_idx, (job_id, overdue[array_idx]))
+
+    for idx, (job_id, age) in cancelled.items():
+        mark_signal_escalated(workspace, idx)
+        print(
+            f"hyperherd: trial #{idx} ignored its {status_of.get(idx, 'stop')} "
+            f"signal for {int(age)}s (grace {grace}s) — force-cancelled SLURM "
+            f"job {job_id}_{idx}.",
+            file=sys.stderr,
+        )
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1910,6 +1976,11 @@ def main():
     # monitor
     p_monitor = subparsers.add_parser("status", help="Show status of all trials", parents=[json_parent])
     p_monitor.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
+    p_monitor.add_argument(
+        "-b", "--brief", action="store_true",
+        help="Sort trials by status (active first) and hide READY/CANCELLED "
+             "trials, like the Discord dashboard.",
+    )
 
     # stats — SLURM accounting (sacct)
     p_stats = subparsers.add_parser("stats", help="Print runtime/memory accounting from sacct", parents=[json_parent])

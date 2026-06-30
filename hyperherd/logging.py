@@ -18,6 +18,7 @@ up automatically.
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, Optional
 
 from hyperherd.manifest import MANIFEST_FILE, WORKSPACE_DIR
@@ -32,6 +33,12 @@ SIGNAL_FILE = "_signal"
 
 # Valid signal actions.
 _SIGNAL_ACTIONS = ("prune", "pause")
+
+# Marker written beside the signal when `herd` force-cancels a trial that
+# ignored its prune/pause signal past the grace period (the cooperative-stop
+# backstop). Keeps later status syncs from re-`scancel`ing / re-logging the same
+# escalation; cleared whenever the signal itself is cleared (e.g. on resume).
+ESCALATED_FILE = "_signal_escalated"
 
 
 class TrialPruned(Exception):
@@ -88,12 +95,45 @@ def read_prune_signal(workspace: str, trial_id) -> Optional[str]:
 
 
 def clear_prune_signal(workspace: str, trial_id) -> None:
-    """Remove a trial's prune/pause signal (e.g. before resuming it)."""
+    """Remove a trial's prune/pause signal and any escalation marker (e.g.
+    before resuming it)."""
+    for path in (signal_path(workspace, trial_id),
+                 _escalated_path(workspace, trial_id)):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+def _escalated_path(workspace: str, trial_id) -> str:
+    """Path to a trial's force-cancel escalation marker."""
+    return os.path.join(
+        workspace, WORKSPACE_DIR, RESULTS_DIR, str(trial_id), ESCALATED_FILE
+    )
+
+
+def signal_age_seconds(workspace: str, trial_id) -> Optional[float]:
+    """Seconds since the trial's prune/pause signal was written, or None if no
+    signal is set. Uses the signal file's mtime (set atomically at write)."""
     path = signal_path(workspace, trial_id)
     try:
-        os.remove(path)
+        return max(0.0, time.time() - os.path.getmtime(path))
     except FileNotFoundError:
-        pass
+        return None
+
+
+def mark_signal_escalated(workspace: str, trial_id) -> None:
+    """Record that `herd` has force-cancelled this trial for ignoring its
+    signal, so later syncs don't re-`scancel` or re-log it."""
+    path = _escalated_path(workspace, trial_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("1")
+
+
+def signal_escalated(workspace: str, trial_id) -> bool:
+    """True if this trial's ignored signal was already force-cancelled."""
+    return os.path.isfile(_escalated_path(workspace, trial_id))
 
 
 def assert_writable() -> None:

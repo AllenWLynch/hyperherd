@@ -41,8 +41,9 @@ def render_state(state: TickState) -> str:
         lines.append(
             f"Successive halving: optimizing `{state.sh.get('metric')}` "
             f"({state.sh.get('direction')}), rungs {rungs} "
-            f"(in the metric's step units). Call `run_sh()` on scheduled "
-            f"ticks while trials are running — it owns metric-based stopping."
+            f"(in the metric's step units). SH runs automatically every tick — "
+            f"it owns metric-based stopping, so you don't need to call "
+            f"`run_sh()` yourself (use it only for an on-demand/dry-run check)."
         )
         lines.append("")
 
