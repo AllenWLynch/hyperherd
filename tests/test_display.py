@@ -15,10 +15,10 @@ from hyperherd.display import (
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def _render(trials, *, brief=False, log_tails=None):
+def _render(trials, *, brief=False, log_tails=None, progress=None):
     buf = io.StringIO()
     with redirect_stdout(buf):
-        print_status_table(trials, log_tails or {}, brief=brief)
+        print_status_table(trials, log_tails or {}, progress=progress, brief=brief)
     return _ANSI_RE.sub("", buf.getvalue())
 
 
@@ -89,6 +89,42 @@ class TestStatusTable(unittest.TestCase):
             trial_sort_key({"status": "running", "index": 9}),
             trial_sort_key({"status": "completed", "index": 0}),
         )
+
+    def test_no_step_column_without_progress(self):
+        out = _render([self._trial(0, "running", name="run")])
+        self.assertNotIn("Step", out)
+        self.assertNotIn("Steps/min", out)
+
+    def test_step_column_shown_when_progress_present(self):
+        out = _render(
+            [self._trial(0, "running", name="run")],
+            progress={0: (1234, 7.5)},
+        )
+        self.assertIn("Step", out)
+        self.assertIn("Steps/min", out)
+        self.assertIn("1,234", out)   # thousands separator
+        self.assertIn("7.5/m", out)
+
+    def test_step_shown_without_rate(self):
+        # Completed trials carry a step but no rate — Step column appears,
+        # Steps/min column is omitted entirely.
+        out = _render(
+            [self._trial(0, "completed", name="done")],
+            progress={0: (9999, None)},
+        )
+        self.assertIn("Step", out)
+        self.assertNotIn("Steps/min", out)
+        self.assertIn("9,999", out)
+
+    def test_missing_progress_entry_renders_blank(self):
+        out = _render(
+            [self._trial(0, "running", name="a"),
+             self._trial(1, "ready", name="b")],
+            progress={0: (50, 3.0)},   # trial 1 has no entry
+        )
+        self.assertIn("50", out)
+        # Trial 1's row still renders without crashing.
+        self.assertIn("b", out)
 
 
 class TestCondenseCaseBlock(unittest.TestCase):

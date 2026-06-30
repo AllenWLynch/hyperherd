@@ -30,6 +30,7 @@ from hyperherd.logging import (
     load_all_results,
     collect_step_rows,
     load_metric_stream,
+    read_trial_progress,
     write_prune_signal,
     clear_prune_signal,
     signal_age_seconds,
@@ -469,11 +470,23 @@ def cmd_status(args):
     for trial in trials:
         log_tails[trial["index"]] = slurm.get_log_tail(config.workspace, trial["index"])
 
+    # Cheaply derive per-trial training progress (current step + steps/min)
+    # from the metric streams. steps/min only carries meaning for trials
+    # that are actively training, so we leave it blank for the rest.
+    progress = {}
+    for trial in trials:
+        idx = trial["index"]
+        step, spm = read_trial_progress(config.workspace, idx)
+        running = (trial.get("status") or "").lower() == "running"
+        progress[idx] = (step, spm if running else None)
+
     if getattr(args, "json_output", False):
-        agent_output.emit(agent_output.status_payload(trials, log_tails))
+        agent_output.emit(agent_output.status_payload(trials, log_tails, progress))
         return 0
 
-    print_status_table(trials, log_tails, brief=getattr(args, "brief", False))
+    print_status_table(
+        trials, log_tails, progress=progress, brief=getattr(args, "brief", False),
+    )
     print_summary(trials)
     return 0
 
@@ -1485,6 +1498,44 @@ def cmd_monitor(args):
     # the loader only fills in keys not already set.
     _apply_workspace_env(workspace)
 
+    # One-shot prompt: seed the inbox with the message and run a single
+    # user-message tick with a console channel so the reply prints here.
+    # No daemon, no Discord, no preflight (the agent only needs model auth,
+    # which _apply_workspace_env just loaded).
+    if args.prompt:
+        import datetime
+        from pathlib import Path as _Path
+        from hyperherd.monitor_agent import tick as tick_mod
+        from hyperherd.monitor_agent.channel import (
+            make_inbox_writer, InboundEvent,
+        )
+        from hyperherd.monitor_agent.channel.console_channel import ConsoleChannel
+
+        async def _run_prompt():
+            writer = make_inbox_writer(_Path(workspace))
+            ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            await writer(InboundEvent(
+                timestamp=ts, source="cli",
+                author=os.environ.get("USER", "cli"), text=args.prompt,
+            ))
+            return await tick_mod.run_tick(
+                workspace, trigger="user_message", channel=ConsoleChannel(),
+            )
+
+        try:
+            result = asyncio.run(_run_prompt())
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        print(
+            f"(turn complete — cost=${result.cost_usd:.4f} turns={result.turns})",
+            file=sys.stderr,
+        )
+        if result.halted:
+            print(f"Agent halted: {result.halt_reason or '(no reason)'}",
+                  file=sys.stderr)
+        return 0
+
     # Live paths only — preflight the env so misconfigurations fail
     # before the daemon spends API tokens or sits silently with no
     # chat surface.
@@ -2099,6 +2150,15 @@ def main():
     p_monitor.add_argument(
         "--once", action="store_true",
         help="Run exactly one tick and exit (live — calls the model)",
+    )
+    p_monitor.add_argument(
+        "-p", "--prompt", metavar="MSG", default=None,
+        help=(
+            "One-shot: wake the agent with MSG, run a single turn, print its "
+            "reply to the terminal, and exit. Lets you steer the study in "
+            "natural language without a running daemon or Discord. Implies a "
+            "live model call."
+        ),
     )
     p_monitor.add_argument(
         "--dry-run", action="store_true",

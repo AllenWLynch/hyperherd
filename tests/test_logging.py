@@ -16,6 +16,7 @@ from hyperherd.logging import (
     load_trial_results,
     log_result,
     parse_overrides,
+    read_trial_progress,
 )
 
 
@@ -157,6 +158,57 @@ class TestLogResult(unittest.TestCase):
         # checking for '..' components.
         with self.assertRaises(ValueError):
             log_result("ok\\..\\escape", 0.0, step=0)
+
+
+class TestReadTrialProgress(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        manifest.init_workspace(self.tmpdir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def _write_stream(self, idx, name, records):
+        d = os.path.join(
+            self.tmpdir, manifest.WORKSPACE_DIR, "results", str(idx), "stream",
+        )
+        os.makedirs(os.path.dirname(os.path.join(d, name + ".jsonl")), exist_ok=True)
+        with open(os.path.join(d, name + ".jsonl"), "w") as f:
+            for step, value, ts in records:
+                f.write(json.dumps({"step": step, "value": value, "ts": ts}) + "\n")
+
+    def test_no_streams_returns_none(self):
+        self.assertEqual(read_trial_progress(self.tmpdir, 7), (None, None))
+
+    def test_current_step_and_rate(self):
+        # 10 steps over 60s → 6 of those intervals span 50 steps in 50s = 1/s.
+        recs = [(s, 0.5, float(s)) for s in range(0, 101, 10)]  # ts == step
+        self._write_stream(3, "val_loss", recs)
+        step, spm = read_trial_progress(self.tmpdir, 3)
+        self.assertEqual(step, 100)
+        # 100 steps over 100s (ts==step) → 60 steps/min.
+        self.assertAlmostEqual(spm, 60.0, places=3)
+
+    def test_picks_highest_step_across_metrics(self):
+        self._write_stream(3, "val_loss", [(0, 1.0, 0.0), (50, 0.5, 50.0)])
+        self._write_stream(3, "train/loss", [(0, 2.0, 0.0), (120, 0.2, 120.0)])
+        step, spm = read_trial_progress(self.tmpdir, 3)
+        self.assertEqual(step, 120)
+
+    def test_single_record_has_no_rate(self):
+        self._write_stream(3, "val_loss", [(42, 0.5, 100.0)])
+        step, spm = read_trial_progress(self.tmpdir, 3)
+        self.assertEqual(step, 42)
+        self.assertIsNone(spm)
+
+    def test_reads_only_tail_window(self):
+        # 5000 records; with window=10 we should still report the last step
+        # and a finite rate without reading everything into a list.
+        recs = [(s, 0.1, float(s)) for s in range(5000)]
+        self._write_stream(3, "val_loss", recs)
+        step, spm = read_trial_progress(self.tmpdir, 3, window=10)
+        self.assertEqual(step, 4999)
+        self.assertIsNotNone(spm)
 
 
 class TestLoadAllResults(unittest.TestCase):

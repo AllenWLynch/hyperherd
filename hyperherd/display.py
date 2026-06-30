@@ -121,8 +121,30 @@ def _trial_name(trial: dict) -> str:
     )
 
 
+def _fmt_step(step) -> str:
+    """Render a current-step value for the status table (blank if unknown)."""
+    return "" if step is None else f"{int(step):,}"
+
+
+def _fmt_rate(spm) -> str:
+    """Render a steps/min rate compactly (blank if unknown)."""
+    if spm is None:
+        return ""
+    if spm >= 100:
+        return f"{spm:,.0f}/m"
+    if spm >= 10:
+        return f"{spm:.0f}/m"
+    if spm >= 1:
+        return f"{spm:.1f}/m"
+    return f"{spm:.2f}/m"
+
+
 def print_status_table(
-    trials: List[dict], log_tails: Dict[int, str], *, brief: bool = False,
+    trials: List[dict],
+    log_tails: Dict[int, str],
+    *,
+    progress: Optional[Dict[int, tuple]] = None,
+    brief: bool = False,
 ) -> None:
     """Print a formatted status table of all trials.
 
@@ -130,6 +152,10 @@ def print_status_table(
     truncated unhelpfully). With ``brief=True``, sort by status (active first,
     like the dashboard) and hide READY/CANCELLED trials so the view focuses on
     what's in flight.
+
+    ``progress`` maps trial index → ``(current_step, steps_per_min)``. When any
+    trial has a step value, a ``Step`` (and, if any rate is known, ``Steps/min``)
+    column is inserted; otherwise the layout is unchanged.
     """
     if brief:
         trials = sorted(
@@ -141,6 +167,14 @@ def print_status_table(
         print("No trials found.")
         return
 
+    progress = progress or {}
+    step_strs = {t["index"]: _fmt_step(progress.get(t["index"], (None, None))[0])
+                 for t in trials}
+    rate_strs = {t["index"]: _fmt_rate(progress.get(t["index"], (None, None))[1])
+                 for t in trials}
+    show_step = any(step_strs.values())
+    show_rate = any(rate_strs.values())
+
     idx_width = max(len(str(t["index"])) for t in trials)
     idx_width = max(idx_width, 5)
 
@@ -151,12 +185,19 @@ def print_status_table(
     status_width = max(len(t.get("status", "")) for t in trials)
     status_width = max(status_width, 6)
 
+    step_width = max([len("Step")] + [len(s) for s in step_strs.values()]) if show_step else 0
+    rate_width = max([len("Steps/min")] + [len(s) for s in rate_strs.values()]) if show_rate else 0
+
     header = (
         f"{'Trial':>{idx_width}}  "
         f"{'Name':<{name_width}}  "
         f"{'Status':<{status_width}}  "
-        f"Last Log"
     )
+    if show_step:
+        header += f"{'Step':>{step_width}}  "
+    if show_rate:
+        header += f"{'Steps/min':>{rate_width}}  "
+    header += "Last Log"
     print(header)
     print("-" * len(header.expandtabs()))
 
@@ -174,12 +215,17 @@ def print_status_table(
 
         status_str = _colorize_status(f"{status:<{status_width}}", status)
 
-        print(
+        row = (
             f"{idx:>{idx_width}}  "
             f"{name:<{name_width}}  "
             f"{status_str}  "
-            f"{log_tail}"
         )
+        if show_step:
+            row += f"{step_strs[idx]:>{step_width}}  "
+        if show_rate:
+            row += f"{rate_strs[idx]:>{rate_width}}  "
+        row += log_tail
+        print(row)
 
 
 def print_summary(trials: List[dict]) -> None:

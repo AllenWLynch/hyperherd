@@ -379,6 +379,87 @@ def list_metric_streams(workspace: str, trial_id: int) -> list:
     return sorted(names)
 
 
+def _tail_jsonl(path: str, n: int) -> list:
+    """Read and parse the last ``n`` JSON lines of a file, cheaply.
+
+    Seeks from the end in blocks instead of reading the whole file, so this
+    stays fast even on long-running trials whose streams have tens of
+    thousands of records. Returns parsed dicts in file order (oldest of the
+    tail first); unparseable lines are skipped. Empty list if the file is
+    missing or unreadable.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            data = b""
+            block = 8192
+            # Read backwards until we have n+1 newlines (so the n-th line from
+            # the end is captured in full) or hit the start of the file.
+            while pos > 0 and data.count(b"\n") <= n:
+                read = min(block, pos)
+                pos -= read
+                f.seek(pos)
+                data = f.read(read) + data
+    except OSError:
+        return []
+    out = []
+    for line in data.splitlines()[-n:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def read_trial_progress(workspace: str, trial_id: int, *, window: int = 80) -> tuple:
+    """Cheaply estimate a trial's training progress from its metric streams.
+
+    Returns ``(current_step, steps_per_min)``:
+
+    - ``current_step`` — the highest last-logged step across the trial's
+      streams (``None`` if the trial has no stream data yet).
+    - ``steps_per_min`` — average rate over the tail ``window`` of records of
+      the stream that owns ``current_step``, using the per-record ``ts``
+      timestamps (``None`` if it can't be computed, e.g. a single record).
+
+    Only the tail of each stream file is read, so this is safe to call for
+    every trial in a status table.
+    """
+    names = list_metric_streams(workspace, trial_id)
+    if not names:
+        return (None, None)
+    stream_dir = os.path.join(
+        workspace, WORKSPACE_DIR, RESULTS_DIR, str(trial_id), "stream",
+    )
+    best_step = None
+    best_tail: list = []
+    for name in names:
+        tail = _tail_jsonl(os.path.join(stream_dir, f"{name}.jsonl"), window)
+        if not tail:
+            continue
+        step = tail[-1].get("step")
+        if step is None:
+            continue
+        if best_step is None or step > best_step:
+            best_step, best_tail = step, tail
+    if best_step is None:
+        return (None, None)
+
+    spm = None
+    first = next((r for r in best_tail if "step" in r and "ts" in r), None)
+    last = best_tail[-1]
+    if (
+        first is not None and "ts" in last
+        and last["ts"] > first["ts"] and last["step"] > first["step"]
+    ):
+        spm = (last["step"] - first["step"]) / (last["ts"] - first["ts"]) * 60.0
+    return (best_step, spm)
+
+
 def load_trial_results(workspace: str, trial_id: int) -> dict:
     """Load results for a specific trial. Returns empty dict if no results."""
     path = os.path.join(workspace, WORKSPACE_DIR, RESULTS_DIR, f"{trial_id}.json")

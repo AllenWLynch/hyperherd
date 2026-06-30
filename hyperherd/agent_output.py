@@ -103,11 +103,14 @@ def _trial_dict(trial: dict) -> Dict[str, Any]:
 def status_payload(
     trials: List[dict],
     log_tails: Optional[Dict[int, str]] = None,
+    progress: Optional[Dict[int, tuple]] = None,
 ) -> Dict[str, Any]:
     """`herd status --json`: totals + one entry per trial.
 
     The `last_log_line` field is what the human table shows in its rightmost
     column — convenient for an agent that wants to skim without `herd tail`.
+    `progress` maps index → `(current_step, steps_per_min)`; when present, each
+    trial gains `step` and `steps_per_min` fields (either may be null).
     """
     by_status: Dict[str, int] = {}
     for t in trials:
@@ -120,6 +123,10 @@ def status_payload(
         if log_tails is not None:
             tail = log_tails.get(t["index"], "")
             d["last_log_line"] = tail or None
+        if progress is not None:
+            step, spm = progress.get(t["index"], (None, None))
+            d["step"] = step
+            d["steps_per_min"] = round(spm, 2) if spm is not None else None
         out_trials.append(d)
 
     return {
