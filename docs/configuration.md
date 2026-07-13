@@ -214,6 +214,10 @@ successive_halving:
   budget: 50            # total/max steps a trial trains to
   eta: 2                # reduction factor (default 2 → keep the better half each rung)
   mode: sync            # scheduler: "sync" (default) or "asha" — see below
+
+  # Optional — pick at most ONE. See "Bracketing" below.
+  bracket_by: [optimizer]   # only compare trials with the same optimizer
+  # hyperband: {seed: 0}    # random bracketing; a subset never gets pruned
 ```
 
 | Field | Type | Required | Default | Description |
@@ -222,8 +226,10 @@ successive_halving:
 | `direction` | `min` \| `max` | **yes** | — | Whether lower or higher is better. |
 | `min_steps` | int ≥ 1 | **yes** | — | First rung — the earliest step at which a trial can be pruned. |
 | `budget` | int ≥ 1 | **yes** | — | Total/maximum steps a trial runs to. Must be ≥ `min_steps`. |
-| `eta` | int ≥ 2 | no | `2` | Reduction factor. Rungs are spaced by powers of `eta`; `eta=2` keeps the better half at each rung. |
+| `eta` | int ≥ 2 | no | `2` | Reduction factor. Sets **both** the rung spacing (rungs are powers of `eta`) and the survival rate — each rung keeps the top `1/eta` of the cohort. |
 | `mode` | `sync` \| `asha` | no | `sync` | Scheduler — how the cut is made at each rung (see below). |
+| `bracket_by` | list of param names | no | — | Only compare trials that share these parameters' values. Mutually exclusive with `hyperband`. |
+| `hyperband` | `{seed: int}` | no | — | Random bracketing; a randomly-chosen subset of trials is never pruned. Mutually exclusive with `bracket_by`. |
 
 **Scheduler (`mode`).** Both keep the top `1/eta` at each rung; they differ in how they handle a partially-arrived field:
 
@@ -235,6 +241,58 @@ Rungs are `min_steps × eta^k` for each value `≤ budget` — e.g. `min_steps: 
 The **step units are whatever the trainer logs the metric with.** If you log once per epoch (`log_result("val_loss", v, step=epoch)`), express `min_steps`/`budget` in epochs; if per global training step, use those. Log on a consistent cadence across trials so the field is compared fairly — epoch-aligned logging is the simplest. See the [MNIST example](example.md) for an epoch-aligned setup.
 
 `herd sh` is stateless — run it on a loop, or let the autonomous monitor's `run_sh` tool call it. See [`herd sh`](commands.md#herd-sh) and the [monitor docs](monitor.md#successive-halving) for details.
+
+### Bracketing
+
+By default every trial competes against every other. That's only fair when trials share **training dynamics**. Some hyperparameters change the *shape* of the loss curve rather than just its quality — parameter count, regularization strength, optimizer — and they bias the cut: a large model that is merely slow to warm up gets pruned by a small one that converges fast and plateaus early, before it ever had a chance to win.
+
+A **bracket** is a set of trials that only compete with each other, plus the rung ladder they're judged on. Two ways to define them; set at most one.
+
+#### `bracket_by` — explicit
+
+```yaml
+successive_halving:
+  # ...
+  bracket_by: [optimizer, hidden_dim]
+```
+
+The bracket key is the tuple of those parameters' values, so an `adam`/`256` trial is only ever ranked against other `adam`/`256` trials. Every bracket shares the same rung ladder. Use this when you *know* which parameters are incomparable.
+
+**Bracket on coarse-grained parameters.** Bracketing on a continuous parameter (or too many parameters at once) typically leaves every trial alone in its own bracket, and a bracket of one can never prune anyone — successive halving silently becomes a no-op. `herd sh` warns when that has happened:
+
+```
+Warning: bracket_by ['lr'] produced 24 bracket(s) with cohort sizes {1: 24}; none of
+them can prune (sync needs >= 2 trials per bracket). Successive halving is a no-op.
+Bracket on a coarser-grained parameter, or drop bracketing.
+```
+
+#### `hyperband` — random
+
+```yaml
+successive_halving:
+  # ...
+  hyperband: {seed: 0}
+```
+
+The hedge for when you *don't* know which parameters change the dynamics ([Li et al. 2018](https://arxiv.org/abs/1603.06560)). Trials are assigned to brackets `s` by a seeded hash of their index. Bracket `s` judges on the **top `s+1` rungs** of the ladder — so with rungs `[10, 20, 40, 80]`:
+
+| Bracket | Rungs | Behavior |
+|---|---|---|
+| `s=3` | `10, 20, 40, 80` | Most aggressive — cuts from the earliest rung |
+| `s=2` | `20, 40, 80` | |
+| `s=1` | `40, 80` | Only judged near the budget |
+| `s=0` | *none* | **Never pruned.** Always runs to `budget`. |
+
+Bracket `s=0` is the hedge: a small, randomly-chosen subset of trials always runs to completion regardless of how bad it looks early. If early-epoch loss turns out to be a poor predictor of final loss for your sweep, those trials survive to prove it. Bracket sizes follow Hyperband's `n_s` — most trials land in the aggressive brackets, a minority in the hedge.
+
+Assignment depends only on a trial's **index**, so growing the sweep (editing the config to add trials) never moves existing trials between brackets. Changing `min_steps`, `budget`, or `eta` *does* re-partition them, since those change the ladder the brackets are cut from.
+
+To see what bracketing is buying you, compare against flat successive halving without editing the YAML:
+
+```bash
+herd sh --dry-run --reason              # bracketed
+herd sh --dry-run --reason --no-brackets   # what flat SH would have done
+```
 
 ## Complete example
 

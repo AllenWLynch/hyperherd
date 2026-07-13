@@ -31,6 +31,19 @@ successive_halving:
   budget: 50            # trains to at most 50 epochs (matches max_epochs)
   eta: 2                # keep the better half at each rung
 
+  # Bracketing: sgd converges much more slowly than adam early on, so an
+  # unbracketed cut at epoch 5 would prune every sgd trial before any of them
+  # had a chance — not because sgd is worse, but because it's slower to start.
+  # `bracket_by` makes trials compete only against others with the same
+  # optimizer, so each optimizer keeps its own best. Drop this to see the bias:
+  #   herd sh --dry-run --reason --no-brackets
+  bracket_by: [optimizer]
+
+  # The alternative, when you can't name the culprit parameter: random
+  # bracketing. A randomly-chosen subset of trials is never pruned and always
+  # runs to `budget`, hedging against early loss being a bad predictor.
+  # hyperband: {seed: 0}
+
 # Optional: enable the autonomous monitor's Discord channel. Walk through
 # docs/discord-setup.md once to mint a bot, then put your server's ID here.
 # Without this block, `herd monitor` still runs (failure triage, resubmits,

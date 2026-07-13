@@ -171,11 +171,11 @@ Auto-bumps are capped at one per failure class per sweep. If a 50% mem bump stil
 If the sweep configures a [`successive_halving:`](configuration.md#successive-halving-pruning) block, the monitor's metric-based stopping is handled by the deterministic SH algorithm instead of the agent's judgment-based pruning. On each scheduled tick while trials are running, the agent calls its `run_sh` tool (which runs [`herd sh`](commands.md#herd-sh)) and reports what changed:
 
 ```
-🐕 SH @ rung 10: pruned idx 3, 7 (bottom half); paused idx 5 until the field
+🐕 SH @ rung 10: pruned idx 3, 7 (below the cut); paused idx 5 until the field
 catches up. Totals — 4 running, 2 paused, 4 completed, 2 pruned. Next tick in 30 min.
 ```
 
-`paused` is intentional and resumable — not a failure. A paused trial may be resumed automatically by a later `run_sh` once enough peers reach its rung, or you can resume it yourself with `herd run -i <index>`. The agent won't *also* judgment-prune on metrics when SH is configured (that would double up); it reserves `/prune` for things SH doesn't cover, like an immediate NaN explosion.
+`paused` is intentional and resumable — not a failure. A paused trial may be resumed automatically by a later `run_sh` once enough peers reach its rung, or you can resume it yourself with `herd run <index>`. The agent won't *also* judgment-prune on metrics when SH is configured (that would double up); it reserves `/prune` for things SH doesn't cover, like an immediate NaN explosion.
 
 You can drive SH by hand too — `herd sh --dry-run` previews the decisions, `herd sh` applies them — independent of whether the daemon is running.
 

@@ -234,21 +234,28 @@ async def bump_time(args: Dict[str, Any]) -> Dict[str, Any]:
     "run_indices",
     "Submit (or resubmit with force=true) the given trial indices. Returns "
     "{slurm_job_id, submitted_indices}. Use force=true after a YAML bump to "
-    "re-run failed trials.",
-    {"indices": list, "force": bool},
+    "re-run failed trials. `overrides` is an optional {key: value} map of extra "
+    "launcher overrides to PERSIST on these trials (e.g. {'batch_size': '16'} "
+    "to retry an OOM at a smaller batch); they win over the sweep's own params "
+    "and stick across later resubmits. An override on a *swept* parameter also "
+    "renames the trial, so it writes to a fresh output dir instead of "
+    "overwriting the original run.",
+    {"indices": list, "force": bool, "overrides": dict},
 )
 async def run_indices(args: Dict[str, Any]) -> Dict[str, Any]:
     indices = args.get("indices") or []
     force = bool(args.get("force", False))
+    overrides = args.get("overrides") or {}
     if not indices:
         return _text_response({"slurm_job_id": None, "submitted_indices": []})
     spec = ",".join(str(int(i)) for i in sorted(indices))
-    cmd = ["herd", "run", "--json", "-i", spec, str(_CTX["workspace"])]
+    cmd = ["herd", "run", "--json", str(_CTX["workspace"]), spec]
+    cmd.extend(f"{k}={v}" for k, v in overrides.items())
     if force:
         cmd.append("--force")
     return _text_response(await _run_herd_json(
         cmd, audit_event="run_indices",
-        audit_fields={"indices": indices, "force": force},
+        audit_fields={"indices": indices, "force": force, "overrides": overrides},
     ))
 
 
@@ -325,22 +332,33 @@ async def prune_index(args: Dict[str, Any]) -> Dict[str, Any]:
     "Run one round of successive-halving pruning (shells `herd sh --json`). "
     "Only meaningful when the sweep configured a `successive_halving:` block "
     "in hyperherd.yaml — check `state.sh` first. In one deterministic call it "
-    "reads each trial's logged metric stream, PRUNES provably-bottom-half "
-    "trials (terminal), PAUSES undecidable ones (status `paused` — resumable, "
-    "NOT a failure), and RESUMES paused trials that become provably top-half. "
+    "reads each trial's logged metric stream, PRUNES trials provably below the "
+    "cut (terminal), PAUSES undecidable ones (status `paused` — resumable, "
+    "NOT a failure), and RESUMES paused trials that become provably above it. "
     "It never launches never-submitted (`ready`) trials — starting trials is "
     "your job (`run_sweep`/`herd run`), not SH's. Idempotent: "
     "calling it when nothing is decidable is a cheap no-op. The scheduler is set "
     "in config (`successive_halving.mode`): `sync` pauses undecidable trials "
     "until the field arrives; `asha` ranks only arrived trials and never pauses "
     "(so `paused` is always empty under asha). Pass dry_run=true to preview "
-    "decisions without applying them. Returns {dry_run, mode, rungs, "
-    "slurm_job_id, submitted, pruned, paused, decisions:[{index, action, "
-    "verdict, rung, reason, explanation, standing}]}. Each decision's "
-    "`explanation` is a plain-language 'why' and `standing` is the cohort "
-    "arithmetic behind it (rung, step, value, cohort_size, keep, "
-    "ahead_definite, unreached) — use these to tell a user why a trial was "
-    "paused/pruned/kept (null for trials not yet at a rung).",
+    "decisions without applying them. Returns {dry_run, mode, rungs, bracketing, "
+    "brackets, warnings, slurm_job_id, submitted, pruned, paused, "
+    "decisions:[{index, action, verdict, rung, bracket, reason, explanation, "
+    "standing}]}. Each decision's `explanation` is a plain-language 'why' and "
+    "`standing` is the cohort arithmetic behind it (rung, step, value, "
+    "cohort_size, keep, ahead_definite, unreached) — use these to tell a user "
+    "why a trial was paused/pruned/kept (null for trials not yet at a rung). "
+    "BRACKETING: when the sweep sets `successive_halving.bracket_by` or "
+    "`hyperband`, trials only compete WITHIN their bracket, and each bracket has "
+    "its own rung ladder (`brackets:[{key,label,rungs,indices,cohort_size}]`). "
+    "Two consequences you must respect when explaining decisions: (1) rung "
+    "INDICES are bracket-relative — never compare `rung` or `standing.rung` "
+    "across brackets; `standing.step` is the absolute training step and is the "
+    "only cross-bracket-comparable figure. (2) A hyperband bracket with empty "
+    "`rungs` (`s=0`) is the deliberate unpruned hedge: its trials always run to "
+    "budget, and that is correct, not a bug. `warnings` is non-empty when "
+    "bracketing sliced the field so finely that nothing can ever be pruned — "
+    "surface it to the user, it means their config is a no-op.",
     {"dry_run": bool},
 )
 async def run_sh(args: Dict[str, Any]) -> Dict[str, Any]:

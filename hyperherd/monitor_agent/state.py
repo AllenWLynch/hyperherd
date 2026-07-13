@@ -211,7 +211,7 @@ def _read_sh_config(workspace: Path) -> Optional[Dict[str, Any]]:
         sh = load_config(str(workspace)).successive_halving
         if sh is None:
             return None
-        return {
+        out = {
             "metric": sh.metric,
             "direction": sh.direction,
             "min_steps": sh.min_steps,
@@ -220,6 +220,14 @@ def _read_sh_config(workspace: Path) -> Optional[Dict[str, Any]]:
             "mode": sh.mode,
             "rungs": rung_schedule(sh.min_steps, sh.budget, sh.eta),
         }
+        # Just the config echo — bracket *membership* needs the manifest and
+        # would duplicate the planner. The agent gets the real partition (and
+        # any degenerate-bracket warnings) back from `run_sh`.
+        if sh.bracket_by:
+            out["bracketing"] = {"kind": "params", "keys": list(sh.bracket_by)}
+        elif sh.hyperband is not None:
+            out["bracketing"] = {"kind": "hyperband", "seed": sh.hyperband.seed}
+        return out
     except Exception:
         return None
 

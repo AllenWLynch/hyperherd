@@ -139,14 +139,14 @@ def _format_status(snap: dict, only_active: bool = False) -> str:
 # --- /stop ----------------------------------------------------------------
 
 def cmd_stop(workspace: Path, index: int) -> str:
-    """Cancel a single trial. Backed by `herd stop -i <index>`."""
+    """Cancel a single trial. Backed by `herd stop <workspace> <index>`."""
     try:
         proc = subprocess.run(
-            _RUNNABLE + ["stop", "-i", str(index), str(workspace)],
+            _RUNNABLE + ["stop", str(workspace), str(index)],
             capture_output=True, text=True, check=True,
         )
     except subprocess.CalledProcessError as e:
-        return f"`herd stop -i {index}` failed: {_strip_ansi(e.stderr or e.stdout)}"
+        return f"`herd stop {index}` failed: {_strip_ansi(e.stderr or e.stdout)}"
     out = _strip_ansi(proc.stdout or "").strip() or "(no output)"
     return f"Stopped trial {index}.\n{out}"
 
@@ -287,7 +287,7 @@ def cmd_prune(workspace: Path, index: int, reason: str = "user-pruned via /prune
     (resumable) — pruned trials are NOT resubmitted by future `herd run`
     calls."""
     proc = subprocess.run(
-        _RUNNABLE + ["stop", "-i", str(index), str(workspace)],
+        _RUNNABLE + ["stop", str(workspace), str(index)],
         capture_output=True, text=True,
     )
     # Don't fail if stop returned nonzero — the trial might already
@@ -316,7 +316,7 @@ def cmd_pause(workspace: Path, index: int) -> str:
     `log_result(step=...)` call (checkpointing first if it checkpoints) —
     no scancel. Distinct from `/stop` (cancel) and `/prune` (terminal):
     a paused trial is resumable, by `herd sh` (if it's later judged
-    top-half) or `herd run -i <index>`."""
+    above the cut) or `herd run <index>`."""
     try:
         from hyperherd import manifest
         from hyperherd.logging import write_prune_signal
@@ -335,7 +335,7 @@ def cmd_pause(workspace: Path, index: int) -> str:
         return f"Couldn't pause trial {index}: {e}"
     return (
         f"Paused trial {index} (was {status}). It stops at its next logged "
-        f"step and is resumable (`herd sh`, or `herd run -i {index}`)."
+        f"step and is resumable (`herd sh`, or `herd run {index}`)."
     )
 
 
@@ -388,6 +388,8 @@ def _format_sh(result: dict) -> str:
     paused = result.get("paused") or []
     job_id = result.get("slurm_job_id")
     decisions = result.get("decisions") or []
+    brackets = result.get("brackets") or []
+    warnings = result.get("warnings") or []
 
     verb = "Would" if dry else "Did"
     head = "Successive halving" + (" (dry run)" if dry else "")
@@ -401,8 +403,20 @@ def _format_sh(result: dict) -> str:
     summary = f"{verb}: {', '.join(parts)}." if parts else "no trials need action right now."
 
     lines = [f"{head} — {summary}"]
+    for w in warnings:
+        lines.append(f"⚠️ {w}")
     if rungs:
         lines.append(f"Rungs (steps): {', '.join(str(r) for r in rungs)}")
+
+    # Only worth listing when the field is actually partitioned.
+    if len(brackets) > 1:
+        lines.append("")
+        for b in brackets:
+            ladder = (", ".join(str(r) for r in (b.get("rungs") or []))
+                      or "no decision rungs — runs to budget")
+            lines.append(
+                f"  [{b.get('label', b.get('key'))}]  "
+                f"{b.get('cohort_size', 0)} competing — rungs: {ladder}")
 
     # One line per trial the algorithm actually moved (SUBMIT/PRUNE/PAUSE).
     acted = [d for d in decisions if (d.get("action") or "none") != "none"]
@@ -412,7 +426,8 @@ def _format_sh(result: dict) -> str:
         for d in sorted(acted, key=lambda x: x.get("index", 0)):
             idx_col = f"#{d.get('index', '?')}".ljust(idx_w)
             action = (d.get("action") or "?").upper().ljust(7)
-            lines.append(f"  {idx_col}  {action}  {d.get('reason', '')}")
+            bkt = f"[{d['bracket']}] " if d.get("bracket") else ""
+            lines.append(f"  {idx_col}  {action}  {bkt}{d.get('reason', '')}")
 
     if job_id and not dry:
         lines.append("")
@@ -423,13 +438,13 @@ def _format_sh(result: dict) -> str:
 # --- /run -----------------------------------------------------------------
 
 def cmd_run(workspace: Path, index: int) -> str:
-    """Submit one trial. Backed by `herd run -i <index>`."""
+    """Submit one trial. Backed by `herd run <workspace> <index>`."""
     proc = subprocess.run(
-        _RUNNABLE + ["run", "-i", str(index), str(workspace)],
+        _RUNNABLE + ["run", str(workspace), str(index)],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        return f"`herd run -i {index}` failed: {_strip_ansi(proc.stderr or proc.stdout)}"
+        return f"`herd run {index}` failed: {_strip_ansi(proc.stderr or proc.stdout)}"
     out = _strip_ansi(proc.stdout or "").strip() or "(no output)"
     return f"Submitted trial {index}.\n{out}"
 

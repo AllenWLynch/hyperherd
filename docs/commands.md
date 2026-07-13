@@ -41,22 +41,64 @@ The templates have placeholder SLURM resource fields (`partition`, `time`, `mem`
 Submit (or resubmit) the sweep.
 
 ```bash
-herd run [WORKSPACE] [flags]
+herd run [WORKSPACE] [INDICES] [KEY=VALUE ...] [flags]
 ```
 
 Generates the trial manifest, runs preflight checks, writes the sbatch script to `.hyperherd/job.sbatch`, submits it, and records the SLURM job ID.
 
 `herd run` is idempotent: it only submits trials whose status is `ready`, `failed`, or `cancelled`. Trials that are `submitted`, `queued`, `running`, or `completed` are skipped unless you opt in with `--force`.
 
+**Positionals are classified by shape, in any order:**
+
+| Token | Read as | Example |
+|---|---|---|
+| a path | the workspace | `herd run ./my_sweep` |
+| a SLURM-style index spec | the trials to submit | `herd run 1-4,7` |
+| `KEY=VALUE` | a per-trial override | `herd run 1-4 batch_size=32` |
+
+```bash
+herd run                          # submit every pending trial in the current dir
+herd run 1-4                      # submit just trials 1-4
+herd run 3 batch_size=32          # re-run trial 3 with an override
+herd run ws 1-4,7 lr=1e-3 ckpt=/scratch/last.ckpt
+```
+
+A directory literally named `3` is read as a trial index; write `./3` for the directory.
+
 | Flag | Description |
 |------|-------------|
 | `-n, --dry-run` | Print the submission plan (sbatch script + pending indices); don't submit. Use [`herd ls`](#herd-ls) for the full trial list. |
 | `-j, --max-concurrent N` | Cap concurrent running tasks (overrides `slurm.max_concurrent`) |
-| `-i, --indices SPEC` | Submit only these trial indices, e.g. `0-3,5,7-9` |
-| `-p, --pin NAME=VALUE [NAME=VALUE ...]` | Submit only trials whose swept params match every pin (e.g. `--pin batch_size=32 optimizer=adam`). Names must be sweep parameters; values are coerced to int/float/str. |
-| `-f, --force` | With `--indices`, allow resubmitting running/completed trials. Without, allow config edits that drop running/completed trials (kept as orphans). |
+| `--where NAME=VALUE` | Submit only trials whose swept params match. Repeatable: `--where optimizer=adam --where batch_size=32`. Names must be sweep parameters; values are coerced to int/float/str. |
+| `--clear-overrides` | Drop stored per-trial overrides on the selected trials |
+| `-a, --all` | Required to apply an override to the *whole* sweep (see below) |
+| `-f, --force` | With an index selection, allow resubmitting running/completed trials. Without one, allow config edits that drop running/completed trials (kept as orphans). |
 
-**Editing the config mid-sweep is supported.** If you edit `hyperherd.yaml` between runs, `herd run` reconciles the new manifest against the old one: new trials are appended, removed trials are dropped (or kept as orphans with `-f` if they were already running/completed). See [Re-running and reconciliation](workspace.md#re-running-and-reconciliation) for the rules.
+`-i, --indices SPEC` and `-p, --pin` still work but are deprecated — indices are positional now, and `--pin` was renamed `--where` because a bare `KEY=VALUE` means *override*, which made `-p key=value` for a *filter* too easy to confuse.
+
+### Per-trial overrides
+
+A bare `KEY=VALUE` positional sets an override that is **stored on the trial** and applied to every future submission of it — it survives resubmits, successive-halving pause/resume, and the monitor agent's retries. Overrides are emitted last in the launcher's override string, so they win over the sweep's own params, `static_overrides`, and constraint `set:` extras.
+
+```bash
+herd run 1-4 batch_size=32      # store + submit
+herd ls                         # shows a "# cli override:" block on those trials
+herd run 1-4 --clear-overrides  # drop them
+```
+
+**Overrides need a target.** A bare `herd run batch_size=32` would silently rewrite every trial in the sweep, so it's refused — narrow with an index spec, a `--where` filter, or pass `--all` to mean it.
+
+**Re-running a completed trial works.** `herd run 3 batch_size=32` on a `completed` trial is unambiguous re-run intent, so it doesn't need `--force`.
+
+If the override shadows a **swept** parameter, the trial's name gains a suffix (`lr-0.01_bs-64` → `lr-0.01_bs-64_ov_bs-32`) and it writes to a *new* output directory, so the original result is preserved. The suffix is appended rather than substituted so that the name stays unique: overriding trial 3 to `batch_size=32` when some *other* trial already sweeps `batch_size=32` would otherwise land both trials on the same output directory.
+
+An override on a non-swept key (`ckpt=`, `debug=`) leaves the name alone — a deliberate in-place re-run, which is what a checkpoint resume wants, but it overwrites the previous results and `herd run` warns you.
+
+Resubmitting a `running`/`queued` trial still requires `--force` (a second array task would race the first).
+
+**Overrides change what a trial *is*, for everything that reads it.** `herd res` attributes the trial's metrics to the overridden value, `--where batch_size=32` selects it, and [`bracket_by`](configuration.md#bracketing) puts it in the bracket it actually trained in — not the one its original params name.
+
+**Editing the config mid-sweep is supported.** If you edit `hyperherd.yaml` between runs, `herd run` reconciles the new manifest against the old one: new trials are appended, removed trials are dropped (or kept as orphans with `-f` if they were already running/completed). Overrides survive reconciliation — they aren't part of a trial's identity hash. See [Re-running and reconciliation](workspace.md#re-running-and-reconciliation) for the rules.
 
 **Example output** — successful submission
 
@@ -66,7 +108,7 @@ Generates the trial manifest, runs preflight checks, writes the sbatch script to
 
 --8<-- "_outputs/dry-run.html"
 
-**Agent mode** — `herd run --dry-run --json` emits the submission plan (the indices + sbatch script that would actually be submitted right now, given current status / `--pin` / `--indices`). For the full sweep enumeration regardless of status, use `herd ls` (or its JSON variant when added). The intended workflow for an agent is to inspect the trials, then call `herd run --json` to submit.
+**Agent mode** — `herd run --dry-run --json` emits the submission plan (the indices + sbatch script that would actually be submitted right now, given current status / `--where` / the index selection). For the full sweep enumeration regardless of status, use `herd ls` (or its JSON variant when added). The intended workflow for an agent is to inspect the trials, then call `herd run --json` to submit.
 
 ```json
 {
@@ -91,14 +133,18 @@ A real (non-dry-run) `herd run --json` returns the same shape with `dry_run: fal
 List every trial in the sweep with its swept parameters.
 
 ```bash
-herd ls [WORKSPACE] [-p NAME=VALUE ...]
+herd ls [WORKSPACE] [--where NAME=VALUE ...]
 ```
 
 Status-agnostic — shows the *shape* of the sweep, not what `herd run` would do next. Reads the manifest if present; otherwise materializes the combinations from `hyperherd.yaml` so you can `herd ls` BEFORE the first `herd run` to sanity-check the YAML.
 
+Trials carrying [per-trial overrides](#per-trial-overrides) show them in a `# cli override:` block.
+
 | Flag | Description |
 |------|-------------|
-| `-p, --pin NAME=VALUE [NAME=VALUE ...]` | Filter to trials whose swept params match every pin (e.g. `--pin batch_size=32 optimizer=adam`). |
+| `--where NAME=VALUE` | Filter to trials whose swept params match. Repeatable: `--where optimizer=adam --where batch_size=32`. |
+
+`-p, --pin` still works but is deprecated; use `--where`.
 
 Use `herd status` for the SLURM-synced status table (this command does not touch SLURM); use `herd run --dry-run` for a submission preview.
 
@@ -239,16 +285,18 @@ For safety, `herd test` refuses any index that has previously been submitted to 
 
 ## `herd stop`
 
-Cancel a running/queued trial.
+Cancel running/queued trials.
 
 ```bash
-herd stop [WORKSPACE] INDEX
+herd stop [WORKSPACE] INDICES
 herd stop [WORKSPACE] --all
 ```
 
-Calls `scancel <jobid>_<index>` and updates the manifest to `cancelled`. Pass either an `INDEX` or `--all`, not both. With `--all`, every trial whose status is in (`submitted`, `queued`, `running`) is cancelled.
+Calls `scancel <jobid>_<index>` and updates the manifest to `cancelled`. `INDICES` is a SLURM-style spec, so `herd stop 3`, `herd stop 1-4`, and `herd stop 1-4,7` all work. Pass either indices or `--all`, not both. With `--all`, every trial whose status is in (`submitted`, `queued`, `running`) is cancelled.
 
-**Agent mode** — `herd stop --json` returns one record per cancelled trial (empty list if there was nothing live):
+Naming exactly one trial that isn't running/queued is an error. Across a **range**, trials that aren't live are skipped rather than failing the call — `herd stop 1-8` when trial 3 already completed cancels the rest and reports 3 as skipped.
+
+**Agent mode** — `herd stop --json` returns one record per cancelled trial (empty list if there was nothing live), plus a `skipped` list of range members that weren't live:
 
 ```json
 {
@@ -267,7 +315,9 @@ Run one round of **successive-halving** pruning. Reads each trial's logged metri
 herd sh [WORKSPACE] [flags]
 ```
 
-Requires a [`successive_halving:`](configuration.md#successive-halving-pruning) block in `hyperherd.yaml` (or pass the equivalent flags). At geometrically-spaced step *rungs* (`min_steps`, `min_steps×eta`, … ≤ `budget`), it keeps the better half of the surviving cohort and prunes the worse half; a trial whose standing can't yet be decided (not enough of the field has reached the rung) is **paused** until it can. It acts as soon as a trial's rank is certain — it doesn't wait for every trial to reach a rung.
+Requires a [`successive_halving:`](configuration.md#successive-halving-pruning) block in `hyperherd.yaml` (or pass the equivalent flags). At geometrically-spaced step *rungs* (`min_steps`, `min_steps×eta`, … ≤ `budget`), it keeps the top `1/eta` of the surviving cohort and prunes the rest; a trial whose standing can't yet be decided (not enough of the field has reached the rung) is **paused** until it can. It acts as soon as a trial's rank is certain — it doesn't wait for every trial to reach a rung.
+
+When the sweep configures [bracketing](configuration.md#bracketing), trials are only ranked against others in the same bracket, and each bracket has its own rung ladder.
 
 `herd sh` is **stateless and idempotent**: each call recomputes every trial's standing from its metric stream, so it's safe to run on a loop (cron, or the autonomous monitor's `run_sh` tool).
 
@@ -279,27 +329,48 @@ Requires a [`successive_halving:`](configuration.md#successive-halving-pruning) 
 | `--min-steps N` | First rung step (overrides config) |
 | `--budget N` | Total step budget (overrides config) |
 | `--eta N` | Reduction factor, ≥2 (overrides config; default 2) |
+| `--mode {sync,asha}` | Scheduler (overrides config; default `sync`) |
+| `-r, --reason` | Explain the cohort arithmetic behind every decision. Grouped by bracket when bracketing is on. |
+| `--no-brackets` | Ignore the config's `bracket_by`/`hyperband` and compare every trial against every other — pair with `--dry-run --reason` to see what bracketing is buying you |
 | `-j, --max-concurrent N` | Cap concurrent running array tasks on (re)submission |
 
-**Pruning is cooperative.** `herd sh` doesn't `scancel`; it writes a per-trial signal and stamps the manifest. A running trial honors the signal at its next `log_result(..., step=...)` call by raising `hyperherd.TrialPruned`, so it can checkpoint and exit cleanly. Pruned trials become `pruned` (terminal, not resubmitted); paused trials become `paused` (resumable — `herd sh` may resume one automatically once enough peers reach its rung, or you can `herd run -i <index>`).
+**Pruning is cooperative.** `herd sh` doesn't `scancel`; it writes a per-trial signal and stamps the manifest. A running trial honors the signal at its next `log_result(..., step=...)` call by raising `hyperherd.TrialPruned`, so it can checkpoint and exit cleanly. Pruned trials become `pruned` (terminal, not resubmitted); paused trials become `paused` (resumable — `herd sh` may resume one automatically once enough peers reach its rung, or you can `herd run <index>`).
 
 **Agent mode** — `herd sh --json`:
 
 ```json
 {
   "dry_run": false,
+  "mode": "sync",
   "rungs": [5, 10, 20, 40],
+  "bracketing": {"kind": "hyperband", "seed": 0},
+  "brackets": [
+    {"key": "s=0", "label": "s=0 (hedge, never pruned)", "rungs": [],
+     "indices": [1, 4], "cohort_size": 2},
+    {"key": "s=2", "label": "s=2", "rungs": [5, 10, 20, 40],
+     "indices": [0, 2, 3, 5], "cohort_size": 4}
+  ],
+  "warnings": [],
   "slurm_job_id": null,
   "submitted": [],
   "pruned": [2, 3],
   "paused": [5],
   "decisions": [
-    {"index": 0, "action": "none", "verdict": "promote", "rung": 0, "reason": "top-half at rung 0 (step 5)"},
-    {"index": 2, "action": "prune", "verdict": "prune", "rung": 0, "reason": "bottom-half at rung 0 (step 5)"},
-    {"index": 5, "action": "pause", "verdict": "pause", "rung": 0, "reason": "undecidable at rung 0 (step 5) — pausing until field catches up"}
+    {"index": 0, "action": "none", "verdict": "promote", "rung": 0, "bracket": "s=2",
+     "reason": "above the cut at rung 0 (step 5)"},
+    {"index": 2, "action": "prune", "verdict": "prune", "rung": 0, "bracket": "s=2",
+     "reason": "below the cut at rung 0 (step 5)"},
+    {"index": 5, "action": "pause", "verdict": "pause", "rung": 0, "bracket": "s=2",
+     "reason": "undecidable at rung 0 (step 5) — pausing until field catches up"}
   ]
 }
 ```
+
+`rungs` is the **global** ladder and stays flat whether or not bracketing is on; each bracket's ladder is a suffix of it. `bracketing` is `null` when not bracketing, and `brackets` is then a single `"all"` entry.
+
+Rung **indices** are bracket-relative — under `hyperband`, rung 0 of one bracket is a different step than rung 0 of another. Compare `standing.step` (the absolute training step), never `rung`, across brackets. A bracket with empty `rungs` is the deliberate hyperband hedge: its trials always run to budget.
+
+`warnings` is non-empty when bracketing sliced the field so finely that nothing can ever be pruned.
 
 ## `herd snapshot`
 

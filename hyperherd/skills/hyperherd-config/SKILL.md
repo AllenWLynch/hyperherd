@@ -193,8 +193,31 @@ successive_halving:
 | `direction` | yes | `min` or `max`. |
 | `min_steps` | yes | First rung. Rungs are `min_steps × eta^k ≤ budget` (e.g. `5,50,2` → `[5,10,20,40]`). |
 | `budget` | yes | Max steps; must be `>= min_steps`. Usually matches the trainer's epoch/step cap (e.g. a `max_epochs` static override). |
-| `eta` | no (default 2) | Integer `>= 2`. |
+| `eta` | no (default 2) | Integer `>= 2`. Sets **both** the rung spacing and the survival rate — each rung keeps the top `1/eta` of the cohort. |
 | `mode` | no (default `sync`) | `sync`: conservative bracket — pauses undecidable trials until enough of the field arrives (never an early-stop mistake, but stalls on uneven launches). `asha`: asynchronous halving — ranks only the trials that have arrived at each rung and never waits (suits fields launched/relaunched over time). Suggest `asha` when the user starts trials in waves or lets the monitor relaunch them. |
+| `bracket_by` | no | List of sweep parameter names. Trials only compete with trials sharing those values. Mutually exclusive with `hyperband`. See below. |
+| `hyperband` | no | `{seed: 0}`. Random bracketing; a randomly-chosen subset is never pruned. Mutually exclusive with `bracket_by`. See below. |
+
+### Bracketing — when trials aren't comparable
+
+Plain SH compares every trial against every other. That's only fair when trials share **training dynamics**. Parameters that change the *shape* of the loss curve rather than just its quality — model size / parameter count, regularization strength, optimizer, schedule — bias the cut: a big model that's merely slow to warm up gets pruned by a small one that converges fast and plateaus early.
+
+**Ask yourself this whenever you add a `successive_halving:` block to a sweep that varies model capacity or regularization.** If any swept parameter plausibly changes the *rate* of convergence rather than just the final quality, propose bracketing.
+
+```yaml
+successive_halving:
+  metric: val_loss
+  direction: min
+  min_steps: 5
+  budget: 50
+  eta: 2
+  bracket_by: [optimizer, hidden_dim]   # only compare like with like
+```
+
+- **`bracket_by: [names]`** — the bracket key is the tuple of those parameters' values. Use it when you *know* which parameters are incomparable. **Bracket on coarse-grained (discrete, few-valued) parameters only.** Bracketing on a continuous parameter puts every trial in its own bracket, and a bracket of one can never prune anyone — SH silently becomes a no-op. `herd sh` warns when this happens, but don't author it in the first place.
+- **`hyperband: {seed: 0}`** — the hedge for when you *don't* know which parameters matter. Trials are randomly assigned to brackets; the most aggressive prunes from the earliest rung, and one bracket (`s=0`) is **never pruned at all** — those trials always run to `budget`. If early-epoch loss turns out to be a bad predictor of final loss for this sweep, those survivors prove it.
+
+Prefer `bracket_by` when the user can name the culprit parameter; suggest `hyperband` when they can't, or when they explicitly want insurance against over-eager pruning. Never set both — it's a validation error.
 
 **Critical: step units must be consistent across trials.** SH compares trials at the same rung, so `min_steps`/`budget` are in *whatever units the trainer passes as `step`*. The cleanest choice is to log the objective **once per epoch** with `step=epoch` — then express the rungs in epochs. Warn against using a framework's global batch-step counter when `batch_size` is swept (different trials reach "step N" at different epochs — an unfair comparison). When you add this block, tell the user their trainer must stream `metric` per-epoch (or per a consistent step unit), and that pruning is cooperative — the trial stops at its next `log_result(step=...)` (which raises `hyperherd.TrialPruned`), so a long-running loop should let that exception propagate (or catch it to checkpoint+exit 0). See `docs/configuration.md#successive-halving-pruning` and the MNIST example's `on_validation_epoch_end`.
 
@@ -382,17 +405,18 @@ Override per invocation with `herd run --max-concurrent N` (CLI wins over the co
 After writing or editing the config, suggest the user run:
 
 ```bash
-herd run <workspace> --dry-run    # validate config, preview trials & sbatch script
-herd test <workspace>             # run trial 0 with --cfg job (Hydra config validation only)
-herd local <workspace>            # run trial 0 end-to-end locally — full pre-flight, no SLURM
-herd run <workspace>              # actually submit
+herd run <workspace> --dry-run       # validate config, preview trials & sbatch script
+herd ls <workspace>                  # list every trial and its params
+herd test <workspace> --cfg-job      # trial 0, Hydra config validation only
+herd test <workspace>                # run trial 0 end-to-end locally — no SLURM
+herd run <workspace>                 # actually submit
 ```
 
-`herd local` runs the launcher exactly like SLURM would, with `HYPERHERD_*` env vars set. It refuses any index that has ever been submitted to SLURM (would clobber outputs).
+`herd test` runs the launcher exactly like SLURM would, with `HYPERHERD_*` env vars set. It refuses any index that has ever been submitted to SLURM (would clobber outputs).
 
 ## Authoring discipline
 
-- Don't invent fields. The full set is in `docs/configuration.md`. Top-level fields today are: `name`, `grid`, `launcher`, `slurm`, `parameters`, `conditions`, `static_overrides`, `discord` (autonomous monitor), `mcp_servers` (external MCP integrations). Anything else is wrong.
+- Don't invent fields. The full set is in `docs/configuration.md`. Top-level fields today are: `name`, `grid`, `launcher`, `slurm`, `parameters`, `conditions`, `static_overrides`, `discord` (autonomous monitor), `mcp_servers` (external MCP integrations), `successive_halving` (early-stopping), `prune_grace_seconds`. Anything else is wrong.
 - Don't recommend `constraints:` for new configs — `conditions:` is the canonical key (the legacy alias is for backward compat only).
 - Don't recommend a `watch:` block. It used to exist for the legacy webhook-poster (`herd watch`), which has been removed. The monitor's chat surface is now the `discord:` block.
 - Don't recommend a top-level `hydra:` block. There used to be one (a wrapper around `static_overrides`), now it's just `static_overrides`. The legacy alias still parses but it's not the canonical form.
