@@ -314,5 +314,167 @@ class TestPausedSticky(unittest.TestCase):
         self.assertEqual(st[1], "running")
 
 
+class TestCmdShBrackets(unittest.TestCase):
+    """`herd sh` with bracketing configured: partition, JSON shape, warnings."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        with open(os.path.join(self.tmp, "launch.sh"), "w") as f:
+            f.write("#!/bin/bash\n")
+        os.chmod(os.path.join(self.tmp, "launch.sh"), 0o755)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _config(self, bracketing):
+        cfg = (
+            "name: t\n"
+            f"workspace: {self.tmp}\n"
+            f"launcher: {os.path.join(self.tmp, 'launch.sh')}\n"
+            "grid: all\n"
+            "parameters:\n"
+            "  lr:\n"
+            "    type: discrete\n"
+            "    abbrev: lr\n"
+            "    values: [0.1, 0.2, 0.3]\n"
+            "  opt:\n"
+            "    type: discrete\n"
+            "    abbrev: opt\n"
+            "    values: [adam, sgd]\n"
+            "slurm:\n"
+            "  partition: p\n"
+            "  time: '00:10:00'\n"
+            "  mem: 1G\n"
+            "successive_halving:\n"
+            "  metric: val_loss\n"
+            "  direction: min\n"
+            "  min_steps: 10\n"
+            "  budget: 80\n"
+            "  eta: 2\n"
+            f"{bracketing}"
+        )
+        with open(os.path.join(self.tmp, "hyperherd.yaml"), "w") as f:
+            f.write(cfg)
+
+    def _seed(self):
+        """6 trials (3 lr x 2 opt). sgd is uniformly worse than adam early —
+        a flat sweep prunes the whole sgd branch on that alone."""
+        manifest.init_workspace(self.tmp)
+        combos = [{"lr": lr, "opt": o}
+                  for lr in (0.1, 0.2, 0.3) for o in ("adam", "sgd")]
+        manifest.create_manifest(
+            self.tmp, combos, abbrevs={"lr": "lr", "opt": "opt"})
+        for t in manifest.load_manifest(self.tmp):
+            i = t["index"]
+            base = 0.2 if t["params"]["opt"] == "adam" else 2.0
+            _stream(self.tmp, i, *[(s, base + 0.001 * i) for s in range(0, 81, 10)])
+            manifest.update_trial_status(self.tmp, i, "running")
+
+    def _args(self, **over):
+        base = dict(
+            workspace=self.tmp, dry_run=True, json_output=True, reason=False,
+            metric=None, direction=None, min_steps=None, budget=None,
+            eta=None, max_concurrent=None, no_brackets=False,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def _run(self, **over):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cmd_sh(self._args(**over))
+        self.assertEqual(rc, 0)
+        return json.loads(buf.getvalue())
+
+    def test_bracket_by_partitions_and_keeps_each_branch(self):
+        self._config("  bracket_by: [opt]\n")
+        self._seed()
+        payload = self._run()
+        self.assertEqual(payload["bracketing"], {"kind": "params", "keys": ["opt"]})
+        self.assertEqual(len(payload["brackets"]), 2)
+        # The sgd branch survives: its best trial is NOT pruned, even though it
+        # is worse than every adam trial.
+        by_idx = {d["index"]: d for d in payload["decisions"]}
+        sgd = [t["index"] for t in manifest.load_manifest(self.tmp)
+               if t["params"]["opt"] == "sgd"]
+        self.assertTrue(
+            any(by_idx[i]["action"] != "prune" for i in sgd),
+            "the whole sgd bracket was pruned — bracketing did nothing")
+
+    def test_no_brackets_flag_reproduces_flat_sh(self):
+        # The control. Same config, --no-brackets, and now the entire sgd branch
+        # dies — which is exactly the bias `bracket_by` was added to remove.
+        self._config("  bracket_by: [opt]\n")
+        self._seed()
+        payload = self._run(no_brackets=True)
+        self.assertIsNone(payload["bracketing"])
+        by_idx = {d["index"]: d for d in payload["decisions"]}
+        sgd = [t["index"] for t in manifest.load_manifest(self.tmp)
+               if t["params"]["opt"] == "sgd"]
+        self.assertTrue(all(by_idx[i]["action"] == "prune" for i in sgd))
+
+    def test_rungs_stays_flat_for_old_consumers(self):
+        # The global ladder must keep its pre-bracketing shape — the Discord
+        # /sh formatter joins it as a list of step numbers.
+        self._config("  bracket_by: [opt]\n")
+        self._seed()
+        self.assertEqual(self._run()["rungs"], [10, 20, 40, 80])
+
+    def test_decisions_carry_a_bracket_key(self):
+        self._config("  bracket_by: [opt]\n")
+        self._seed()
+        for d in self._run()["decisions"]:
+            self.assertIsNotNone(d["bracket"])
+
+    def test_hyperband_hedge_has_no_rungs_and_is_never_pruned(self):
+        self._config("  hyperband: {seed: 3}\n")
+        self._seed()
+        payload = self._run()
+        self.assertEqual(payload["bracketing"], {"kind": "hyperband", "seed": 3})
+        hedge = [b for b in payload["brackets"] if not b["rungs"]]
+        if hedge:   # seed-dependent on a field this small
+            for i in hedge[0]["indices"]:
+                self.assertNotIn(i, payload["pruned"])
+
+    def test_degenerate_bracketing_warns(self):
+        # bracket_by on the fine-grained param -> every trial alone -> no-op.
+        self._config("  bracket_by: [lr, opt]\n")
+        self._seed()
+        payload = self._run()
+        self.assertTrue(payload["warnings"])
+        self.assertIn("no-op", payload["warnings"][0])
+        self.assertEqual(payload["pruned"], [])
+
+    def test_unbracketed_sweep_reports_no_bracketing(self):
+        self._config("")
+        self._seed()
+        payload = self._run()
+        self.assertIsNone(payload["bracketing"])
+        self.assertEqual(payload["warnings"], [])
+        self.assertEqual(len(payload["brackets"]), 1)
+
+    def test_overridden_trial_brackets_by_what_it_actually_trains_with(self):
+        # REGRESSION. A trial re-run via `herd run <i> opt=sgd` trains with sgd,
+        # but its manifest `params` still say adam. Bracketing on the raw params
+        # would race it against the adam cohort — comparing it to trials with
+        # completely different dynamics, which is the exact bias `bracket_by`
+        # exists to prevent.
+        self._config("  bracket_by: [opt]\n")
+        self._seed()
+        adam = next(t["index"] for t in manifest.load_manifest(self.tmp)
+                    if t["params"]["opt"] == "adam")
+        manifest.set_trial_overrides(
+            self.tmp, [adam], {"opt": "sgd"},
+            abbrevs={"lr": "lr", "opt": "opt"})
+
+        payload = self._run()
+        bracket_of = {d["index"]: d["bracket"] for d in payload["decisions"]}
+        sgd_native = [t["index"] for t in manifest.load_manifest(self.tmp)
+                      if t["params"]["opt"] == "sgd"]
+        self.assertEqual(
+            bracket_of[adam], bracket_of[sgd_native[0]],
+            "an overridden trial was bracketed by the params it did NOT train with")
+
+
 if __name__ == "__main__":
     unittest.main()

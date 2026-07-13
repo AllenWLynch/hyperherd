@@ -92,12 +92,18 @@ def parse_elapsed_seconds(elapsed: str) -> Optional[int]:
 # --- per-command payloads ----------------------------------------------------
 
 def _trial_dict(trial: dict) -> Dict[str, Any]:
-    return {
+    out = {
         "index": trial["index"],
         "status": trial.get("status", "unknown"),
         "experiment_name": trial.get("experiment_name") or None,
         "params": trial.get("params", {}),
     }
+    # Only present when the trial actually carries CLI overrides, so the common
+    # case stays as compact as it was.
+    overrides = trial.get("overrides") or {}
+    if overrides:
+        out["overrides"] = overrides
+    return out
 
 
 def status_payload(
@@ -181,10 +187,17 @@ def launch_payload(
     }
 
 
-def stop_payload(cancelled: List[Dict[str, Any]]) -> Dict[str, Any]:
+def stop_payload(
+    cancelled: List[Dict[str, Any]],
+    skipped: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """`herd stop --json`. `cancelled` is a list of
-    `{index, slurm_job_id, previous_status}` dicts — empty on a no-op."""
-    return {"cancelled": cancelled}
+    `{index, slurm_job_id, previous_status}` dicts — empty on a no-op.
+
+    `skipped` lists `{index, status}` for targets in the requested range that
+    weren't running/queued (e.g. `herd stop 1-8` where trial 3 already
+    completed). Empty for a single-index stop, which errors instead."""
+    return {"cancelled": cancelled, "skipped": skipped or []}
 
 
 def tail_payload(

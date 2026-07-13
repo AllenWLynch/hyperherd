@@ -9,6 +9,7 @@ import sys
 from typing import Dict, Optional
 
 from hyperherd import agent_output
+from hyperherd import argspec
 from hyperherd.config import ConfigError, load_config
 from hyperherd.constraints import apply_constraints
 from hyperherd.display import (
@@ -39,8 +40,11 @@ from hyperherd.logging import (
 )
 from hyperherd.successive_halving import (
     Action,
+    BracketSpec,
     SweepConfig,
     TrialState,
+    bracket_partition,
+    bracket_warnings,
     decision_label,
     explain as explain_decision,
     plan_successive_halving,
@@ -97,19 +101,23 @@ def _apply_reconciliation(config, diff, force: bool) -> bool:
     return True
 
 
-def _parse_pin_args(pin_args, config):
-    """Parse `--pin name=value` strings into a {name: coerced_value} dict.
+def _parse_where_args(where_args, config):
+    """Parse `--where name=value` strings into a {name: coerced_value} dict.
+
+    `--where` *selects* trials; a bare `name=value` positional *overrides* one.
+    So this deliberately only accepts sweep parameter names — filtering on a key
+    the sweep doesn't vary would either match everything or nothing.
 
     Raises ValueError with a user-facing message on:
       - malformed entries (no `=`)
       - names not in config.parameters (incl. static_overrides keys —
-        those aren't sweep parameters and pinning to them is meaningless)
+        those aren't sweep parameters and filtering on them is meaningless)
 
-    Coerces the RHS by trying int → float → str, in that order. Trial
-    params are stored with their original YAML types so a stored `32`
-    (int) still matches a `--pin batch_size=32` (coerced int 32).
+    Coerces the RHS int → float → str. Trial params are stored with their
+    original YAML types, so a stored `32` (int) still matches `--where
+    batch_size=32` (coerced to int 32).
     """
-    if not pin_args:
+    if not where_args:
         return {}
 
     sweep_params = set(config.parameters.keys())
@@ -117,61 +125,119 @@ def _parse_pin_args(pin_args, config):
         s.split("=", 1)[0] for s in (config.static_overrides or [])
     }
 
-    pins = {}
-    for entry in pin_args:
+    filters = {}
+    for entry in where_args:
         if "=" not in entry:
             raise ValueError(
-                f"--pin {entry!r}: expected 'name=value', got no '='"
+                f"--where {entry!r}: expected 'name=value', got no '='"
             )
         name, raw = entry.split("=", 1)
         name = name.strip()
         raw = raw.strip()
         if not name:
-            raise ValueError(f"--pin {entry!r}: empty parameter name")
+            raise ValueError(f"--where {entry!r}: empty parameter name")
         if name in static_keys:
             raise ValueError(
-                f"--pin {name!r}: that's a static_overrides key, not a "
-                f"sweep parameter. --pin only accepts sweep parameter "
+                f"--where {name!r}: that's a static_overrides key, not a "
+                f"sweep parameter. --where only selects on sweep parameter "
                 f"names. Sweep parameters: {sorted(sweep_params)}"
             )
         if name not in sweep_params:
             raise ValueError(
-                f"--pin {name!r}: unknown parameter. "
+                f"--where {name!r}: unknown parameter. "
                 f"Sweep parameters: {sorted(sweep_params)}"
             )
 
-        # Type coercion: int → float → str.
-        coerced: object = raw
-        try:
-            coerced = int(raw)
-        except ValueError:
-            try:
-                coerced = float(raw)
-            except ValueError:
-                coerced = raw
+        filters[name] = manifest.coerce_scalar(raw)
 
-        pins[name] = coerced
-
-    return pins
+    return filters
 
 
-def _filter_trials_by_pins(trials, pins):
-    """Return the subset of trials whose `params` match every pin.
+def _filter_trials_by_where(trials, filters):
+    """Return the subset of trials whose `params` match every `--where` filter.
 
     Comparison uses `==`, which gives loose numeric equality (int 32
     matches float 32.0) but strict string equality. Trials are
     expected to be dicts with a `params` sub-dict, as stored in the
     manifest.
     """
-    if not pins:
+    if not filters:
         return list(trials)
 
     out = []
     for t in trials:
-        params = t.get("params", {})
-        if all(params.get(k) == v for k, v in pins.items()):
+        params = manifest.effective_params(t.get("params", {}), t.get("overrides"))
+        if all(params.get(k) == v for k, v in filters.items()):
             out.append(t)
     return out
+
+
+def _parse_override_args(override_args):
+    """Parse positional `KEY=VALUE` tokens into an ordered {key: value} dict.
+
+    Values stay as the raw strings the user typed — they are emitted verbatim
+    into the launcher's override string, so `lr=1e-3` reaches the trainer as
+    `1e-3` rather than being round-tripped through a float formatter.
+    Shape was already validated in `argspec.classify_positionals`.
+    """
+    out: Dict[str, str] = {}
+    for token in override_args or []:
+        key, value = token.split("=", 1)
+        out[key] = value
+    return out
+
+
+def _apply_trial_overrides(config, indices, overrides, clear, say):
+    """Persist per-trial overrides onto `indices`, warning about the sharp edges."""
+    trials = {t["index"]: t for t in manifest.load_manifest(config.workspace)}
+    swept = set(config.parameters.keys())
+
+    # An override that shadows a swept param folds into `experiment_name`, so
+    # the trial writes to a NEW output directory and the original run's results
+    # survive. One that doesn't (ckpt=..., debug=true) leaves the name alone —
+    # a deliberate in-place re-run, which is what a checkpoint resume wants, but
+    # it means the previous results get overwritten. Say which is happening.
+    shadowing = sorted(k for k in overrides if k in swept)
+    plain = sorted(k for k in overrides if k not in swept)
+
+    touched = manifest.set_trial_overrides(
+        config.workspace, indices, overrides,
+        config.abbrevs, config.labels, clear=clear,
+    )
+    if not touched:
+        return 0
+
+    idxs = sorted(t["index"] for t in touched)
+    if clear and not overrides:
+        say(f"  Cleared overrides on {len(idxs)} trial(s): {idxs}")
+        return 0
+
+    desc = ", ".join(f"{k}={v}" for k, v in overrides.items())
+    say(f"  Override {desc} on {len(idxs)} trial(s): {idxs}")
+
+    if shadowing:
+        say(f"  {', '.join(shadowing)} shadows a swept parameter — these trials "
+            f"are renamed (e.g. {touched[0]['experiment_name']}) and write to a "
+            f"new output directory, so no earlier result is overwritten.")
+    if plain and any(t.get("status") == "completed" for t in touched):
+        print(
+            f"Warning: {', '.join(plain)} is not a swept parameter, so the trial "
+            f"name is unchanged — this re-run will overwrite the previous "
+            f"results of the completed trial(s) it targets.",
+            file=sys.stderr,
+        )
+
+    stale = sorted(
+        t["index"] for t in touched
+        if t.get("status") in ("running", "queued", "submitted")
+    )
+    if stale:
+        print(
+            f"Note: trial(s) {stale} are already live; the override is stored "
+            f"but only takes effect on their next submission.",
+            file=sys.stderr,
+        )
+    return 0
 
 
 def cmd_launch(args):
@@ -186,13 +252,16 @@ def cmd_launch(args):
         if not json_mode:
             print(*a, **kw)
 
-    # Parse --pin early so config validation errors surface before any
+    # Parse --where early so config validation errors surface before any
     # SLURM/manifest work.
     try:
-        pins = _parse_pin_args(getattr(args, "pin", None), config)
+        filters = _parse_where_args(getattr(args, "where", None), config)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    overrides = _parse_override_args(getattr(args, "overrides", None))
+    clear_overrides = bool(getattr(args, "clear_overrides", False))
 
     # Preflight checks
     try:
@@ -273,7 +342,7 @@ def cmd_launch(args):
         try:
             requested = sorted(set(slurm._parse_array_range(args.indices)))
         except ValueError as e:
-            print(f"Invalid --indices spec {args.indices!r}: {e}", file=sys.stderr)
+            print(f"Invalid index spec {args.indices!r}: {e}", file=sys.stderr)
             return 1
         valid = {t["index"] for t in trials}
         unknown = [i for i in requested if i not in valid]
@@ -285,46 +354,82 @@ def cmd_launch(args):
             return 1
         if not args.force:
             status_by_idx = {t["index"]: t["status"] for t in trials}
-            blocked = [
+            # A live trial (running/queued/submitted) must never be resubmitted
+            # without --force: a second array task for the same index would race
+            # the first over the same output files.
+            live = [
                 i for i in requested
-                if status_by_idx[i] in ("running", "queued", "submitted", "completed")
+                if status_by_idx[i] in ("running", "queued", "submitted")
             ]
+            # A `completed` trial is different — nothing is live, so the only
+            # cost is overwriting its result. Supplying an override for it is an
+            # unambiguous "re-run this, differently", so we allow that without
+            # --force. A bare re-run of a completed trial still needs --force.
+            done = [
+                i for i in requested
+                if status_by_idx[i] == "completed"
+            ] if not overrides else []
+            blocked = sorted(set(live) | set(done))
             if blocked:
                 rows = ", ".join(f"{i}={status_by_idx[i]}" for i in blocked)
+                hint = (
+                    "Pass --force to override, or `herd clean` to reset."
+                    if live else
+                    "Pass --force to override, or give an override "
+                    "(e.g. `herd run 3 batch_size=32`) to re-run it."
+                )
                 print(
-                    f"Refusing to resubmit indices already running/completed: {rows}.\n"
-                    f"Pass --force to override, or `herd clean` to reset.",
+                    f"Refusing to resubmit indices already running/completed: "
+                    f"{rows}.\n{hint}",
                     file=sys.stderr,
                 )
                 return 1
         pending = requested
         _say(f"  Submitting {len(pending)} requested trial(s): {args.indices}")
 
-    # Apply --pin filter (after status- and indices-based filtering), so
-    # the user's pinned params narrow the candidate pool to matching
-    # trials only. An empty result is a hard error: the user expected
-    # specific trials and we shouldn't silently submit nothing.
-    pin_filter_summary: Optional[str] = None
-    if pins:
+    # Apply --where filter (after status- and indices-based filtering), so the
+    # user's selected params narrow the candidate pool to matching trials only.
+    # An empty result is a hard error: the user expected specific trials and we
+    # shouldn't silently submit nothing.
+    where_filter_summary: Optional[str] = None
+    if filters:
         all_trials = manifest.load_manifest(config.workspace)
-        matching = _filter_trials_by_pins(all_trials, pins)
+        matching = _filter_trials_by_where(all_trials, filters)
         matching_indices = {t["index"] for t in matching}
         before = len(pending)
         pending = [i for i in pending if i in matching_indices]
-        pin_desc = ", ".join(f"{k}={v}" for k, v in pins.items())
+        where_desc = ", ".join(f"{k}={v}" for k, v in filters.items())
         if not pending:
             print(
-                f"Error: no submittable trials match --pin {pin_desc}. "
-                f"({len(matching)} total trials match the pin, but none "
-                f"were in the {before} pending after status/indices "
-                f"filtering — they may already be running or completed.)",
+                f"Error: no submittable trials match --where {where_desc}. "
+                f"({len(matching)} total trials match, but none were in the "
+                f"{before} pending after status/index filtering — they may "
+                f"already be running or completed.)",
                 file=sys.stderr,
             )
             return 1
-        pin_filter_summary = (
-            f"--pin {pin_desc} narrowed from {before} to {len(pending)} trial(s)"
+        where_filter_summary = (
+            f"--where {where_desc} narrowed from {before} to {len(pending)} trial(s)"
         )
-        _say(f"  {pin_filter_summary}.")
+        _say(f"  {where_filter_summary}.")
+
+    # Persist per-trial CLI overrides on the selected trials. Do this BEFORE
+    # generating the sbatch script: the script bakes each trial's override
+    # string in at submission time (slurm._build_lookup_case).
+    if overrides or clear_overrides:
+        narrowed = bool(args.indices) or bool(filters) or bool(getattr(args, "all", False))
+        if not narrowed:
+            print(
+                "Error: refusing to apply overrides to the whole sweep. Narrow "
+                "the target with an index spec (`herd run 1-4 batch_size=32`), "
+                "a `--where` filter, or pass --all to mean it.",
+                file=sys.stderr,
+            )
+            return 1
+        rc = _apply_trial_overrides(
+            config, pending, overrides, clear_overrides, _say)
+        if rc:
+            return rc
 
     # Generate sbatch script
     script = slurm.generate_sbatch_script(config, pending, args.max_concurrent)
@@ -344,7 +449,7 @@ def cmd_launch(args):
             sbatch_script=script,
             pending_indices=pending,
             total_trials=len(trials),
-            filter_summary=pin_filter_summary,
+            filter_summary=where_filter_summary,
         )
         return 0
 
@@ -388,13 +493,13 @@ def cmd_ls(args):
     materializes the combinations from the config so users can `herd
     ls` BEFORE the first `herd run` to sanity-check the YAML.
 
-    Supports the same `--pin name=value` filter as `herd run` for
+    Supports the same `--where name=value` filter as `herd run` for
     inspecting a slice of the grid.
     """
     config = load_config(args.workspace)
 
     try:
-        pins = _parse_pin_args(getattr(args, "pin", None), config)
+        filters = _parse_where_args(getattr(args, "where", None), config)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -431,13 +536,13 @@ def cmd_ls(args):
             "(no manifest yet — showing combinations from hyperherd.yaml)"
         )
 
-    if pins:
+    if filters:
         before = len(trials)
-        trials = _filter_trials_by_pins(trials, pins)
+        trials = _filter_trials_by_where(trials, filters)
         if not trials:
-            pin_desc = ", ".join(f"{k}={v}" for k, v in pins.items())
+            where_desc = ", ".join(f"{k}={v}" for k, v in filters.items())
             print(
-                f"No trials match --pin {pin_desc} "
+                f"No trials match --where {where_desc} "
                 f"(of {before} total).",
                 file=sys.stderr,
             )
@@ -898,7 +1003,10 @@ def cmd_results(args):
     for trial in trials:
         idx = trial["index"]
         exp_name = trial.get("experiment_name", "")
-        params = trial["params"]
+        # Effective, not raw — otherwise a trial re-run with an override reports
+        # its metric under the hyperparameters it did NOT train with, which is
+        # exactly the table you pick the winning config from.
+        params = manifest.effective_params(trial["params"], trial.get("overrides"))
         trial_results = results.get(idx, {})
 
         row = [str(idx), exp_name]
@@ -959,17 +1067,39 @@ def _latest_job_id_for(records, index: int):
     return None
 
 
+def _stop_targets(args):
+    """The trial indices `herd stop` was asked to cancel, or None for --all.
+
+    Accepts the positional index spec (`herd stop 1-4,7`) and, for callers that
+    build an argparse Namespace directly (the monitor agent's `stop_index`
+    tool, and older scripts), a singular `index` attribute.
+    """
+    spec = getattr(args, "indices", None)
+    if spec:
+        return sorted(set(slurm._parse_array_range(spec)))
+    index = getattr(args, "index", None)
+    if index is not None:
+        return [int(index)]
+    return None
+
+
 def cmd_stop(args):
-    """Cancel one or all running/queued trials via scancel <jobid>_<index>."""
+    """Cancel running/queued trials via scancel <jobid>_<index>."""
     config = load_config(args.workspace)
 
     if not manifest.workspace_exists(config.workspace):
         print("No workspace found.", file=sys.stderr)
         return 1
 
-    if (args.index is None) == (not args.all):
+    try:
+        targets = _stop_targets(args)
+    except ValueError as e:
+        print(f"Invalid index spec: {e}", file=sys.stderr)
+        return 1
+
+    if (targets is None) == (not args.all):
         print(
-            "Pass either an index or --all (not both, not neither).",
+            "Pass either trial indices or --all (not both, not neither).",
             file=sys.stderr,
         )
         return 1
@@ -977,65 +1107,81 @@ def cmd_stop(args):
     _sync_slurm_status(config.workspace)
     trials = manifest.load_manifest(config.workspace)
     records = manifest.get_job_ids(config.workspace)
+    by_index = {t["index"]: t for t in trials}
 
     if args.all:
-        targets = [t for t in trials if t.get("status") in _LIVE_STATUSES]
-        cancelled: list = []
-        for t in targets:
-            jid = _latest_job_id_for(records, t["index"])
-            if jid is None:
-                continue
-            slurm.cancel_array_task(jid, t["index"])
-            cancelled.append({
-                "index": t["index"],
-                "slurm_job_id": jid,
-                "previous_status": t.get("status"),
-            })
-        if cancelled:
-            manifest.bulk_update_status(
-                config.workspace,
-                {row["index"]: "cancelled" for row in cancelled},
+        targets = [t["index"] for t in trials if t.get("status") in _LIVE_STATUSES]
+        skipped: list = []
+    else:
+        unknown = [i for i in targets if i not in by_index]
+        if unknown:
+            print(f"No trial found with index {unknown[0]}."
+                  if len(unknown) == 1 else
+                  f"No trials found with indices {unknown}.", file=sys.stderr)
+            return 1
+
+        not_live = [
+            i for i in targets if by_index[i].get("status") not in _LIVE_STATUSES
+        ]
+        # A single non-live target is a hard error — the user named one trial and
+        # it isn't cancellable, so there is nothing to do and saying so is more
+        # useful than exiting 0. Across a *range*, though, hitting some finished
+        # trials is expected (`herd stop 1-8` when 3 already completed), so those
+        # are skipped rather than failing the whole call.
+        if not_live and len(targets) == 1:
+            i = not_live[0]
+            print(
+                f"Trial {i} is {by_index[i].get('status', 'unknown')!r}, not "
+                f"running/queued — nothing to cancel.",
+                file=sys.stderr,
             )
-        if getattr(args, "json_output", False):
-            agent_output.emit(agent_output.stop_payload(cancelled))
-            return 0
-        if not targets:
-            print("No live trials to cancel.")
-            return 0
-        idxs = sorted(row["index"] for row in cancelled)
-        print(f"Cancelled {len(cancelled)} trial(s): {idxs}")
-        return 0
+            return 1
+        skipped = [
+            {"index": i, "status": by_index[i].get("status", "unknown")}
+            for i in not_live
+        ]
+        targets = [i for i in targets if i not in set(not_live)]
 
-    index = args.index
-    trial = next((t for t in trials if t["index"] == index), None)
-    if trial is None:
-        print(f"No trial found with index {index}.", file=sys.stderr)
+    cancelled: list = []
+    no_job_id: list = []
+    for index in targets:
+        jid = _latest_job_id_for(records, index)
+        if jid is None:
+            no_job_id.append(index)
+            continue
+        if not getattr(args, "json_output", False) and not args.all:
+            print(f"Cancelling trial {index} (job {jid}_{index})...")
+        slurm.cancel_array_task(jid, index)
+        cancelled.append({
+            "index": index,
+            "slurm_job_id": jid,
+            "previous_status": by_index[index].get("status"),
+        })
+
+    # A lone target with no recorded job ID is unactionable — same reasoning as
+    # the not-live case above.
+    if no_job_id and not cancelled and len(no_job_id) == 1 and not args.all:
+        print(f"No SLURM job ID recorded for trial {no_job_id[0]}.", file=sys.stderr)
         return 1
 
-    status = trial.get("status", "unknown")
-    if status not in _LIVE_STATUSES:
-        print(
-            f"Trial {index} is {status!r}, not running/queued — nothing to cancel.",
-            file=sys.stderr,
+    if cancelled:
+        manifest.bulk_update_status(
+            config.workspace,
+            {row["index"]: "cancelled" for row in cancelled},
         )
-        return 1
-
-    job_id = _latest_job_id_for(records, index)
-    if job_id is None:
-        print(f"No SLURM job ID recorded for trial {index}.", file=sys.stderr)
-        return 1
-
-    if not getattr(args, "json_output", False):
-        print(f"Cancelling trial {index} (job {job_id}_{index})...")
-    slurm.cancel_array_task(job_id, index)
-    manifest.update_trial_status(config.workspace, index, "cancelled")
 
     if getattr(args, "json_output", False):
-        agent_output.emit(agent_output.stop_payload([{
-            "index": index,
-            "slurm_job_id": job_id,
-            "previous_status": status,
-        }]))
+        agent_output.emit(agent_output.stop_payload(cancelled, skipped=skipped))
+        return 0
+
+    if not cancelled:
+        print("No live trials to cancel.")
+        return 0
+    idxs = sorted(row["index"] for row in cancelled)
+    print(f"Cancelled {len(cancelled)} trial(s): {idxs}")
+    if skipped:
+        rows = ", ".join(f"{s['index']}={s['status']}" for s in skipped)
+        print(f"Skipped {len(skipped)} not running/queued: {rows}")
     return 0
 
 
@@ -1054,6 +1200,10 @@ def _resolve_sh_config(args, config):
     budget = args.budget if args.budget is not None else (base.budget if base else None)
     eta = args.eta if args.eta is not None else (base.eta if base else 2)
     mode = getattr(args, "mode", None) or (base.mode if base else "sync")
+    # `--no-brackets` A/Bs a bracketed sweep against flat SH without a YAML edit.
+    flat = getattr(args, "no_brackets", False)
+    bracket_by = None if flat else (base.bracket_by if base else None)
+    hyperband = None if flat else (base.hyperband if base else None)
 
     missing = [
         name for name, val in (
@@ -1071,9 +1221,28 @@ def _resolve_sh_config(args, config):
         return SuccessiveHalving(
             metric=metric, direction=direction,
             min_steps=min_steps, budget=budget, eta=eta, mode=mode,
+            bracket_by=bracket_by, hyperband=hyperband,
         )
     except Exception as e:
         raise ValueError(f"invalid successive-halving parameters: {e}") from e
+
+
+def _bracket_spec(sh_cfg):
+    """Map the YAML's bracketing config onto the planner's BracketSpec."""
+    if sh_cfg.bracket_by:
+        return BracketSpec(kind="params", keys=tuple(sh_cfg.bracket_by))
+    if sh_cfg.hyperband is not None:
+        return BracketSpec(kind="hyperband", seed=sh_cfg.hyperband.seed)
+    return BracketSpec()
+
+
+def _bracketing_payload(sh_cfg):
+    """The `bracketing` field of `herd sh --json` — None when not bracketing."""
+    if sh_cfg.bracket_by:
+        return {"kind": "params", "keys": list(sh_cfg.bracket_by)}
+    if sh_cfg.hyperband is not None:
+        return {"kind": "hyperband", "seed": sh_cfg.hyperband.seed}
+    return None
 
 
 def cmd_sh(args):
@@ -1109,17 +1278,31 @@ def cmd_sh(args):
         budget=sh_cfg.budget,
         eta=sh_cfg.eta,
         mode=sh_cfg.mode,
+        bracket=_bracket_spec(sh_cfg),
     )
     states = [
         TrialState(
             index=t["index"],
             status=t.get("status", "ready"),
             stream=load_metric_stream(config.workspace, t["index"], sh_cfg.metric),
+            # Effective, not raw: a trial re-run with `herd run 3 hidden_dim=1024`
+            # trains a different-sized model, so `bracket_by: [hidden_dim]` must
+            # put it in the 1024 bracket, not the one its manifest params name.
+            params=manifest.effective_params(
+                t.get("params") or {}, t.get("overrides")),
         )
         for t in trials
     ]
 
     plan = plan_successive_halving(states, sweep)
+    brackets = bracket_partition(states, sweep)
+
+    # Warn on stderr (not stdout, so --json stays parseable) on every run,
+    # including --dry-run, so `herd sh -n` works as a real preflight. The failure
+    # this catches is silent: bracket too finely and SH prunes nothing at all.
+    sh_warnings = bracket_warnings(brackets, sweep)
+    for w in sh_warnings:
+        print(f"Warning: {w}", file=sys.stderr)
 
     submits = [p for p in plan if p.action == Action.SUBMIT]
     prunes = [p for p in plan if p.action == Action.PRUNE]
@@ -1159,7 +1342,21 @@ def cmd_sh(args):
         agent_output.emit({
             "dry_run": dry_run,
             "mode": sweep.mode,
+            # The GLOBAL ladder — unchanged, and still flat. Every bracket's
+            # ladder is a suffix of it, so existing consumers keep working.
             "rungs": rung_schedule(sweep.min_steps, sweep.budget, sweep.eta),
+            "bracketing": _bracketing_payload(sh_cfg),
+            "brackets": [
+                {
+                    "key": b.key,
+                    "label": b.label,
+                    "rungs": b.rungs,
+                    "indices": b.members,
+                    "cohort_size": len(b.cohort),
+                }
+                for b in brackets.values()
+            ],
+            "warnings": sh_warnings,
             "slurm_job_id": slurm_job_id,
             "submitted": submit_indices,
             "pruned": sorted(p.index for p in prunes),
@@ -1171,7 +1368,11 @@ def cmd_sh(args):
                     "max_step": p.max_step,
                     "action": p.action.value,
                     "verdict": p.verdict.value,
+                    # Bracket-RELATIVE under hyperband: rung 0 of bracket 1 is a
+                    # different step than rung 0 of bracket 3. Only
+                    # `standing.step` is comparable across brackets.
                     "rung": p.rung,
+                    "bracket": p.bracket,
                     "reason": p.reason,
                     "explanation": explain_decision(p),
                     "standing": (
@@ -1194,8 +1395,7 @@ def cmd_sh(args):
 
     _print_sh_plan(plan, submit_indices, prunes, pauses, dry_run, slurm_job_id)
     if getattr(args, "reason", False):
-        _print_sh_reasons(
-            plan, rung_schedule(sweep.min_steps, sweep.budget, sweep.eta))
+        _print_sh_reasons(plan, brackets)
     return 0
 
 
@@ -1234,37 +1434,61 @@ def _fmt_metric_value(v):
         return str(v)
 
 
-def _print_sh_reasons(plan, rungs):
-    """`herd sh --reason`: explain SH's stance on every cohort trial. Trials it
-    actually ranked at a rung come first, each with the cohort arithmetic behind
-    the decision; trials still training toward the first rung follow as compact
-    one-liners (so it's clear they're just not there yet, not being ignored)."""
+def _print_sh_reasons(plan, brackets=None):
+    """`herd sh --reason`: explain SH's stance on every cohort trial.
+
+    Trials it actually ranked at a rung come first, each with the cohort
+    arithmetic behind the decision; trials still training toward their first rung
+    follow as compact one-liners (so it's clear they're just not there yet, not
+    being ignored).
+
+    When bracketing is on, output is grouped by bracket with its ladder in the
+    header — the hedge bracket then visibly reads as *intentionally idle* rather
+    than broken. Each trial's first rung comes off its own `TrialAction`, not off
+    a global ladder: under hyperband there IS no global ladder that applies to
+    every trial.
+    """
     shown = [p for p in plan if p.status in _COHORT_STATUSES]
     print()
     if not shown:
         print("Why: no trials are in the successive-halving cohort yet.")
         return
-    judged = sorted((p for p in shown if p.standing is not None),
-                    key=lambda x: x.index)
-    waiting = sorted((p for p in shown if p.standing is None),
-                     key=lambda x: x.index)
-    first_rung = rungs[0] if rungs else None
 
     print("Why:")
+    bracketed = any(p.bracket for p in shown)
+    if not bracketed:
+        _print_sh_reason_group(shown)
+        return
+
+    info = {b.key: b for b in (brackets or {}).values()}
+    for key in sorted({p.bracket for p in shown}):
+        b = info.get(key)
+        ladder = (", ".join(str(r) for r in b.rungs)
+                  if b and b.rungs else "no decision rungs — runs to budget")
+        label = b.label if b else key
+        print(f"  [{label}]  rungs: {ladder}")
+        _print_sh_reason_group([p for p in shown if p.bracket == key], indent=4)
+
+
+def _print_sh_reason_group(rows, indent=2):
+    pad = " " * indent
+    judged = sorted((p for p in rows if p.standing is not None), key=lambda x: x.index)
+    waiting = sorted((p for p in rows if p.standing is None), key=lambda x: x.index)
     for p in judged:
         s = p.standing
-        print(f"  #{p.index:<4} {decision_label(p).upper():<13} "
+        print(f"{pad}#{p.index:<4} {decision_label(p).upper():<13} "
               f"rung {s.rung} (step {s.step}), "
               f"value {_fmt_metric_value(s.value)}")
-        print(f"        {explain_decision(p)}")
+        print(f"{pad}      {explain_decision(p)}")
     for p in waiting:
-        if first_rung is not None:
+        if p.first_rung_step is not None:
             at = (f"at step {p.max_step}" if p.max_step is not None
                   else "no metric logged yet")
-            where = f"{at}, not yet at rung 0 (step {first_rung})"
+            where = f"{at}, not yet at rung 0 (step {p.first_rung_step})"
         else:
+            # No ladder at all — min_steps > budget, or the hyperband hedge.
             where = p.reason
-        print(f"  #{p.index:<4} {decision_label(p).upper():<13} {where}")
+        print(f"{pad}#{p.index:<4} {decision_label(p).upper():<13} {where}")
 
 
 def cmd_clean(args):
@@ -1975,8 +2199,26 @@ def main():
     p_init.add_argument("-f", "--force", action="store_true", help="Overwrite existing files")
 
     # launch
-    p_launch = subparsers.add_parser("run", help="Submit a hyperparameter sweep", parents=[json_parent])
-    p_launch.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
+    p_launch = subparsers.add_parser(
+        "run",
+        help="Submit a hyperparameter sweep",
+        parents=[json_parent],
+        usage="herd run [WORKSPACE] [INDICES] [KEY=VALUE ...] [options]",
+        epilog=(
+            "Positionals are classified by shape, in any order: a directory is "
+            "the workspace, a SLURM-style spec (e.g. 1-4,7) selects trials, and "
+            "KEY=VALUE sets a persistent per-trial override. Examples:\n"
+            "  herd run                       submit every pending trial\n"
+            "  herd run 1-4 batch_size=32     resubmit trials 1-4 with an override\n"
+            "  herd run --where optimizer=adam lr=0.01\n"
+            "Use `--` to end option parsing, and ./3 for a workspace named '3'."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_launch.add_argument(
+        "pos", nargs="*", metavar="ARG",
+        help="[WORKSPACE] [INDICES] [KEY=VALUE ...] — see examples below",
+    )
     p_launch.add_argument(
         "-n", "--dry-run", action="store_true",
         help="Print the sbatch script and trial list without submitting"
@@ -1985,25 +2227,38 @@ def main():
         "-j", "--max-concurrent", type=int, default=None,
         help="Cap concurrent running array tasks (overrides slurm.max_concurrent)"
     )
+    # Deprecated: indices are positional now. Kept working because the monitor
+    # agent and older scripts/docs invoke `herd run -i <spec> <ws>`.
+    p_launch.add_argument("-i", "--indices", default=None, help=argparse.SUPPRESS)
     p_launch.add_argument(
-        "-i", "--indices", default=None,
-        help="Submit only these trial indices (SLURM-style spec, e.g. '0-3,5,7-9')"
+        "--where", action="append", default=None, metavar="NAME=VALUE",
+        help=(
+            "Only submit trials whose swept parameters match this filter. "
+            "Repeatable (`--where optimizer=adam --where batch_size=32`). Names "
+            "must be sweep parameters; values are coerced to int/float/str. "
+            "Combines with the index selection and the standard status filter."
+        ),
     )
     p_launch.add_argument(
-        "-p", "--pin", nargs="+", default=None, metavar="NAME=VALUE",
-        help=(
-            "Only submit trials whose swept parameters match every pin "
-            "(e.g. `--pin batch_size=32 optimizer=adam`). Names must be "
-            "sweep parameters; values are coerced to int/float/str. "
-            "Combines with --indices and the standard status filter."
-        ),
+        "-p", "--pin", nargs="+", default=None, help=argparse.SUPPRESS,
+    )  # deprecated alias for --where
+    p_launch.add_argument(
+        "--clear-overrides", action="store_true",
+        help="Drop any stored per-trial overrides on the selected trials",
     )
     p_launch.add_argument(
         "-f", "--force", action="store_true",
         help=(
-            "Override safety checks: with --indices, resubmit trials that are "
-            "already running or completed; without --indices, allow config "
+            "Override safety checks: with an index selection, resubmit trials "
+            "that are already running or completed; without one, allow config "
             "edits that drop running/completed trials (kept as orphans)"
+        ),
+    )
+    p_launch.add_argument(
+        "-a", "--all", action="store_true",
+        help=(
+            "Required to apply KEY=VALUE overrides to the whole sweep — without "
+            "it, overrides need an index selection or --where to narrow them"
         ),
     )
 
@@ -2017,12 +2272,15 @@ def main():
         help="Workspace directory (default: current dir)",
     )
     p_ls.add_argument(
-        "-p", "--pin", nargs="+", default=None, metavar="NAME=VALUE",
+        "--where", action="append", default=None, metavar="NAME=VALUE",
         help=(
-            "Filter to trials whose swept params match every pin "
-            "(e.g. `--pin batch_size=32 optimizer=adam`)"
+            "Filter to trials whose swept params match this filter. Repeatable "
+            "(`--where optimizer=adam --where batch_size=32`)"
         ),
     )
+    p_ls.add_argument(
+        "-p", "--pin", nargs="+", default=None, help=argparse.SUPPRESS,
+    )  # deprecated alias for --where
 
     # monitor
     p_monitor = subparsers.add_parser("status", help="Show status of all trials", parents=[json_parent])
@@ -2102,9 +2360,16 @@ def main():
     )
 
     # stop
-    p_stop = subparsers.add_parser("stop", help="Cancel a running/queued trial (or all of them)", parents=[json_parent])
-    p_stop.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
-    p_stop.add_argument("index", nargs="?", type=int, default=None, help="Trial index to cancel")
+    p_stop = subparsers.add_parser(
+        "stop",
+        help="Cancel running/queued trials (one, a range, or all)",
+        parents=[json_parent],
+        usage="herd stop [WORKSPACE] [INDICES] | herd stop --all",
+    )
+    p_stop.add_argument(
+        "pos", nargs="*", metavar="ARG",
+        help="[WORKSPACE] [INDICES] — e.g. `herd stop 3`, `herd stop 1-4,7`",
+    )
     p_stop.add_argument("-a", "--all", action="store_true", help="Cancel every running/queued trial in the workspace")
 
     # sh — successive-halving pruning
@@ -2132,6 +2397,12 @@ def main():
         "--mode", choices=("sync", "asha"), default=None,
         help="Scheduler (overrides config): 'asha' ranks only arrived trials "
              "(never waits); 'sync' pauses undecidable trials until the field arrives",
+    )
+    p_sh.add_argument(
+        "--no-brackets", action="store_true",
+        help="Ignore the config's bracket_by/hyperband and compare every trial "
+             "against every other — useful with --dry-run --reason to see what "
+             "bracketing is buying you",
     )
     p_sh.add_argument(
         "-j", "--max-concurrent", type=int, default=None,
@@ -2238,13 +2509,67 @@ def main():
     # dog — easter egg, hidden from --help.
     subparsers.add_parser("dog", help=argparse.SUPPRESS)
 
-    args = parser.parse_args()
+    # `parse_known_args`, not `parse_args`: argparse cannot split a `nargs="*"`
+    # positional across an optional, so `herd run ws --where lr=0.1 bs=128`
+    # would drop the trailing `bs=128` as "unrecognized". Collecting the
+    # leftovers and classifying them alongside `pos` makes positionals and flags
+    # freely interleavable. Non-`pos` commands still reject leftovers.
+    args, extras = parser.parse_known_args()
+
+    # `run` and `stop` take a catch-all `pos` and classify its tokens by shape
+    # (directory / index spec / KEY=VALUE) — argparse's greedy positional
+    # matcher can't tell them apart on its own. See hyperherd/argspec.py.
+    #                allow_indices, allow_overrides
+    _POS_COMMANDS = {"run": (True, True), "stop": (True, False)}
+    if args.command not in _POS_COMMANDS:
+        if extras:
+            parser.error(f"unrecognized arguments: {' '.join(extras)}")
+    else:
+        # A leftover that looks like a flag is a typo, not a positional — don't
+        # let `--froce` get classified as a workspace path.
+        bad_flags = [e for e in extras if e.startswith("-") and e != "-"]
+        if bad_flags:
+            parser.error(f"unrecognized arguments: {' '.join(bad_flags)}")
+        allow_i, allow_o = _POS_COMMANDS[args.command]
+        tokens = list(args.pos) + extras
+        try:
+            pos = argspec.classify_positionals(
+                tokens, allow_indices=allow_i, allow_overrides=allow_o)
+        except argspec.TokenError as e:
+            parser.error(str(e))
+        args.workspace = pos.workspace
+        if pos.indices:
+            if getattr(args, "indices", None):
+                parser.error(
+                    "pass trial indices either positionally or with -i, not both")
+            args.indices = pos.indices
+        args.overrides = pos.overrides
+        shadowed = argspec.shadowed_directory(pos, tokens)
+        if shadowed:
+            print(
+                f"note: reading {shadowed!r} as a trial index, not the directory "
+                f"of that name — write ./{shadowed} if you meant the workspace.",
+                file=sys.stderr,
+            )
+
+    # `--pin` is the deprecated spelling of `--where` (renamed once bare
+    # KEY=VALUE positionals came to mean *override*, making `-p k=v` for a
+    # *filter* an easy mistake to make). Merge and warn. Affects: run, ls.
+    if args.command in ("run", "ls"):
+        if getattr(args, "pin", None):
+            print(
+                "Warning: -p/--pin is deprecated; use --where (repeat the flag "
+                "per filter). Bare KEY=VALUE now means a per-trial override.",
+                file=sys.stderr,
+            )
+        args.where = (getattr(args, "where", None) or []) + (getattr(args, "pin", None) or [])
 
     # Disambiguate `<workspace?> <index?>` positionals when only one was given.
-    # `herd stop 5` from inside a workspace binds "5" to `workspace` because it
+    # `herd stats 5` from inside a workspace binds "5" to `workspace` because it
     # comes first; if it looks like an int and isn't a directory, treat it as
-    # `index` instead. Affects: stop, stats, test.
-    if (
+    # `index` instead. `run`/`stop` no longer come through here — they classify
+    # their positionals above, which is strictly more capable.
+    if args.command in ("stats", "test", "tail") and (
         getattr(args, "index", "<missing>") is None
         and isinstance(getattr(args, "workspace", None), str)
         and not os.path.isdir(args.workspace)

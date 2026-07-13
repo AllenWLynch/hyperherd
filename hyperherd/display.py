@@ -362,6 +362,14 @@ def print_trial_listing(
             print(f"    {_DIM}# constraint set:{_RESET}")
             for name, value in extras.items():
                 print(f"    {_format_param_kv(name, value, is_non_default=True)}")
+
+        # Per-trial CLI overrides (`herd run 3 batch_size=32`). Shown last
+        # because that's the order the launcher sees them in — they win.
+        overrides = trial.get("overrides") or {}
+        if overrides:
+            print(f"    {_DIM}# cli override:{_RESET}")
+            for name, value in overrides.items():
+                print(f"    {_format_param_kv(name, value, is_non_default=True)}")
         print()
 
 

@@ -84,6 +84,90 @@ def build_experiment_name(
     return "_".join(parts)
 
 
+def coerce_scalar(raw: str) -> Any:
+    """Coerce a user-typed string to int → float → str, in that order.
+
+    Trial params keep their original YAML types, so a CLI token `32` must become
+    the int `32` to compare (or name) equal to a stored `32`.
+    """
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return raw
+
+
+def effective_params(
+    params: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """`params` with any override that *shadows a swept param* folded in.
+
+    This is the trial's configuration **as actually trained**, and it's what any
+    code that *interprets* a trial must read: which bracket it belongs in
+    (`bracket_by`), what hyperparameters to attribute its metrics to (`herd
+    res`), whether it matches a `--where` filter. Reading raw `params` there
+    would report — and rank — the trial under a config it didn't run.
+
+    Overrides on keys that aren't swept params (`ckpt=...`, `debug=true`) aren't
+    folded in: they don't move the trial to a different point in the search
+    space.
+
+    NOT used for naming — see `experiment_name_for`, which must stay collision-
+    free and therefore can't simply substitute the new value into the name.
+
+    Values are coerced so `labels:` lookups still resolve (a label map is keyed
+    by the declared YAML value, e.g. int 32, not the string "32").
+    """
+    out = dict(params)
+    for key, raw in (overrides or {}).items():
+        if key in out:
+            out[key] = coerce_scalar(raw) if isinstance(raw, str) else raw
+    return out
+
+
+def _override_token(value: Any) -> str:
+    """A filename-safe token for an override value in an experiment name."""
+    return format_short_value(value).replace("/", "_")
+
+
+def experiment_name_for(
+    params: Dict[str, Any],
+    overrides: Optional[Dict[str, str]],
+    abbrevs: Dict[str, str],
+    labels: Optional[Dict[str, Dict[Any, str]]] = None,
+) -> str:
+    """The trial's output-directory name, accounting for CLI overrides.
+
+    An override that shadows a swept parameter **appends a suffix** to the
+    original name rather than substituting the new value into it::
+
+        trial 0: params {lr: 0.1, bs: 32}  ->  lr-0.1_bs-32
+        herd run 0 bs=64                   ->  lr-0.1_bs-32_ov_bs-64
+
+    Substituting would produce `lr-0.1_bs-64` — which is *already some other
+    trial's name* whenever the override value is one the sweep covers. Trial 0
+    would then write straight into trial 1's output directory and destroy its
+    results, and if trial 1 were running, two array tasks would race over the
+    same files. Appending keeps the base (the original params, which are unique
+    by construction), so the full name stays unique too.
+
+    Overrides on non-swept keys (`ckpt=`, `debug=`) leave the name alone: they
+    don't identify a different point in the search space, so the trial re-runs
+    **in place**, which is what a checkpoint resume wants.
+    """
+    base = build_experiment_name(params, abbrevs, labels)
+    shadowing = [(k, v) for k, v in (overrides or {}).items() if k in params]
+    if not shadowing:
+        return base
+    suffix = "_".join(
+        f"{abbrevs.get(k, k)}-{_override_token(v)}" for k, v in shadowing
+    )
+    return f"{base}_ov_{suffix}"
+
+
 def trial_hash(params: Dict[str, Any], extras: Optional[Dict[str, Any]] = None) -> str:
     """Stable identity hash for a trial, derived from its swept params + constraint extras.
 
@@ -105,13 +189,21 @@ def _trial_record(
     extras: Dict[str, Any],
     abbrevs: Dict[str, str],
     labels: Optional[Dict[str, Dict[Any, str]]],
+    overrides: Optional[Dict[str, str]] = None,
 ) -> dict:
+    overrides = overrides or {}
     return {
         "index": index,
+        # NOTE: `overrides` is deliberately NOT hashed. The hash is the trial's
+        # reconciliation identity (which point in the search space it is); an
+        # ad-hoc CLI override doesn't move it, so folding overrides in here
+        # would make every override look like a config edit that replaced the
+        # trial.
         "hash": trial_hash(params, extras),
         "params": params,
         "extras": extras,
-        "experiment_name": build_experiment_name(params, abbrevs, labels),
+        "overrides": overrides,
+        "experiment_name": experiment_name_for(params, overrides, abbrevs, labels),
         "status": "ready",
     }
 
@@ -153,6 +245,8 @@ def load_manifest(base: str) -> List[dict]:
     for t in trials:
         if "hash" not in t:
             t["hash"] = trial_hash(t.get("params", {}), t.get("extras") or {})
+        # Manifests written before per-trial CLI overrides existed have no key.
+        t.setdefault("overrides", {})
     return trials
 
 
@@ -284,6 +378,43 @@ def bulk_update_status(base: str, updates: Dict[int, str]) -> None:
     _write_manifest(base, trials)
 
 
+def set_trial_overrides(
+    base: str,
+    indices: List[int],
+    overrides: Dict[str, str],
+    abbrevs: Dict[str, str],
+    labels: Optional[Dict[str, Dict[Any, str]]] = None,
+    clear: bool = False,
+) -> List[dict]:
+    """Merge per-trial CLI overrides into the given trials; return those records.
+
+    `clear` drops any stored overrides first, so `--clear-overrides` alone resets
+    a trial and `--clear-overrides k=v` replaces rather than merges.
+
+    Rewrites `experiment_name` (see `experiment_name_for`) so an override that
+    shadows a swept parameter sends the trial to a new output directory instead
+    of overwriting the original run's results. `hash` is untouched — an override
+    doesn't change which point in the search space the trial is, and making it
+    the reconciliation identity would turn every override into a config edit
+    that replaced the trial.
+    """
+    trials = load_manifest(base)
+    targets = set(indices)
+    touched = []
+    for trial in trials:
+        if trial["index"] not in targets:
+            continue
+        current = {} if clear else dict(trial.get("overrides") or {})
+        current.update(overrides)
+        trial["overrides"] = current
+        trial["experiment_name"] = experiment_name_for(
+            trial.get("params", {}), current, abbrevs, labels)
+        touched.append(trial)
+    if touched:
+        _write_manifest(base, trials)
+    return touched
+
+
 def get_trials_by_status(base: str, status: str) -> List[dict]:
     return [t for t in load_manifest(base) if t["status"] == status]
 
@@ -352,7 +483,8 @@ def resolve_overrides(
       1. experiment_name=<name>
       2. swept parameter overrides
       3. static_overrides
-      4. constraint `set` extras (last → wins over statics)
+      4. constraint `set` extras (wins over statics)
+      5. per-trial CLI overrides from `herd run <idx> k=v` (last → wins over all)
     """
     trials = load_manifest(base)
     trial = None
@@ -380,5 +512,11 @@ def resolve_overrides(
     extras = trial.get("extras") or {}
     for k, v in extras.items():
         parts.append(f"{k}={_format_override_value(v)}")
+
+    # Per-trial CLI overrides win over everything. Emitted VERBATIM, not through
+    # `_format_override_value` — the user typed these, and round-tripping them
+    # through the float formatter would silently rewrite `lr=1e-3` to `lr=0.001`.
+    for k, v in (trial.get("overrides") or {}).items():
+        parts.append(f"{k}={v}")
 
     return " ".join(parts)
