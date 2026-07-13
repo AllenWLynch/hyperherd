@@ -19,7 +19,7 @@ Trials are evaluated at geometrically-spaced step *rungs*:
 ## Two schedulers (`cfg.mode`)
 
 **`"sync"`** — the conservative bracket. The surviving *cohort* at each rung is
-split: keep the top ``K = ceil(m/2)``, prune the bottom, and *pause* trials
+split: keep the top ``K = ceil(m/eta)``, prune the bottom, and *pause* trials
 whose standing can't yet be decided because not enough of the field has arrived.
 A trial at a rung is decided as soon as its standing is certain *regardless of
 how the not-yet-arrived trials turn out*. For a trial ``t`` with
@@ -45,6 +45,50 @@ slower, worse-but-later arrival would have spared.
 
 Ties are broken by trial index (immutable) in both modes, so decisions are
 deterministic and recomputation is reproducible/idempotent.
+
+## Brackets (`cfg.bracket`)
+
+By default the whole field is one cohort on one rung ladder. That is only fair
+when trials share training dynamics. Hyperparameters that change the *shape* of
+the loss curve rather than just its quality — parameter count, regularization
+strength, optimizer — bias the cut: a large model that is merely slow to warm up
+loses to a small one that converges fast and plateaus early.
+
+A **bracket** is (a set of trials that only compete with each other) + (a rung
+ladder). Two ways to define them, mutually exclusive:
+
+* **`kind="params"`** (`bracket_by: [hidden_dim, optimizer]`) — the bracket key
+  is the tuple of those parameters' values. Every bracket shares the global
+  ladder. Direct and interpretable: you name the parameters that are
+  incomparable, and trials only race their own kind.
+* **`kind="hyperband"`** (Li et al. 2018) — the hedge for when you *don't* know
+  which parameters matter. Trials are assigned to brackets `s ∈ [0, s_max]` by a
+  seeded hash of their index. Bracket `s` judges on the **top `s+1` rungs** of
+  the ladder — it starts at `budget * eta**-s`, exactly Hyperband's `r_s`. So
+  with rungs `[10, 20, 40, 80]`::
+
+      s=3  [10, 20, 40, 80]   full ladder — cuts from the earliest rung
+      s=2      [20, 40, 80]
+      s=1          [40, 80]   only judged near the budget
+      s=0                 —   NO decision rungs: runs to budget, always
+
+  **Bracket 0 gets an empty ladder** (not `[80]`), so its trials can never be
+  pruned. That subset is the hedge: if early-epoch loss is a bad predictor of
+  final loss for your sweep, some trials survive to prove it.
+
+  (The empty ladder is deliberate. A single rung *at* the budget would still cut
+  the bottom `m - ceil(m/eta)` trials at the exact moment they finished their
+  full budget — all the compute spent, then marked `pruned`, and the hedge
+  destroyed. An empty ladder routes through the `not rungs` branch in
+  `plan_successive_halving` and is structurally unprunable.)
+
+Bracket membership is **derived, never persisted** — a pure function of (trial
+index or params, cfg). Hyperband's assignment depends only on the trial's index,
+not on the set of trials, so appending trials to a sweep never moves the existing
+ones between brackets. Editing `min_steps`/`budget`/`eta` mid-sweep *does*
+re-partition the hyperband brackets wholesale (they change `s_max`); nothing is
+corrupted, since the planner is recomputed from scratch each tick, but a trial's
+existing `pruned` status may no longer be explicable by its current bracket.
 
 ## Statelessness, stickiness, liveness
 
@@ -72,17 +116,19 @@ deterministic and recomputation is reproducible/idempotent.
   has logged past the rung.
 """
 
+import functools
+import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 # Trial statuses that are out of the competition entirely: pruned is sticky;
 # failed/cancelled trials can no longer produce values or advance.
 _EXCLUDED_STATUSES = frozenset({"pruned", "failed", "cancelled"})
 
-# Statuses excluded from the cohort (the denominator that sets K = ceil(m/2)
+# Statuses excluded from the cohort (the denominator that sets K = ceil(m/eta)
 # and the `unreached` phantom count). Terminal trials plus `ready`: SH never
 # launches a never-submitted trial (starting trials is the user's job), so a
 # `ready` member could never arrive on its own — counting it would let a paused
@@ -127,6 +173,18 @@ class TrialState:
     index: int
     status: str
     stream: Sequence[dict] = ()
+    # The trial's swept parameter values. Only read for `bracket_by`; defaulted
+    # so callers that don't bracket (and the planner's own tests) can omit it.
+    params: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BracketSpec:
+    """How the field is partitioned into brackets (mirrors the YAML)."""
+
+    kind: str = "none"            # "none" | "params" | "hyperband"
+    keys: Tuple[str, ...] = ()    # params mode: the parameters to bracket on
+    seed: int = 0                 # hyperband mode: seeds the assignment
 
 
 @dataclass(frozen=True)
@@ -139,6 +197,18 @@ class SweepConfig:
     budget: int
     eta: int = 2
     mode: str = "sync"   # "sync" (conservative bracket) | "asha" (asynchronous)
+    bracket: BracketSpec = BracketSpec()
+
+
+@dataclass(frozen=True)
+class BracketInfo:
+    """One bracket: who is in it, and the ladder they are judged on."""
+
+    key: str              # stable identifier, e.g. "optimizer=adam" or "s=2"
+    label: str            # human-facing, e.g. "s=0 (hedge)"
+    rungs: List[int]      # this bracket's decision ladder; [] → never prunes
+    members: List[int]    # every trial index in the bracket
+    cohort: List[int]     # members still competing (not terminal, not `ready`)
 
 
 @dataclass(frozen=True)
@@ -147,7 +217,7 @@ class RungStanding:
 
     This is what `herd sh --reason` surfaces to explain *why* a trial was
     pruned/paused/kept: at the rung, the cohort has `cohort_size` members and
-    keeps the top `keep` (= ceil(cohort_size/2)); `ahead_definite` of them are
+    keeps the top `keep` (= ceil(cohort_size/eta)); `ahead_definite` of them are
     certainly ranked above this trial and `unreached` have not reached the rung
     yet (each could still turn out better). The verdict follows directly:
     PRUNE iff ``ahead_definite >= keep``; PROMOTE iff
@@ -158,7 +228,7 @@ class RungStanding:
     step: int             # rungs[rung] — the step threshold
     value: Optional[float]  # this trial's objective value at the rung
     cohort_size: int      # m — trials still competing at this rung
-    keep: int             # K = ceil(m/2) — how many survive
+    keep: int             # K = ceil(m/eta) — how many survive
     ahead_definite: int   # cohort members certainly ranked above this trial
     unreached: int        # cohort members not yet at the rung
 
@@ -170,11 +240,20 @@ class TrialAction:
     index: int
     action: Action
     verdict: Verdict
-    rung: Optional[int]   # decision rung index (None when not at a rung)
+    # Decision rung index (None when not at a rung). NOTE this is *relative to
+    # the trial's own bracket ladder* — under hyperband, rung 0 of bracket 1 is
+    # a different step than rung 0 of bracket 3. `standing.step` is the only
+    # cross-bracket-comparable figure.
+    rung: Optional[int]
     reason: str
     standing: Optional[RungStanding] = None  # cohort arithmetic (None off-rung)
     status: str = ""           # the trial's manifest status (for labelling)
     max_step: Optional[int] = None  # highest logged step (None if nothing logged)
+    bracket: Optional[str] = None   # bracket key (None when not bracketing)
+    # First step of this trial's ladder — None when its bracket has no decision
+    # rungs (the hyperband hedge), which is what lets callers explain an idle
+    # trial without reaching for a global ladder that may not apply to it.
+    first_rung_step: Optional[int] = None
 
 
 # --- pure helpers ----------------------------------------------------------
@@ -194,6 +273,167 @@ def rung_schedule(min_steps: int, budget: int, eta: int) -> List[int]:
         rungs.append(r)
         r *= eta
     return rungs
+
+
+def hyperband_sizes(s_max: int, eta: int) -> List[int]:
+    """Hyperband's per-bracket trial counts `n_s`, indexed by `s` (Li et al.).
+
+    ``n_s = ceil((s_max+1)/(s+1) * eta**s)`` — geometrically more trials in the
+    aggressive high-`s` brackets, fewest in the unpruned `s=0` hedge. We use them
+    as *proportions* to assign an already-fixed set of trials, not (as in the
+    paper) to decide how many configurations to sample.
+    """
+    return [
+        -(-((s_max + 1) * eta ** s) // (s + 1))  # integer ceil
+        for s in range(s_max + 1)
+    ]
+
+
+def hyperband_bracket(index: int, seed: int, s_max: int, eta: int) -> int:
+    """Assign trial `index` to a hyperband bracket, deterministically.
+
+    A pure function of (index, seed) — NOT of the set of trials. That matters:
+    `manifest.append_trials` hands new trials fresh indices, and the planner is
+    re-run from scratch every tick, so an assignment that depended on the field
+    (e.g. ranking all trials by hash and slicing by cumulative `n_s`) would move
+    existing trials between brackets — and thus between rung ladders — whenever
+    the sweep grew. A trial promoted last tick could be pruned this tick.
+    Hashing the index alone makes bracket membership stable for a trial's life.
+
+    The trade is that bracket sizes match `n_s` only in expectation, not exactly.
+    That is the right trade: exactness here buys nothing, and costs idempotence.
+    """
+    if s_max <= 0:
+        return 0
+    sizes = hyperband_sizes(s_max, eta)
+    total = sum(sizes)
+    digest = hashlib.sha1(f"{seed}:{index}".encode()).digest()
+    draw = int.from_bytes(digest[:8], "big") % total
+    cumulative = 0
+    for s, n in enumerate(sizes):
+        cumulative += n
+        if draw < cumulative:
+            return s
+    return s_max  # unreachable; guards against a rounding edge
+
+
+def _params_bracket_key(params: Mapping[str, Any], keys: Sequence[str]) -> str:
+    return ", ".join(f"{k}={params.get(k)!r}" for k in keys)
+
+
+def bracket_partition(
+    trials: Sequence[TrialState], cfg: SweepConfig
+) -> "Dict[str, BracketInfo]":
+    """Partition `trials` into brackets, each with its own rung ladder.
+
+    With no bracketing configured this returns a single bracket holding the whole
+    field on the global ladder — i.e. exactly the pre-bracketing behavior, which
+    is why the planner can treat the unbracketed case as a one-bracket special
+    case rather than a separate code path.
+    """
+    rungs = rung_schedule(cfg.min_steps, cfg.budget, cfg.eta)
+    spec = cfg.bracket or BracketSpec()
+
+    def _mk(key: str, label: str, ladder: List[int], members: List[int]) -> BracketInfo:
+        return BracketInfo(
+            key=key,
+            label=label,
+            rungs=ladder,
+            members=members,
+            cohort=[i for i in members if by_index[i].status not in _NON_COHORT_STATUSES],
+        )
+
+    by_index = {t.index: t for t in trials}
+    groups: Dict[str, List[int]] = {}
+
+    if spec.kind == "params" and spec.keys:
+        for t in trials:
+            groups.setdefault(_params_bracket_key(t.params, spec.keys), []).append(t.index)
+        # All param brackets share the global ladder — they differ in *who*
+        # competes, not in how aggressively.
+        return {k: _mk(k, k, list(rungs), sorted(v)) for k, v in sorted(groups.items())}
+
+    if spec.kind == "hyperband" and len(rungs) >= 2:
+        s_max = len(rungs) - 1
+        for t in trials:
+            s = hyperband_bracket(t.index, spec.seed, s_max, cfg.eta)
+            groups.setdefault(s, []).append(t.index)
+        out: Dict[str, BracketInfo] = {}
+        for s in sorted(groups):
+            # Bracket s judges on the top s+1 rungs — i.e. it starts at
+            # budget*eta^-s, exactly Hyperband's r_s. So s=s_max gets the full
+            # ladder (most aggressive) and s=1 only judges near the budget.
+            #
+            # s=0 would be a single rung AT the budget; we give it an EMPTY
+            # ladder instead. See the module docstring: a lone budget rung would
+            # still cut the bottom of the bracket the instant those trials
+            # finished their full budget — all the compute spent, then marked
+            # `pruned`. Empty means structurally unprunable, which is the point.
+            ladder = list(rungs[s_max - s:]) if s else []
+            label = f"s={s} (hedge, never pruned)" if s == 0 else f"s={s}"
+            out[f"s={s}"] = _mk(f"s={s}", label, ladder, sorted(groups[s]))
+        return out
+
+    # No bracketing: one bracket, the whole field, the global ladder.
+    return {"all": _mk("all", "all", list(rungs), sorted(by_index))}
+
+
+def bracket_can_prune(b: BracketInfo, cfg: SweepConfig) -> bool:
+    """Whether `b` is capable of pruning anyone, ever.
+
+    False for the hyperband hedge (no rungs) and for brackets whose cohort is
+    too small for the scheduler's keep rule to ever cut someone: sync needs >= 2
+    (K = ceil(m/eta) >= 1, and the leader is never pruned), asha needs >= eta
+    (below that its `n < eta → keep all` gate fires).
+    """
+    if not b.rungs:
+        return False
+    m = len(b.cohort)
+    return m >= cfg.eta if cfg.mode == "asha" else m >= 2
+
+
+def bracket_warnings(
+    brackets: Mapping[str, BracketInfo], cfg: SweepConfig
+) -> List[str]:
+    """Warn when bracketing has sliced the field too finely to ever prune.
+
+    The failure this exists to catch is silent: `bracket_by` on a continuous
+    parameter puts every trial in its own bracket, every cohort is a singleton,
+    nothing is ever pruned, and SH looks like it's working while doing nothing.
+    """
+    spec = cfg.bracket or BracketSpec()
+    if spec.kind == "none":
+        return []
+
+    # The hedge is *supposed* to never prune — excluding it keeps the warning
+    # about genuinely degenerate brackets rather than the one we designed.
+    judged = [b for b in brackets.values() if b.rungs]
+    if not judged:
+        return []
+    dead = [b for b in judged if not bracket_can_prune(b, cfg)]
+    if not dead:
+        return []
+
+    sizes: Dict[int, int] = {}
+    for b in judged:
+        sizes[len(b.cohort)] = sizes.get(len(b.cohort), 0) + 1
+    need = (f"asha needs >= eta={cfg.eta} trials per bracket"
+            if cfg.mode == "asha" else "sync needs >= 2 trials per bracket")
+    origin = (f"bracket_by {list(spec.keys)}" if spec.kind == "params"
+              else f"hyperband (seed={spec.seed})")
+
+    if len(dead) == len(judged):
+        return [
+            f"{origin} produced {len(judged)} bracket(s) with cohort sizes "
+            f"{dict(sorted(sizes.items()))}; none of them can prune ({need}). "
+            f"Successive halving is a no-op. Bracket on a coarser-grained "
+            f"parameter, or drop bracketing."
+        ]
+    return [
+        f"{origin}: {len(dead)} of {len(judged)} bracket(s) can never prune "
+        f"({need}); cohort sizes {dict(sorted(sizes.items()))}. Those trials "
+        f"will run to budget regardless of their metric."
+    ]
 
 
 def dedup_stream(stream: Sequence[dict]) -> Dict[int, float]:
@@ -278,6 +518,7 @@ def _rung_verdict(
     vals: Dict[int, Dict[int, float]],
     reached: Dict[int, int],
     direction: str,
+    eta: int,
 ) -> tuple:
     """PRUNE / PROMOTE / PAUSE for a trial that has reached `rung_idx`.
 
@@ -287,7 +528,11 @@ def _rung_verdict(
     callers (e.g. `herd sh --reason`) can explain the decision.
     """
     m = len(cohort)
-    K = (m + 1) // 2  # ceil(m/2)
+    # Keep the top 1/eta of the cohort, matching the rung ladder's eta spacing
+    # (and ASHA's floor(n/eta)). Integer ceil — math.ceil(m/eta) would round
+    # wrong once m/eta exceeds float precision. K >= 1 for all m >= 1, eta >= 2,
+    # which is what guarantees a cohort's leader is never pruned.
+    K = -(-m // eta)  # ceil(m/eta)
     nv_idx = _normalize(vals[idx][rung_idx], direction)
 
     ahead_definite = 0
@@ -355,60 +600,97 @@ def plan_successive_halving(
       have *arrived* and keep the top ``floor(n/eta)`` (all of them while fewer
       than ``eta`` have arrived). Never waits; accepts the occasional early-stop
       mistake in exchange for always making progress.
+
+    Both run **per bracket** (see the module docstring). With no bracketing
+    that's a single bracket holding the whole field, so the unbracketed case is
+    just the one-bracket case rather than a separate path.
     """
-    rungs = rung_schedule(cfg.min_steps, cfg.budget, cfg.eta)
-    reached, vals, max_steps = _precompute(trials, rungs)
+    brackets = bracket_partition(trials, cfg)
+    by_index = {t.index: t for t in trials}
 
-    # Cohort pool: everything that can still compete. Excludes terminal trials
-    # (pruned/failed/cancelled) and `ready` (never-launched — SH won't start it,
-    # so it can't arrive). `completed` trials stay in — they are full results and
-    # remain valid competitors at every rung they reached.
-    pool = [t.index for t in trials if t.status not in _NON_COHORT_STATUSES]
+    # `reached` is an index into the *bracket's own* ladder, so everything
+    # downstream of it has to be computed per bracket — under hyperband, two
+    # trials at the same step can sit at different rung indices.
+    reached: Dict[int, int] = {}
+    vals: Dict[int, Dict[int, float]] = {}
+    max_steps: Dict[int, Optional[int]] = {}
+    rungs_of: Dict[int, List[int]] = {}
+    bracket_of: Dict[int, str] = {}
+    decided: Dict[int, tuple] = {}
 
-    # Algorithm-specific: decide (verdict, decision_rung, standing) for every
-    # pool trial that has reached at least rung 0. Off-rung/excluded trials are
-    # handled uniformly by the emit loop below.
-    if cfg.mode == "asha":
-        decided = _decide_asha(pool, rungs, vals, reached, cfg)
-    else:
-        decided = _decide_sync(pool, rungs, vals, reached, cfg)
+    for b in brackets.values():
+        members = [by_index[i] for i in b.members]
+        r, v, ms = _precompute(members, b.rungs)
+        reached.update(r)
+        vals.update(v)
+        max_steps.update(ms)
+        for i in b.members:
+            rungs_of[i] = b.rungs
+            bracket_of[i] = b.key
+
+        # Cohort pool: everything in this bracket that can still compete.
+        # Excludes terminal trials (pruned/failed/cancelled) and `ready`
+        # (never-launched — SH won't start it, so it can't arrive). `completed`
+        # trials stay in — they are full results and remain valid competitors at
+        # every rung they reached.
+        pool = b.cohort
+
+        # Algorithm-specific: decide (verdict, decision_rung, standing) for every
+        # pool trial that has reached at least rung 0. Off-rung/excluded trials
+        # are handled uniformly by the emit loop below.
+        if cfg.mode == "asha":
+            decided.update(_decide_asha(pool, b.rungs, vals, reached, cfg))
+        else:
+            decided.update(_decide_sync(pool, b.rungs, vals, reached, cfg))
+
+    bracketed = (cfg.bracket or BracketSpec()).kind != "none"
 
     actions: List[TrialAction] = []
     for t in trials:
         idx, status = t.index, t.status
         rj = reached[idx]
         ms = max_steps.get(idx)
+        rungs = rungs_of[idx]
+        bkt = bracket_of[idx] if bracketed else None
+        first_step = rungs[0] if rungs else None
+
+        emit = functools.partial(
+            _action, idx, status, bracket=bkt, first_rung_step=first_step,
+            max_step=ms)
 
         if status in _EXCLUDED_STATUSES:
-            actions.append(_action(idx, status, Verdict.NONE, None,
-                                   f"{status}: excluded from SH", max_step=ms))
+            actions.append(emit(Verdict.NONE, None, f"{status}: excluded from SH"))
             continue
 
         if status == "ready":
             # Never-launched and out of the cohort: SH doesn't start trials
             # (the user's job), so there is nothing to decide here.
-            actions.append(_action(idx, status, Verdict.NOT_AT_RUNG, None,
-                                   "not launched — SH never launches trials",
-                                   max_step=ms))
+            actions.append(emit(Verdict.NOT_AT_RUNG, None,
+                                "not launched — SH never launches trials"))
             continue
 
         if not rungs:
-            # No rungs (min_steps > budget): SH never prunes.
-            actions.append(_action(idx, status, Verdict.NOT_AT_RUNG, None,
-                                   "no rung schedule (min_steps > budget)",
-                                   max_step=ms))
+            # No decision rungs. Either this is the hyperband hedge bracket,
+            # which is *designed* to be unprunable — its trials run to budget no
+            # matter what their metric does — or there is no ladder at all
+            # (min_steps > budget), in which case SH never prunes anyone.
+            # Verdict.NOT_AT_RUNG → Action.NONE, forever.
+            hedge = (cfg.bracket or BracketSpec()).kind == "hyperband"
+            why = ("bracket has no decision rungs — runs to budget (hyperband hedge)"
+                   if hedge else "no rung schedule (min_steps > budget)")
+            actions.append(emit(Verdict.NOT_AT_RUNG, None, why))
             continue
 
         if rj < 0:
-            actions.append(_action(
-                idx, status, Verdict.NOT_AT_RUNG, None,
-                f"still training toward rung 0 (step {rungs[0]})", max_step=ms))
+            actions.append(emit(
+                Verdict.NOT_AT_RUNG, None,
+                f"still training toward rung 0 (step {rungs[0]})"))
             continue
 
         verdict, decision_rung, standing = decided[idx]
-        actions.append(_action(idx, status, verdict, decision_rung,
-                               _reason(verdict, decision_rung, rungs),
-                               standing, max_step=ms))
+        actions.append(emit(verdict, decision_rung,
+                            _reason(verdict, decision_rung, rungs),
+                            standing=standing))
 
     return actions
 
@@ -433,7 +715,7 @@ def _decide_sync(pool, rungs, vals, reached, cfg):
         for idx in C:
             if reached[idx] >= k:
                 v, standing = _rung_verdict(
-                    idx, C, k, rungs, vals, reached, cfg.direction)
+                    idx, C, k, rungs, vals, reached, cfg.direction, cfg.eta)
                 rung_standings[(idx, k)] = standing
                 if v == Verdict.PROMOTE:
                     promoted.append(idx)
@@ -532,7 +814,7 @@ def verdict_to_action(status: str, verdict: Verdict) -> Action:
         return Action.NONE  # PROMOTE / RUN_FREE / NOT_AT_RUNG → keep running
     if status == "paused":
         if verdict in (Verdict.PROMOTE, Verdict.RUN_FREE):
-            return Action.SUBMIT  # provably top-half → resume
+            return Action.SUBMIT  # provably above the cut → resume
         if verdict == Verdict.PRUNE:
             return Action.PRUNE
         return Action.NONE  # still ambiguous → stay paused
@@ -541,7 +823,8 @@ def verdict_to_action(status: str, verdict: Verdict) -> Action:
 
 def _action(idx: int, status: str, verdict: Verdict, rung: Optional[int],
             reason: str, standing: Optional[RungStanding] = None,
-            max_step: Optional[int] = None) -> TrialAction:
+            max_step: Optional[int] = None, bracket: Optional[str] = None,
+            first_rung_step: Optional[int] = None) -> TrialAction:
     return TrialAction(
         index=idx,
         action=verdict_to_action(status, verdict),
@@ -551,6 +834,8 @@ def _action(idx: int, status: str, verdict: Verdict, rung: Optional[int],
         standing=standing,
         status=status,
         max_step=max_step,
+        bracket=bracket,
+        first_rung_step=first_rung_step,
     )
 
 
@@ -561,8 +846,8 @@ def _reason(verdict: Verdict, rung: Optional[int], rungs: Sequence[int]) -> str:
         step = rungs[rung] if rung < len(rungs) else None
     at = f" at rung {rung} (step {step})" if step is not None else ""
     return {
-        Verdict.PROMOTE: f"top-half{at}",
-        Verdict.PRUNE: f"bottom-half{at}",
+        Verdict.PROMOTE: f"above the cut{at}",
+        Verdict.PRUNE: f"below the cut{at}",
         Verdict.PAUSE: f"undecidable{at} — pausing until field catches up",
         Verdict.RUN_FREE: f"cleared final rung{at} — running to budget",
         Verdict.NOT_AT_RUNG: "not yet at a rung",
@@ -631,11 +916,11 @@ def explain(ta: TrialAction) -> str:
     head = f"cohort of {s.cohort_size}, keep top {s.keep}: "
     if ta.verdict == Verdict.PRUNE:
         return (head + f"{s.ahead_definite} trial(s) already ranked ahead "
-                f"(≥ {s.keep}) → bottom half")
+                f"(≥ {s.keep}) → below the cut")
     if ta.verdict in (Verdict.PROMOTE, Verdict.RUN_FREE):
         tail = " (final rung → run to budget)" if ta.verdict == Verdict.RUN_FREE else ""
         return (head + f"{s.ahead_definite} ahead + {s.unreached} not yet at rung "
-                f"< {s.keep} → top half{tail}")
+                f"< {s.keep} → survives the cut{tail}")
     if ta.verdict == Verdict.PAUSE:
         return (head + f"{s.ahead_definite} ahead, {s.unreached} not yet at this "
                 f"rung → can't decide until the field catches up")

@@ -164,14 +164,61 @@ class TestTieBreak(unittest.TestCase):
         self.assertEqual(v[3], Verdict.PRUNE)
 
 
+class TestKeepFraction(unittest.TestCase):
+    """Sync keeps the top ceil(m/eta) of the cohort — not a hardcoded half.
+
+    `eta` sets both the rung spacing and the survival rate; if the two disagree
+    (the old `K = ceil(m/2)` regardless of eta) the surviving field grows faster
+    than the ladder shrinks it and the sweep blows past `budget`.
+    """
+
+    def _prune_count(self, m, eta):
+        # m trials, distinct values 0..m-1 (idx i has value i, so idx 0 is best).
+        # min_steps=1, budget=1 → a single rung, so this measures exactly one cut.
+        cfg = _cfg(min_steps=1, budget=1, eta=eta)
+        trials = [
+            TrialState(i, "running", _stream((0, float(i)), (1, float(i))))
+            for i in range(m)
+        ]
+        plan = plan_successive_halving(trials, cfg)
+        return sum(1 for p in plan if p.action == Action.PRUNE)
+
+    def test_eta_2_keeps_half(self):
+        # Unchanged from the old hardcoded behavior — eta=2 is the default, so
+        # this is the back-compat guard.
+        self.assertEqual(self._prune_count(4, eta=2), 2)   # keep ceil(4/2)=2
+        self.assertEqual(self._prune_count(5, eta=2), 2)   # keep ceil(5/2)=3
+
+    def test_eta_3_keeps_a_third(self):
+        self.assertEqual(self._prune_count(3, eta=3), 2)   # keep ceil(3/3)=1
+        self.assertEqual(self._prune_count(9, eta=3), 6)   # keep ceil(9/3)=3
+
+    def test_eta_4_keeps_a_quarter(self):
+        self.assertEqual(self._prune_count(5, eta=4), 3)   # keep ceil(5/4)=2
+        self.assertEqual(self._prune_count(8, eta=4), 6)   # keep ceil(8/4)=2
+
+    def test_keep_reported_in_standing(self):
+        cfg = _cfg(min_steps=1, budget=1, eta=3)
+        trials = [
+            TrialState(i, "running", _stream((0, float(i)), (1, float(i))))
+            for i in range(6)
+        ]
+        plan = _by_index(plan_successive_halving(trials, cfg))
+        self.assertEqual(plan[0].standing.keep, 2)          # ceil(6/3)
+        self.assertEqual(plan[0].standing.cohort_size, 6)
+
+
 class TestLastSurvivorNeverPruned(unittest.TestCase):
     """The field can never be pruned to zero.
 
-    For a cohort of size m, K = ceil(m/2) >= 1 and PRUNE requires
-    ahead_definite >= K. The cohort leader (best objective, ties broken by
-    smallest index) always has ahead_definite == 0, so 0 >= K is never true:
+    For a cohort of size m, K = ceil(m/eta) >= 1 (for any eta >= 2) and PRUNE
+    requires ahead_definite >= K. The cohort leader (best objective, ties broken
+    by smallest index) always has ahead_definite == 0, so 0 >= K is never true:
     every non-empty cohort promotes at least one trial, and a singleton
     always promotes. These pin that guarantee against regressions.
+
+    This matters far more once bracketing lands: brackets shrink cohorts, so the
+    small-m path stops being an edge case and becomes the common one.
     """
 
     def test_single_running_trial_with_terrible_metric_not_pruned(self):
@@ -204,19 +251,23 @@ class TestLastSurvivorNeverPruned(unittest.TestCase):
         self.assertIn(p.verdict, (Verdict.PROMOTE, Verdict.RUN_FREE))
 
     def test_never_prunes_whole_cohort(self):
-        # Exhaustive small-field check: across cohort sizes and value
-        # orderings, at least one trial always survives each tick.
+        # Exhaustive small-field check: across cohort sizes, value orderings and
+        # reduction factors, at least one trial always survives each tick.
         import itertools
-        cfg = _cfg(min_steps=1, budget=8)
-        for m in range(1, 7):
-            for vals in itertools.permutations(range(m)):
-                trials = [
-                    TrialState(i, "running", _stream(*[(s, float(v)) for s in range(9)]))
-                    for i, v in enumerate(vals)
-                ]
-                plan = plan_successive_halving(trials, cfg)
-                pruned = sum(1 for p in plan if p.action == Action.PRUNE)
-                self.assertLess(pruned, m, f"all {m} pruned for values {vals}")
+        for eta in (2, 3, 4):
+            cfg = _cfg(min_steps=1, budget=8, eta=eta)
+            for m in range(1, 7):
+                for vals in itertools.permutations(range(m)):
+                    trials = [
+                        TrialState(i, "running",
+                                   _stream(*[(s, float(v)) for s in range(9)]))
+                        for i, v in enumerate(vals)
+                    ]
+                    plan = plan_successive_halving(trials, cfg)
+                    pruned = sum(1 for p in plan if p.action == Action.PRUNE)
+                    self.assertLess(
+                        pruned, m,
+                        f"all {m} pruned for values {vals} at eta={eta}")
 
 
 class TestAmbiguityAndPause(unittest.TestCase):

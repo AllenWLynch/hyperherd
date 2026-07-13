@@ -287,6 +287,23 @@ class McpServerConfig(BaseModel):
     expands these from its own environment at startup."""
 
 
+class Hyperband(BaseModel):
+    """Random bracketing (Hyperband, Li et al. 2018).
+
+    Hedges against pruning bias when you don't know *which* hparams change the
+    training dynamics. Trials are assigned deterministically to brackets `s`;
+    bracket `s` uses only the top `s+1` rungs of the ladder, so higher brackets
+    prune aggressively from an early rung and bracket 0 has no decision rungs at
+    all — its trials always run to `budget`. That guaranteed-unpruned subset is
+    the hedge: if early-epoch loss is a bad predictor of final loss for your
+    sweep, some trials survive to prove it.
+    """
+
+    seed: int = 0
+    """Seeds the (deterministic) trial→bracket assignment. Change it to reshuffle
+    which trials land in the unpruned hedge."""
+
+
 class SuccessiveHalving(BaseModel):
     """Successive-halving pruning parameters for a sweep.
 
@@ -294,6 +311,10 @@ class SuccessiveHalving(BaseModel):
     (`min_steps`, `min_steps*eta`, ... up to `budget`). At each rung the better
     fraction of the field is kept and the rest is pruned. `mode` chooses how that
     cut is made — see `hyperherd/successive_halving.py`.
+
+    By default every trial competes against every other. That is only fair when
+    they share training dynamics; `bracket_by` / `hyperband` partition the field
+    when they don't.
     """
 
     metric: str
@@ -311,8 +332,9 @@ class SuccessiveHalving(BaseModel):
     """Total/maximum steps a trial runs to. The rung ladder stops at `budget`."""
 
     eta: int = Field(default=2, ge=2)
-    """Reduction factor. `eta=2` keeps the better half at each rung; rungs are
-    spaced by powers of `eta`."""
+    """Reduction factor. Sets both the rung spacing (rungs are powers of `eta`)
+    and the survival rate: each rung keeps the top `1/eta` of the cohort. `eta=2`
+    (the default) keeps the better half; `eta=3` keeps the top third."""
 
     mode: Literal["sync", "asha"] = "sync"
     """Scheduler. `sync` (default): the conservative bracket — pauses undecidable
@@ -321,6 +343,23 @@ class SuccessiveHalving(BaseModel):
     rung rank only the trials that have arrived and keep the top `1/eta`; never
     waits, so it suits fields launched/relaunched over time."""
 
+    bracket_by: Optional[List[str]] = None
+    """Sweep parameter names to bracket on. Trials are only ever compared against
+    other trials with the *same* values for these parameters.
+
+    Use it for hparams that change the shape of the loss curve rather than just
+    its quality — parameter count, regularization strength, optimizer. Without
+    it, a large model that is merely slow to warm up gets pruned by a small one
+    that converges fast and plateaus early.
+
+    Bracket on coarse-grained parameters: bracketing on a continuous parameter
+    typically puts every trial in its own bracket, which makes pruning a no-op
+    (`herd sh` warns when that happens). Mutually exclusive with `hyperband`."""
+
+    hyperband: Optional[Hyperband] = None
+    """Random bracketing — the hedge for when you don't know which parameters
+    change the dynamics. Mutually exclusive with `bracket_by`."""
+
     @model_validator(mode="after")
     def _check_budget(self):
         if self.min_steps > self.budget:
@@ -328,6 +367,42 @@ class SuccessiveHalving(BaseModel):
                 f"successive_halving.min_steps ({self.min_steps}) must be "
                 f"<= budget ({self.budget})"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_bracketing(self):
+        if self.bracket_by is not None and self.hyperband is not None:
+            raise ValueError(
+                "successive_halving: set either `bracket_by` or `hyperband`, not "
+                "both. They are two answers to the same question (which trials "
+                "are comparable?); combining them multiplies the brackets "
+                "together and leaves cohorts too small to prune."
+            )
+        if self.bracket_by is not None:
+            if not self.bracket_by:
+                raise ValueError(
+                    "successive_halving.bracket_by is empty — omit it to compare "
+                    "every trial against every other."
+                )
+            dupes = {n for n in self.bracket_by if self.bracket_by.count(n) > 1}
+            if dupes:
+                raise ValueError(
+                    f"successive_halving.bracket_by has duplicate name(s): "
+                    f"{sorted(dupes)}"
+                )
+        if self.hyperband is not None:
+            # Imported lazily to keep the import graph one-directional
+            # (successive_halving imports nothing from hyperherd) — same pattern
+            # as the `hyperherd.expr` import in _validate_grid_and_defaults.
+            from hyperherd.successive_halving import rung_schedule
+            rungs = rung_schedule(self.min_steps, self.budget, self.eta)
+            if len(rungs) < 2:
+                raise ValueError(
+                    f"successive_halving.hyperband needs at least 2 rungs to "
+                    f"build brackets from, but min_steps={self.min_steps}, "
+                    f"budget={self.budget}, eta={self.eta} yields {rungs}. "
+                    f"Lower min_steps or raise budget."
+                )
         return self
 
 
@@ -531,6 +606,27 @@ class Config(BaseModel):
             # Note: `set` keys are arbitrary Hydra paths and intentionally not
             # validated against `parameters` — that's the whole point.
 
+        return self
+
+    @model_validator(mode="after")
+    def _validate_bracket_by_names(self):
+        """`bracket_by` names must be sweep parameters.
+
+        Lives on Config, not SuccessiveHalving: only Config can see `parameters`.
+        Bracketing on a key the sweep doesn't vary would put every trial in one
+        bracket — a silent no-op rather than an error.
+        """
+        sh = self.successive_halving
+        if sh is None or not sh.bracket_by:
+            return self
+        unknown = [n for n in sh.bracket_by if n not in self.parameters]
+        if unknown:
+            raise ValueError(
+                f"successive_halving.bracket_by references unknown parameter(s) "
+                f"{unknown}. It must name sweep parameters (one of "
+                f"{sorted(self.parameters)}) — bracketing only makes sense on a "
+                f"value that actually varies across trials."
+            )
         return self
 
     def get_param(self, name: str) -> ParameterSpec:
