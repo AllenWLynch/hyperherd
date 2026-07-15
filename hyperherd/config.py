@@ -406,6 +406,48 @@ class SuccessiveHalving(BaseModel):
         return self
 
 
+class DerivedSpec(BaseModel):
+    """A trial derived from a confirmed-good base trial, plus extra overrides.
+
+    Mints a NEW trial — fresh index, its own experiment_name and checkpoint —
+    that inherits the base trial's swept params and folds in `overrides`. Lets
+    you extend a config that already trained well (e.g. add an ablation flag)
+    without cloning the workspace or perturbing the grid, so the existing sweep's
+    results and trial identities are left untouched.
+
+    The base is identified by `from`: its trial index in this sweep's grid (the
+    same index `herd status` shows for an unmodified sweep). `overrides` are
+    Hydra `key: value` pairs applied on top of the base config; they need NOT be
+    swept parameters — a non-swept flag like `strip_functional_tags: true` is
+    the whole point. Because the derivation becomes part of the trial's identity
+    hash, the variant reconciles deterministically and survives `herd run`.
+    """
+
+    from_index: int = Field(alias="from", ge=0)
+    overrides: Dict[str, Any] = Field(min_length=1)
+
+    # Accept both `from` (the YAML spelling) and `from_index` (the Python name).
+    model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def _validate_override_tokens(self):
+        for key, value in self.overrides.items():
+            if not key or any(c.isspace() for c in key) or "=" in key:
+                raise ValueError(
+                    f"derived override key {key!r} is invalid: override keys "
+                    f"must be non-empty and contain no whitespace or '='"
+                )
+            # The launcher receives the override string as one shell word and
+            # splits it on whitespace, so a space inside a value would silently
+            # become two overrides.
+            if isinstance(value, str) and any(c.isspace() for c in value):
+                raise ValueError(
+                    f"derived override {key}={value!r} has whitespace in its "
+                    f"value; the launcher splits overrides on whitespace"
+                )
+        return self
+
+
 class Config(BaseModel):
     name: str
     workspace: str = ""  # set by load_config from the config file's directory
@@ -433,6 +475,13 @@ class Config(BaseModel):
         default_factory=list,
         validation_alias=AliasChoices("conditions", "constraints"),
     )
+
+    derived: List[DerivedSpec] = Field(default_factory=list)
+    """Trials derived from confirmed-good base grid trials plus extra overrides.
+    Each mints a new trial that inherits a base trial's params and folds in the
+    overrides, with its own name and checkpoint. Additive (the base grid is
+    untouched) and reconcile-stable, so a working sweep can be extended in place
+    rather than cloned. See `DerivedSpec`."""
 
     successive_halving: Optional[SuccessiveHalving] = None
 

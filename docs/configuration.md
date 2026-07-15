@@ -14,6 +14,7 @@ The configuration file is YAML. Every field is documented below with its type, w
 | `discord`     | object | no       | *unset*  | Discord channel for the [`herd monitor`](monitor.md) daemon. See [discord](#discord). |
 | `parameters`  | object | **yes**  | —       | Hyperparameter definitions. At least one parameter is required. See [parameters](#parameters). |
 | `conditions`  | list   | no       | `[]`    | Conditional rules that filter or modify parameter combinations. See [Conditions](conditions.md). |
+| `derived`     | list   | no       | `[]`    | Trials derived from confirmed-good base trials plus extra overrides. See [derived](#derived). |
 | `successive_halving` | object | no | *unset* | Successive-halving pruning parameters for [`herd sh`](commands.md#herd-sh). See [below](#successive-halving-pruning). |
 
 The **workspace** is the directory containing `hyperherd.yaml`. HyperHerd stores its state in a `.hyperherd/` subdirectory within the workspace.
@@ -126,6 +127,27 @@ Four environment variables are also exported in the SLURM script:
 - `HYPERHERD_TRIAL_NAME` — the auto-generated per-trial identifier (e.g. `lr-0.001_opt-adam_bs-64`)
 
 Use these for output directories, wandb run names, logging paths, and the [`log_result()` API](results.md).
+
+## `derived`
+
+Extend a config that already trained well **in place**, without cloning the workspace (which forks the config lineage and invites drift). Each entry mints a **new** trial that inherits a base grid trial's swept params and folds in extra overrides — with its own trial index, `experiment_name`, and checkpoint. The base grid is untouched, and the variants reconcile deterministically, so they survive later `herd run`s instead of being orphaned.
+
+```yaml
+derived:
+  - from: 70                                  # base trial's grid index (as `herd status` shows)
+    overrides: {strip_functional_tags: true}  # Hydra key: value, need NOT be a swept param
+  - from: 70
+    overrides: {chunked: true}
+```
+
+Given a base trial named `lr-0.001_wd-0.1`, these append two trials named `lr-0.001_wd-0.1_ov_strip_functional_tags-true` and `lr-0.001_wd-0.1_ov_chunked-true`. The overrides are added to each variant's override string (last, so they win) and are part of the trial's identity — so a variant never shares the base trial's checkpoint.
+
+Launch the new trials with their indices, e.g. `herd run <ws> 71,72` (check `herd status` for the assigned indices first).
+
+Notes:
+- `from` is the base trial's index in this sweep's grid — stable as long as the grid definition doesn't change. Editing the grid can shift indices; re-check before adding derivations.
+- Unlike `conditions`, `derived` **adds** trials rather than filtering/modifying the grid. A derivation whose override shadows a swept parameter still appends a distinct trial (it does not move the base).
+- `herd res` attributes a derived trial to its base params; the override lives in the trial's `extras`, not as a swept-param column.
 
 ## `parameters`
 

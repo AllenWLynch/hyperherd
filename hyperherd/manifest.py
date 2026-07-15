@@ -183,6 +183,26 @@ def trial_hash(params: Dict[str, Any], extras: Optional[Dict[str, Any]] = None) 
     return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 
+def _derived_name_suffix(
+    derived_overrides: Optional[Dict[str, Any]],
+    abbrevs: Dict[str, str],
+) -> str:
+    """Name suffix distinguishing a `derived:` trial from its base grid trial.
+
+    Mirrors the `_ov_` convention `experiment_name_for` uses for swept-param
+    overrides, so a derivation reads `<base>_ov_<key>-<value>`. Without it a
+    derived trial (identical base params, its override living in `extras`) would
+    share the base trial's experiment_name and clobber its checkpoint.
+    """
+    if not derived_overrides:
+        return ""
+    parts = [
+        f"{abbrevs.get(k, k)}-{_override_token(v)}"
+        for k, v in derived_overrides.items()
+    ]
+    return "_ov_" + "_".join(parts)
+
+
 def _trial_record(
     index: int,
     params: Dict[str, Any],
@@ -190,8 +210,14 @@ def _trial_record(
     abbrevs: Dict[str, str],
     labels: Optional[Dict[str, Dict[Any, str]]],
     overrides: Optional[Dict[str, str]] = None,
+    name_suffix: str = "",
 ) -> dict:
     overrides = overrides or {}
+    experiment_name = experiment_name_for(params, overrides, abbrevs, labels)
+    # A `derived:` trial shares its base's params (and thus base name); the
+    # suffix keeps its output path distinct. See `_derived_name_suffix`.
+    if name_suffix:
+        experiment_name = f"{experiment_name}{name_suffix}"
     return {
         "index": index,
         # NOTE: `overrides` is deliberately NOT hashed. The hash is the trial's
@@ -203,7 +229,7 @@ def _trial_record(
         "params": params,
         "extras": extras,
         "overrides": overrides,
-        "experiment_name": experiment_name_for(params, overrides, abbrevs, labels),
+        "experiment_name": experiment_name,
         "status": "ready",
     }
 
@@ -226,10 +252,15 @@ def create_manifest(
         if isinstance(item, Trial):
             params = item.params
             extras = item.extras
+            derived = item.derived_overrides
         else:
             params = item
             extras = {}
-        records.append(_trial_record(i, params, extras, abbrevs, labels))
+            derived = {}
+        suffix = _derived_name_suffix(derived, abbrevs)
+        records.append(
+            _trial_record(i, params, extras, abbrevs, labels, name_suffix=suffix)
+        )
     _write_manifest(base, records)
     return records
 
@@ -315,7 +346,15 @@ def append_trials(
     existing = load_manifest(base)
     next_idx = _next_index(base, existing)
     for combo in new_combos:
-        existing.append(_trial_record(next_idx, combo.params, combo.extras, abbrevs, labels))
+        suffix = _derived_name_suffix(
+            getattr(combo, "derived_overrides", None), abbrevs
+        )
+        existing.append(
+            _trial_record(
+                next_idx, combo.params, combo.extras, abbrevs, labels,
+                name_suffix=suffix,
+            )
+        )
         next_idx += 1
     _write_manifest(base, existing)
     return existing

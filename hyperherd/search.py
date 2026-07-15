@@ -40,6 +40,21 @@ def _values_equal(a: Any, b: Any) -> bool:
     return a == b
 
 
+def build_trials(config: Config) -> List[Any]:
+    """The full trial list for a sweep: grid → constraints → derived.
+
+    Single source of truth so every path — launch, reconcile, `herd test`, and
+    the agent's sweep-shape reporting — sees the same trials, including any
+    config-declared `derived:` variants. Returns a list of `constraints.Trial`.
+    """
+    # Lazy import to keep search's module-level imports free of constraints
+    # (which imports config); matches the lazy-import pattern used elsewhere.
+    from hyperherd.constraints import apply_constraints, apply_derived
+
+    combos = apply_constraints(generate_combinations(config), config.conditions)
+    return apply_derived(combos, config.derived, config.abbrevs)
+
+
 def generate_combinations(config: Config) -> List[Dict[str, Any]]:
     """Generate parameter combinations based on the grid config.
 

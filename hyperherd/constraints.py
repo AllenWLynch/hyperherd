@@ -4,23 +4,28 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
-from hyperherd.config import Constraint
+from hyperherd.config import Constraint, DerivedSpec
 from hyperherd.expr import eval_expr, sanitized_namespace
 
 
 @dataclass
 class Trial:
-    """A parameter combination plus any constraint-injected extra Hydra overrides.
+    """A parameter combination plus any injected extra Hydra overrides.
 
     `params` are the swept parameter values (subject to dedup).
     `extras` are arbitrary Hydra overrides accumulated from constraint `set`
-    blocks. Keys are Hydra paths (not parameter names) and never participate
-    in dedup — two trials with identical `params` are guaranteed to receive
-    identical `extras` because `extras` is a deterministic function of
-    `params` and the constraint list.
+    blocks (and `derived:` overrides). Keys are Hydra paths (not parameter
+    names). For grid/constraint trials two identical `params` are guaranteed
+    identical `extras` (a deterministic function of `params` and the constraint
+    list), so they never participate in dedup.
+    `derived_overrides` is the subset of `extras` that came from a `derived:`
+    spec. It's carried separately so the manifest can give the variant a
+    distinct name (constraint extras deliberately do NOT rename a trial). It is
+    empty for ordinary grid/constraint trials.
     """
     params: Dict[str, Any]
     extras: Dict[str, Any] = field(default_factory=dict)
+    derived_overrides: Dict[str, Any] = field(default_factory=dict)
 
 
 def _floats_close(a: Any, b: Any) -> bool:
@@ -162,6 +167,51 @@ def apply_constraints(
         deduped.append(trial)
 
     return deduped
+
+
+def apply_derived(
+    trials: List[Trial],
+    derived: List[DerivedSpec],
+    abbrevs: Dict[str, str] = None,
+) -> List[Trial]:
+    """Append config-declared derived trials to the base grid.
+
+    Each `derived:` spec mints one new Trial that inherits its base grid trial's
+    params and folds the spec's `overrides` into `extras` — so the derivation is
+    part of the trial's identity hash (distinct from the base) and is emitted to
+    the launcher by `resolve_overrides`, exactly like a constraint `set`. The
+    overrides are also recorded in `derived_overrides` so the manifest can give
+    the variant a distinct name.
+
+    `from` references the base grid by index; derived trials are appended after
+    the base grid and never reference one another, so a base is always an
+    ordinary grid/constraint trial. Runs AFTER dedup, so a derivation is never
+    collapsed into its base even though they share `params`.
+    """
+    if not derived:
+        return trials
+    base_grid = list(trials)
+    n = len(base_grid)
+    result = list(trials)
+    for spec in derived:
+        if spec.from_index >= n:
+            raise ValueError(
+                f"derived.from={spec.from_index} is out of range: the grid has "
+                f"{n} trial(s) (valid indices 0-{n - 1})"
+            )
+        base = base_grid[spec.from_index]
+        extras = dict(base.extras)
+        # Derivation overrides win over any constraint-injected extra on the
+        # same key — the whole point is to change the base config.
+        extras.update(spec.overrides)
+        result.append(
+            Trial(
+                params=dict(base.params),
+                extras=extras,
+                derived_overrides=dict(spec.overrides),
+            )
+        )
+    return result
 
 
 def _combo_key(combo: Dict[str, Any]) -> str:

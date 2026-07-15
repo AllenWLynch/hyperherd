@@ -116,6 +116,25 @@ These are **not** swept and **not** validated against the parameter list — the
 
 If the value should depend on a swept parameter, use a condition with `set:` instead.
 
+## Extending a confirmed-good config (`derived:`)
+
+When the user wants to spin off adaptations of a **specific trial that already trained well** — an ablation, a flag flip — reach for the top-level `derived:` list instead of cloning the workspace (cloning forks the config and drifts). Each entry mints a NEW trial that inherits a base grid trial's swept params and folds in extra overrides, with its own index, `experiment_name`, and checkpoint.
+
+```yaml
+derived:
+  - from: 70                                  # base trial's grid index (as `herd status` shows)
+    overrides: {strip_functional_tags: true}  # Hydra key: value; need NOT be a swept param
+  - from: 70
+    overrides: {chunked: true}
+```
+
+Key properties (why this is the right tool):
+- **Additive & safe.** The base grid is untouched; variants are appended at fresh indices and reconcile deterministically, so they survive later `herd run`s (not orphaned). This is what makes it safe to extend an in-flight or finished sweep in place.
+- **Distinct identity.** The override is part of the trial's identity and appended to its override string (last, so it wins), and the name gets an `_ov_<key>-<value>` suffix — so a variant never resumes/clobbers the base trial's checkpoint. This is the crucial difference from a bare per-trial override on a non-swept key (`herd run <ws> 70 chunked=true`), which leaves the name unchanged and resumes trial 70 in place.
+- `from` is the base trial's grid index (stable unless the grid definition changes). `overrides` may be any Hydra `key: value`, swept or not.
+
+After adding, launch just the new trials: `herd run <ws> <new indices>` (check `herd status` for the assigned indices).
+
 ## Pre-written instructions to the monitor (`PROMPT.md`)
 
 Drop a `PROMPT.md` file in the workspace root (next to `hyperherd.yaml`) to give `herd monitor` standing instructions for the sweep. The file is read fresh on every tick and rendered into the agent's user-message context, so edits take effect on the next wake-up — no daemon restart.

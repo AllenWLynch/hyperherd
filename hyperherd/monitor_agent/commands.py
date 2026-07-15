@@ -639,8 +639,7 @@ def cmd_params(workspace: Path) -> str:
     output is sweep-shape rather than current-state."""
     try:
         from hyperherd.config import load_config
-        from hyperherd.search import generate_combinations
-        from hyperherd.constraints import apply_constraints
+        from hyperherd.search import build_trials
     except Exception as e:
         return f"Couldn't load config: {e}"
 
@@ -650,7 +649,7 @@ def cmd_params(workspace: Path) -> str:
         return f"Couldn't read hyperherd.yaml: {e}"
 
     try:
-        combos = apply_constraints(generate_combinations(config), config.conditions)
+        combos = build_trials(config)
     except Exception as e:
         return f"Couldn't generate combinations: {e}"
 

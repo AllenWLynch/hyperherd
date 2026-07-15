@@ -11,7 +11,6 @@ from typing import Dict, Optional
 from hyperherd import agent_output
 from hyperherd import argspec
 from hyperherd.config import ConfigError, load_config
-from hyperherd.constraints import apply_constraints
 from hyperherd.display import (
     _DIM,
     _RESET,
@@ -24,7 +23,7 @@ from hyperherd.display import (
 )
 from hyperherd.init import scaffold
 from hyperherd.preflight import PreflightError, run_preflight
-from hyperherd.search import generate_combinations
+from hyperherd.search import build_trials
 from hyperherd import manifest
 from hyperherd import slurm
 from hyperherd.logging import (
@@ -273,8 +272,7 @@ def cmd_launch(args):
         print(f"Warning: {w}", file=sys.stderr)
 
     # Generate parameter combinations
-    combinations = generate_combinations(config)
-    combinations = apply_constraints(combinations, config.conditions)
+    combinations = build_trials(config)
 
     if not combinations:
         print("No valid parameter combinations after applying conditions.", file=sys.stderr)
@@ -518,7 +516,7 @@ def cmd_ls(args):
             return 1
         for w in warnings:
             print(f"Warning: {w}", file=sys.stderr)
-        combos = apply_constraints(generate_combinations(config), config.conditions)
+        combos = build_trials(config)
         if not combos:
             print(
                 "No valid parameter combinations after applying conditions.",
@@ -791,8 +789,7 @@ def cmd_test(args):
         print(f"Preflight check failed: {e}", file=sys.stderr)
         return 1
 
-    combinations = generate_combinations(config)
-    combinations = apply_constraints(combinations, config.conditions)
+    combinations = build_trials(config)
 
     if not combinations:
         print("No valid parameter combinations after applying conditions.", file=sys.stderr)
@@ -816,10 +813,31 @@ def cmd_test(args):
         )
         return 1
 
-    if test_all:
-        return _cmd_test_all(config, trials)
+    # Ephemeral CLI overrides (KEY=VALUE positionals), applied on top of the
+    # trial's config for this run only. Classified/validated in main().
+    cli_overrides = list(getattr(args, "overrides", None) or [])
 
-    index = args.index if args.index is not None else 0
+    if test_all:
+        return _cmd_test_all(config, trials, cli_overrides)
+
+    # `test` takes at most one index; main()'s classifier may hand back a spec.
+    index_spec = getattr(args, "indices", None)
+    if index_spec:
+        try:
+            picked = sorted(set(slurm._parse_array_range(index_spec)))
+        except ValueError as e:
+            print(f"Invalid index {index_spec!r}: {e}", file=sys.stderr)
+            return 1
+        if len(picked) != 1:
+            print(
+                f"herd test runs a single trial, but got {len(picked)} indices "
+                f"({index_spec}). Pass one index (use `herd run` for a set).",
+                file=sys.stderr,
+            )
+            return 1
+        index = picked[0]
+    else:
+        index = 0
     if index < 0 or index >= len(trials):
         print(f"Trial index {index} out of range (0-{len(trials) - 1}).", file=sys.stderr)
         return 1
@@ -844,8 +862,14 @@ def cmd_test(args):
     overrides = manifest.resolve_overrides(
         config.workspace, index, config.static_overrides or None
     )
+    # Append ephemeral CLI overrides last so they win over the manifest and
+    # static_overrides (Hydra is last-wins). The launcher still appends its own
+    # tokens (experiment_name/run_name/…) after $1; _with_cfg_job then prepends
+    # the Hydra flags, keeping every override in one contiguous positional run.
+    if cli_overrides:
+        overrides = f"{overrides} {' '.join(cli_overrides)}"
     if cfg_job:
-        overrides = _append_cfg_job(overrides)
+        overrides = _with_cfg_job(overrides)
 
     if cfg_job:
         print(f"Validating Hydra config for trial {index}")
@@ -882,14 +906,23 @@ def cmd_test(args):
     return result.returncode
 
 
-def _append_cfg_job(overrides: str) -> str:
+def _with_cfg_job(overrides: str) -> str:
     # `--resolve` forces Hydra to fully resolve interpolations
     # (`${...}` references, OmegaConf resolvers, etc.) before printing
     # — without it `--cfg job` happily prints unresolved `${env:FOO}`
     # placeholders and a real run would fail at resolution time. Pair
     # them so the preflight catches resolver errors instead of
     # postponing them to SLURM.
-    return f"{overrides} --cfg job --resolve"
+    #
+    # PREPEND, don't append. Hydra's CLI is argparse-based: the `overrides`
+    # positional (`nargs="*"`) is filled only from the FIRST contiguous run
+    # of positionals, so any `key=value` that lands AFTER a `--flag` is
+    # dropped as "unrecognized arguments" (argparse exits 2). Launchers
+    # routinely append their own overrides after `$1` (e.g. a namespaced
+    # `experiment_name=...` for last-wins), which would then sit past these
+    # flags. Putting `--cfg job --resolve` up front keeps every override —
+    # ours and the launcher's — in one contiguous positional run.
+    return f"--cfg job --resolve {overrides}"
 
 
 def _trial_env(config, index: int, exp_name: str) -> dict:
@@ -906,10 +939,11 @@ def _trial_env(config, index: int, exp_name: str) -> dict:
     return env
 
 
-def _cmd_test_all(config, trials) -> int:
+def _cmd_test_all(config, trials, cli_overrides=None) -> int:
     """Run `--cfg job --resolve` against every trial in the sweep."""
     import subprocess
 
+    cli_overrides = cli_overrides or []
     n = len(trials)
     print(f"Validating Hydra config for {n} trial(s) in {config.workspace}")
     print(f"  launcher: {config.launcher}")
@@ -921,7 +955,9 @@ def _cmd_test_all(config, trials) -> int:
         overrides = manifest.resolve_overrides(
             config.workspace, index, config.static_overrides or None
         )
-        overrides = _append_cfg_job(overrides)
+        if cli_overrides:
+            overrides = f"{overrides} {' '.join(cli_overrides)}"
+        overrides = _with_cfg_job(overrides)
 
         env = _trial_env(config, index, exp_name)
 
@@ -2301,15 +2337,22 @@ def main():
         "test",
         help="Run a single trial locally via the launcher (no SLURM)",
     )
-    p_test.add_argument("workspace", nargs="?", default=".", help="Workspace directory (default: current dir)")
-    # Default is None (not 0) so the smart-positional fallback in
-    # main() can recognize an omitted index. cmd_test treats None as 0.
-    p_test.add_argument("index", nargs="?", type=int, default=None, help="Trial index to run (default: 0)")
+    # Catch-all positionals, classified by shape in main() via argspec (same as
+    # `run`): a workspace path, ONE trial index, and/or KEY=VALUE overrides. The
+    # overrides are ephemeral — appended to this local run's command only, never
+    # persisted to the manifest — so a finished trial can be re-run with an extra
+    # flag (e.g. `herd test 70 strip_functional_tags=true`) without mutating the
+    # sweep. Use `herd run` for persistent per-trial overrides.
+    p_test.add_argument(
+        "pos", nargs="*",
+        help="Workspace path, a single trial index, and/or KEY=VALUE overrides "
+             "(applied on top of the trial's config for this run only).",
+    )
     p_test.add_argument(
         "--cfg-job",
         action="store_true",
         help=(
-            "Append `--cfg job --resolve` to the override string. For Hydra "
+            "Prepend `--cfg job --resolve` to the override string. For Hydra "
             "trainers this prints the fully-resolved config (interpolations and "
             "OmegaConf resolvers expanded) and exits without running training, "
             "so resolver errors surface here instead of in SLURM. Safe to use "
@@ -2520,7 +2563,7 @@ def main():
     # (directory / index spec / KEY=VALUE) — argparse's greedy positional
     # matcher can't tell them apart on its own. See hyperherd/argspec.py.
     #                allow_indices, allow_overrides
-    _POS_COMMANDS = {"run": (True, True), "stop": (True, False)}
+    _POS_COMMANDS = {"run": (True, True), "stop": (True, False), "test": (True, True)}
     if args.command not in _POS_COMMANDS:
         if extras:
             parser.error(f"unrecognized arguments: {' '.join(extras)}")
@@ -2569,7 +2612,7 @@ def main():
     # comes first; if it looks like an int and isn't a directory, treat it as
     # `index` instead. `run`/`stop` no longer come through here — they classify
     # their positionals above, which is strictly more capable.
-    if args.command in ("stats", "test", "tail") and (
+    if args.command in ("stats", "tail") and (
         getattr(args, "index", "<missing>") is None
         and isinstance(getattr(args, "workspace", None), str)
         and not os.path.isdir(args.workspace)
