@@ -168,18 +168,28 @@ def experiment_name_for(
     return f"{base}_ov_{suffix}"
 
 
-def trial_hash(params: Dict[str, Any], extras: Optional[Dict[str, Any]] = None) -> str:
-    """Stable identity hash for a trial, derived from its swept params + constraint extras.
+def trial_hash(
+    params: Dict[str, Any],
+    extras: Optional[Dict[str, Any]] = None,
+    derived_overrides: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Stable identity hash for a trial: swept params + constraint extras + any
+    `derived:` overrides.
 
     Two trials with the same hash are considered the same trial across
     config edits — this is how reconciliation distinguishes
-    "kept" trials from "added"/"removed" ones.
+    "kept" trials from "added"/"removed" ones. A `derived:` trial shares its
+    base's params/extras, so its `derived_overrides` are what make its identity
+    distinct.
+
+    `derived_overrides` is folded in ONLY when non-empty, so an ordinary trial's
+    hash is byte-identical to the pre-derived-feature formula — existing
+    manifests reconcile cleanly without a rehash/migration.
     """
-    blob = json.dumps(
-        {"params": params, "extras": extras or {}},
-        sort_keys=True,
-        default=_json_default,
-    )
+    payload = {"params": params, "extras": extras or {}}
+    if derived_overrides:
+        payload["derived"] = derived_overrides
+    blob = json.dumps(payload, sort_keys=True, default=_json_default)
     return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 
@@ -210,28 +220,34 @@ def _trial_record(
     abbrevs: Dict[str, str],
     labels: Optional[Dict[str, Dict[Any, str]]],
     overrides: Optional[Dict[str, str]] = None,
-    name_suffix: str = "",
+    derived_from: Optional[int] = None,
+    derived_overrides: Optional[Dict[str, Any]] = None,
 ) -> dict:
     overrides = overrides or {}
+    derived_overrides = derived_overrides or {}
     experiment_name = experiment_name_for(params, overrides, abbrevs, labels)
     # A `derived:` trial shares its base's params (and thus base name); the
-    # suffix keeps its output path distinct. See `_derived_name_suffix`.
-    if name_suffix:
-        experiment_name = f"{experiment_name}{name_suffix}"
-    return {
+    # `_ov_…` suffix keeps its output path distinct. See `_derived_name_suffix`.
+    experiment_name += _derived_name_suffix(derived_overrides, abbrevs)
+    record = {
         "index": index,
         # NOTE: `overrides` is deliberately NOT hashed. The hash is the trial's
         # reconciliation identity (which point in the search space it is); an
         # ad-hoc CLI override doesn't move it, so folding overrides in here
         # would make every override look like a config edit that replaced the
-        # trial.
-        "hash": trial_hash(params, extras),
+        # trial. `derived_overrides`, by contrast, DEFINE a new trial, so they
+        # ARE hashed.
+        "hash": trial_hash(params, extras, derived_overrides),
         "params": params,
         "extras": extras,
         "overrides": overrides,
         "experiment_name": experiment_name,
         "status": "ready",
     }
+    if derived_overrides:
+        record["derived_from"] = derived_from
+        record["derived_overrides"] = derived_overrides
+    return record
 
 
 def create_manifest(
@@ -250,17 +266,13 @@ def create_manifest(
     records = []
     for i, item in enumerate(trials):
         if isinstance(item, Trial):
-            params = item.params
-            extras = item.extras
-            derived = item.derived_overrides
+            records.append(_trial_record(
+                i, item.params, item.extras, abbrevs, labels,
+                derived_from=item.derived_from,
+                derived_overrides=item.derived_overrides,
+            ))
         else:
-            params = item
-            extras = {}
-            derived = {}
-        suffix = _derived_name_suffix(derived, abbrevs)
-        records.append(
-            _trial_record(i, params, extras, abbrevs, labels, name_suffix=suffix)
-        )
+            records.append(_trial_record(i, item, {}, abbrevs, labels))
     _write_manifest(base, records)
     return records
 
@@ -305,7 +317,9 @@ def reconcile_manifest(
     awaiting index assignment.
     """
     by_hash = {t["hash"]: t for t in existing}
-    new_hashes = {trial_hash(c.params, c.extras): c for c in combos}
+    new_hashes = {
+        trial_hash(c.params, c.extras, c.derived_overrides): c for c in combos
+    }
 
     kept = [t for t in existing if t["hash"] in new_hashes]
     removed = [t for t in existing if t["hash"] not in new_hashes]
@@ -346,15 +360,11 @@ def append_trials(
     existing = load_manifest(base)
     next_idx = _next_index(base, existing)
     for combo in new_combos:
-        suffix = _derived_name_suffix(
-            getattr(combo, "derived_overrides", None), abbrevs
-        )
-        existing.append(
-            _trial_record(
-                next_idx, combo.params, combo.extras, abbrevs, labels,
-                name_suffix=suffix,
-            )
-        )
+        existing.append(_trial_record(
+            next_idx, combo.params, combo.extras, abbrevs, labels,
+            derived_from=combo.derived_from,
+            derived_overrides=combo.derived_overrides,
+        ))
         next_idx += 1
     _write_manifest(base, existing)
     return existing
@@ -523,7 +533,8 @@ def resolve_overrides(
       2. swept parameter overrides
       3. static_overrides
       4. constraint `set` extras (wins over statics)
-      5. per-trial CLI overrides from `herd run <idx> k=v` (last → wins over all)
+      5. `derived:` overrides (wins over constraint extras)
+      6. per-trial CLI overrides from `herd run <idx> k=v` (last → wins over all)
     """
     trials = load_manifest(base)
     trial = None
@@ -547,9 +558,14 @@ def resolve_overrides(
     if static_overrides:
         parts.extend(static_overrides)
 
-    # Extras are emitted last so constraint `set` values override statics.
+    # Extras are emitted after statics so constraint `set` values override them.
     extras = trial.get("extras") or {}
     for k, v in extras.items():
+        parts.append(f"{k}={_format_override_value(v)}")
+
+    # `derived:` overrides define this variant, so they win over params/statics/
+    # constraint extras (but not the user's explicit per-trial CLI overrides).
+    for k, v in (trial.get("derived_overrides") or {}).items():
         parts.append(f"{k}={_format_override_value(v)}")
 
     # Per-trial CLI overrides win over everything. Emitted VERBATIM, not through

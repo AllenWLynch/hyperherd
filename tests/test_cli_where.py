@@ -90,6 +90,23 @@ class TestParseWhereArgs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown parameter"):
             _parse_where_args(["xyz=1"], self.cfg)
 
+    def test_abbrev_resolves_to_param_name(self):
+        # A param whose abbrev differs from its name: `--where do=0.1` must
+        # resolve to the full parameter name `hidden_dropout`.
+        cfg = Config.model_validate({
+            "name": "t", "workspace": "/tmp", "launcher": "./l.sh",
+            "grid": "all",
+            "parameters": {"hidden_dropout": {
+                "type": "discrete", "abbrev": "do", "values": [0.1, 0.2],
+            }},
+            "slurm": {"partition": "short"},
+        })
+        self.assertEqual(_parse_where_args(["do=0.1"], cfg), {"hidden_dropout": 0.1})
+        # The full name still works too.
+        self.assertEqual(
+            _parse_where_args(["hidden_dropout=0.2"], cfg), {"hidden_dropout": 0.2}
+        )
+
     def test_static_overrides_key_rejected(self):
         # `data.root` is a static_overrides key, not a sweep param.
         with self.assertRaisesRegex(ValueError, "static_overrides key"):

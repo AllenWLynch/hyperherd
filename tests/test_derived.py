@@ -69,15 +69,19 @@ class TestApplyDerived(unittest.TestCase):
         self.assertEqual([t.params for t in out[:3]], [t.params for t in base])
         derived = out[3]
         self.assertEqual(derived.params, {"lr": 0.3})
-        self.assertEqual(derived.extras, {"chunked": True})
+        self.assertEqual(derived.extras, {})                 # NOT folded into extras
         self.assertEqual(derived.derived_overrides, {"chunked": True})
+        self.assertEqual(derived.derived_from, 2)
 
-    def test_extras_merge_with_constraint_extras(self):
+    def test_derivation_kept_separate_from_constraint_extras(self):
         base = [Trial(params={"lr": 0.3}, extras={"warmup": 100})]
         out = apply_derived(
             base, [DerivedSpec(**{"from": 0, "overrides": {"chunked": True}})], {}
         )
-        self.assertEqual(out[1].extras, {"warmup": 100, "chunked": True})
+        # constraint extras untouched; the derivation lives in its own field
+        self.assertEqual(out[1].extras, {"warmup": 100})
+        self.assertEqual(out[1].derived_overrides, {"chunked": True})
+        self.assertEqual(out[1].derived_from, 0)
 
     def test_out_of_range_from_raises(self):
         base = apply_constraints([{"lr": 0.1}], [])
@@ -125,6 +129,17 @@ class TestManifestIntegration(unittest.TestCase):
         self.assertNotEqual(names[3], names[4])
         # Distinct identity hashes.
         self.assertEqual(len({r["hash"] for r in records}), 5)
+
+    def test_record_shape(self):
+        """Derivation is its own field, kept out of extras; parent recorded."""
+        c, trials = self._trials()
+        records = manifest.create_manifest(self.ws, trials, c.abbrevs, c.labels)
+        d = records[3]
+        self.assertEqual(d["derived_from"], 2)
+        self.assertEqual(d["derived_overrides"], {"strip_functional_tags": True})
+        self.assertNotIn("strip_functional_tags", d["extras"])
+        # base grid trials carry no derived metadata
+        self.assertNotIn("derived_from", records[2])
 
     def test_override_reaches_launcher(self):
         c, trials = self._trials()

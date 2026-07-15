@@ -105,12 +105,15 @@ def _parse_where_args(where_args, config):
 
     `--where` *selects* trials; a bare `name=value` positional *overrides* one.
     So this deliberately only accepts sweep parameter names — filtering on a key
-    the sweep doesn't vary would either match everything or nothing.
+    the sweep doesn't vary would either match everything or nothing. Either the
+    full parameter name OR its `abbrev` is accepted (an abbrev resolves to its
+    parameter name), so `--where do=0.1` works when `hidden_dropout` has
+    `abbrev: do`.
 
     Raises ValueError with a user-facing message on:
       - malformed entries (no `=`)
-      - names not in config.parameters (incl. static_overrides keys —
-        those aren't sweep parameters and filtering on them is meaningless)
+      - names not in config.parameters / not an abbrev (incl. static_overrides
+        keys — those aren't sweep parameters and filtering on them is meaningless)
 
     Coerces the RHS int → float → str. Trial params are stored with their
     original YAML types, so a stored `32` (int) still matches `--where
@@ -120,6 +123,11 @@ def _parse_where_args(where_args, config):
         return {}
 
     sweep_params = set(config.parameters.keys())
+    # abbrev -> parameter name, so `--where <abbrev>=v` resolves to the param.
+    # config.abbrevs is name -> abbrev; invert it (skip params with no abbrev).
+    abbrev_to_name = {
+        abbr: name for name, abbr in config.abbrevs.items() if abbr != name
+    }
     static_keys = {
         s.split("=", 1)[0] for s in (config.static_overrides or [])
     }
@@ -135,6 +143,9 @@ def _parse_where_args(where_args, config):
         raw = raw.strip()
         if not name:
             raise ValueError(f"--where {entry!r}: empty parameter name")
+        # Resolve an abbreviation to its parameter name (full names win).
+        if name not in sweep_params and name in abbrev_to_name:
+            name = abbrev_to_name[name]
         if name in static_keys:
             raise ValueError(
                 f"--where {name!r}: that's a static_overrides key, not a "
@@ -143,7 +154,7 @@ def _parse_where_args(where_args, config):
             )
         if name not in sweep_params:
             raise ValueError(
-                f"--where {name!r}: unknown parameter. "
+                f"--where {name!r}: unknown parameter or abbreviation. "
                 f"Sweep parameters: {sorted(sweep_params)}"
             )
 
@@ -486,10 +497,12 @@ def cmd_launch(args):
 def cmd_ls(args):
     """List every trial in the sweep with its swept parameters.
 
-    Status-agnostic: shows the *shape* of the sweep, not what `herd
-    run` would do next. Reads the manifest if present; otherwise
-    materializes the combinations from the config so users can `herd
-    ls` BEFORE the first `herd run` to sanity-check the YAML.
+    Reconciles against the current config the same way `herd run -n` does — so
+    config edits (added/removed grid points, `derived:` trials) are reflected
+    without a separate `herd run`. This can append/drop trials in the manifest
+    (it will not drop active/completed trials without `herd run --force`). If no
+    manifest exists yet, materializes the combinations from the config so users
+    can `herd ls` BEFORE the first `herd run` to sanity-check the YAML.
 
     Supports the same `--where name=value` filter as `herd run` for
     inspecting a slice of the grid.
@@ -503,6 +516,20 @@ def cmd_ls(args):
         return 1
 
     if manifest.workspace_exists(config.workspace):
+        # Reconcile config → manifest before listing, like `herd run -n`.
+        try:
+            warnings = run_preflight(config)
+        except PreflightError as e:
+            print(f"Preflight check failed: {e}", file=sys.stderr)
+            return 1
+        for w in warnings:
+            print(f"Warning: {w}", file=sys.stderr)
+        existing = manifest.load_manifest(config.workspace)
+        diff = manifest.reconcile_manifest(existing, build_trials(config))
+        if not diff.is_clean:
+            # force=False: refuses to drop active/completed trials (prints how to
+            # proceed). On refusal we still list what's on disk rather than error.
+            _apply_reconciliation(config, diff, force=False)
         trials = manifest.load_manifest(config.workspace)
         show_status = True
         title = None
@@ -526,7 +553,10 @@ def cmd_ls(args):
         # Render to manifest-shaped dicts without persisting anything.
         from hyperherd.manifest import _trial_record
         trials = [
-            _trial_record(i, c.params, c.extras, config.abbrevs, config.labels)
+            _trial_record(
+                i, c.params, c.extras, config.abbrevs, config.labels,
+                derived_from=c.derived_from, derived_overrides=c.derived_overrides,
+            )
             for i, c in enumerate(combos)
         ]
         show_status = False

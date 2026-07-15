@@ -323,9 +323,13 @@ def print_trial_listing(
     """Print a verbose per-trial parameter dump.
 
     One stanza per trial: header (`[idx] experiment_name`) plus the
-    swept params (one per line, non-defaults highlighted) plus any
-    constraint-injected `extras`. With `show_status=True` the header
-    also carries the trial's status emoji + label.
+    swept params (one per line, non-defaults highlighted), then any
+    `derived:` overrides, constraint-injected `extras`, and per-trial CLI
+    overrides — each under its own header. With `show_status=True` the header
+    also carries the trial's status label.
+
+    `derived:` trials are NEW trials (own index/params); they're printed
+    indented directly under their base trial so the lineage is legible.
 
     This is the canonical "what does the sweep look like" view —
     `herd ls` calls it for the full sweep; the run dry-run no longer
@@ -336,41 +340,83 @@ def print_trial_listing(
     print(f"{_BOLD}Trials: {len(trials)}{_RESET}")
     print()
 
+    # Group derived trials under their base trial (by index) so they render
+    # nested beneath it rather than at the bottom of the list.
+    children: Dict[int, List[dict]] = {}
+    for t in trials:
+        parent = t.get("derived_from")
+        if parent is not None:
+            children.setdefault(parent, []).append(t)
+
+    printed = set()
     for trial in trials:
-        idx = trial["index"]
-        exp_name = trial.get("experiment_name", "")
-        params = trial.get("params", {})
+        if trial.get("derived_from") is not None:
+            continue  # rendered under its parent below
+        _print_trial_stanza(trial, defaults, show_status)
+        printed.add(trial["index"])
+        for child in children.get(trial["index"], []):
+            _print_trial_stanza(child, defaults, show_status, indent="  ")
+            printed.add(child["index"])
 
-        header = f"{_TRIAL_HEADER}[{idx}]{_RESET}"
-        if exp_name:
-            header += f"  {_EXP_NAME}{exp_name}{_RESET}"
-        if show_status:
-            status = trial.get("status", "?")
-            color = _STATUS_COLORS.get(status.upper(), "")
-            if color:
-                header += f"  {color}{status}{_RESET}"
-            else:
-                header += f"  {status}"
-        print(header)
+    # Any derived trial whose parent isn't in this listing (e.g. filtered out by
+    # --where) still gets shown, at top level, so nothing is silently dropped.
+    for trial in trials:
+        if trial["index"] not in printed:
+            _print_trial_stanza(trial, defaults, show_status)
 
-        for name, value in params.items():
-            highlight = _is_non_default(name, value, defaults)
-            print(f"    {_format_param_kv(name, value, is_non_default=highlight)}")
 
-        extras = trial.get("extras") or {}
-        if extras:
-            print(f"    {_DIM}# constraint set:{_RESET}")
-            for name, value in extras.items():
-                print(f"    {_format_param_kv(name, value, is_non_default=True)}")
+def _print_trial_stanza(
+    trial: dict,
+    defaults: Optional[Dict[str, Any]],
+    show_status: bool,
+    indent: str = "",
+) -> None:
+    """Render one trial stanza, optionally indented (for a nested derivation)."""
+    idx = trial["index"]
+    exp_name = trial.get("experiment_name", "")
+    params = trial.get("params", {})
+    derived_from = trial.get("derived_from")
+    body = indent + "    "
 
-        # Per-trial CLI overrides (`herd run 3 batch_size=32`). Shown last
-        # because that's the order the launcher sees them in — they win.
-        overrides = trial.get("overrides") or {}
-        if overrides:
-            print(f"    {_DIM}# cli override:{_RESET}")
-            for name, value in overrides.items():
-                print(f"    {_format_param_kv(name, value, is_non_default=True)}")
-        print()
+    header = indent
+    if derived_from is not None:
+        header += f"{_DIM}↳{_RESET} "
+    header += f"{_TRIAL_HEADER}[{idx}]{_RESET}"
+    if derived_from is not None:
+        header += f" {_DIM}(derived from [{derived_from}]){_RESET}"
+    if exp_name:
+        header += f"  {_EXP_NAME}{exp_name}{_RESET}"
+    if show_status:
+        status = trial.get("status", "?")
+        color = _STATUS_COLORS.get(status.upper(), "")
+        header += f"  {color}{status}{_RESET}" if color else f"  {status}"
+    print(header)
+
+    for name, value in params.items():
+        highlight = _is_non_default(name, value, defaults)
+        print(f"{body}{_format_param_kv(name, value, is_non_default=highlight)}")
+
+    # `derived:` overrides — what makes this a distinct trial from its base.
+    derived_overrides = trial.get("derived_overrides") or {}
+    if derived_overrides:
+        print(f"{body}{_DIM}# derived:{_RESET}")
+        for name, value in derived_overrides.items():
+            print(f"{body}{_format_param_kv(name, value, is_non_default=True)}")
+
+    extras = trial.get("extras") or {}
+    if extras:
+        print(f"{body}{_DIM}# constraint set:{_RESET}")
+        for name, value in extras.items():
+            print(f"{body}{_format_param_kv(name, value, is_non_default=True)}")
+
+    # Per-trial CLI overrides (`herd run 3 batch_size=32`). Shown last
+    # because that's the order the launcher sees them in — they win.
+    overrides = trial.get("overrides") or {}
+    if overrides:
+        print(f"{body}{_DIM}# cli override:{_RESET}")
+        for name, value in overrides.items():
+            print(f"{body}{_format_param_kv(name, value, is_non_default=True)}")
+    print()
 
 
 def print_dry_run(
