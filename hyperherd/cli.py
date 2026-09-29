@@ -800,6 +800,10 @@ def cmd_test(args):
     instead of in a SLURM job ten minutes later. In this mode no real
     outputs are produced, so the previously-submitted guard is skipped.
 
+    With `--force`, runs a previously-submitted trial end-to-end anyway. The
+    run writes to that trial's real outputs/logs, so it is on the caller to
+    make sure no SLURM task for it is still running.
+
     With `--cfg-job --all`, validates every trial in the sweep. Useful for
     catching parameter combinations whose resolved config is malformed
     (e.g. interpolations that only break under certain override values).
@@ -868,26 +872,39 @@ def cmd_test(args):
         index = picked[0]
     else:
         index = 0
-    if index < 0 or index >= len(trials):
-        print(f"Trial index {index} out of range (0-{len(trials) - 1}).", file=sys.stderr)
+    # Look the trial up by its manifest `index`, never by list position: the two
+    # diverge once conditions collapse cells and the grid indices go sparse.
+    trial = next((t for t in trials if t["index"] == index), None)
+    if trial is None:
+        known = ",".join(str(t["index"]) for t in trials)
+        print(f"Trial index {index} is not in the manifest (have: {known}).", file=sys.stderr)
         return 1
 
     # End-to-end runs would clobber a trial that's already been launched.
-    # `--cfg-job` validates without running, so it's safe to skip.
+    # `--cfg-job` validates without running, so it's safe to skip; `--force`
+    # skips it on the caller's word.
     if not cfg_job:
+        force = getattr(args, "force", False)
         for record in manifest.get_job_ids(config.workspace):
             if index in record.get("indices", []):
+                if force:
+                    print(
+                        f"--force: trial {index} was submitted to SLURM "
+                        f"(job {record['slurm_job_id']}); running it locally "
+                        f"anyway, into its real outputs/logs.",
+                        file=sys.stderr,
+                    )
+                    break
                 print(
                     f"Trial {index} was previously submitted to SLURM "
                     f"(job {record['slurm_job_id']}). Refusing to run locally — "
                     f"running would clobber its outputs/logs. Pick a different "
-                    f"index, pass --cfg-job for a Hydra config-only check, or "
-                    f"`herd clean --all` first.",
+                    f"index, pass --cfg-job for a Hydra config-only check, "
+                    f"--force to run it anyway, or `herd clean --all` first.",
                     file=sys.stderr,
                 )
                 return 1
 
-    trial = trials[index]
     exp_name = trial.get("experiment_name", "")
     overrides = manifest.resolve_overrides(
         config.workspace, index, config.static_overrides or None
@@ -2387,6 +2404,15 @@ def main():
             "OmegaConf resolvers expanded) and exits without running training, "
             "so resolver errors surface here instead of in SLURM. Safe to use "
             "on indices already submitted to SLURM."
+        ),
+    )
+    p_test.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help=(
+            "Run a trial end-to-end even if it was already submitted to SLURM. "
+            "It writes into that trial's real outputs/logs, so make sure no "
+            "SLURM task for it is still running."
         ),
     )
     p_test.add_argument(
